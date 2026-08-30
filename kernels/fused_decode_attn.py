@@ -70,6 +70,9 @@ def triton_available() -> tuple[bool, str]:
 
 if triton is not None:
 
+    # Triton can only capture globals that are already constexpr.
+    _LOG2E = tl.constexpr(1.4426950408889634)
+
     @triton.jit
     def _fused_decode_attn_split(
         Q,
@@ -134,7 +137,7 @@ if triton is not None:
 
         lo = pid_s * SPLIT_SIZE
         hi = tl.minimum(lo + SPLIT_SIZE, S)
-        qk_scale = sm_scale * LOG2E
+        qk_scale = sm_scale * _LOG2E
 
         for start_n in range(lo, hi, BLOCK_N):
             offs_n = start_n + tl.arange(0, BLOCK_N)
