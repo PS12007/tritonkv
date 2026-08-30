@@ -159,6 +159,71 @@ def bench_graph(fn, samples: int, iters: int = 50, warmup: int = 15):
         return {"error": f"{type(exc).__name__}: {exc}"}
 
 
+MAX_REPLICAS = 512
+MAX_REPLICA_BYTES = 400_000_000
+
+
+def replicas_for(cache_bytes: int, l2_bytes: int) -> int:
+    """How many independent copies of the cache to rotate through.
+
+    Enough that the whole set cannot sit in L2, capped so a 16k fp16 cache does
+    not eat the 8 GB card. The achieved footprint is reported alongside the
+    timing so a case that failed to reach the target is visible rather than
+    quietly optimistic.
+    """
+    target = max(3 * (l2_bytes or 0), 96_000_000)
+    if cache_bytes <= 0:
+        return 1
+    want = -(-target // cache_bytes)
+    by_bytes = MAX_REPLICA_BYTES // cache_bytes
+    return int(max(1, min(MAX_REPLICAS, want, by_bytes)))
+
+
+def bench_graph_rotating(fns, samples: int, warmup: int = 3):
+    """Per-call GPU time over a working set too large for L2.
+
+    This replaces the obvious "flush L2, time one call" loop, which on Windows
+    measures the WDDM submission path waking an idle GPU (~300-600 us) rather
+    than the kernel. Here every call in the captured graph touches a *different*
+    copy of the cache, so the data is genuinely cold, while CUDA-graph replay
+    keeps launch overhead out of the number. That is also what decoding actually
+    looks like: 28 layers cycling through caches that evict each other.
+    """
+    R = len(fns)
+    try:
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(warmup):
+                for f in fns:
+                    f()
+        torch.cuda.current_stream().wait_stream(side)
+        torch.cuda.synchronize()
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            for f in fns:
+                f()
+        torch.cuda.synchronize()
+        for _ in range(2):
+            g.replay()
+        torch.cuda.synchronize()
+
+        out = []
+        for _ in range(samples):
+            s = torch.cuda.Event(enable_timing=True)
+            e = torch.cuda.Event(enable_timing=True)
+            s.record()
+            g.replay()
+            e.record()
+            torch.cuda.synchronize()
+            out.append(s.elapsed_time(e) / R)
+        del g
+        return out
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
 def stats(xs: list[float]) -> dict:
     return {
         "mean_ms": statistics.fmean(xs),
@@ -182,54 +247,83 @@ class Case:
     nbits: int | None
     group_size: int | None
     fn: object = field(repr=False, default=None)
+    fns: list = field(repr=False, default_factory=list)
+    n_replicas: int = 1
+    footprint_bytes: int = 0
     cache_bytes: int = 0
     effective_bits: float = 16.0
     config: dict = field(default_factory=dict)
 
 
-def build_cases(shape, ctx: int, batch: int, group_size: int, tuned: dict) -> list[Case]:
+def build_cases(
+    shape, ctx: int, batch: int, group_size: int, tuned: dict, l2_bytes: int
+) -> list[Case]:
+    """One Case per method, each carrying N independent copies of the cache.
+
+    Replicas are shared between every method that reads the same cache format,
+    so the eager, compiled and fused 4-bit cases all rotate over the *same*
+    tensors and are cold in exactly the same way.
+    """
     B = batch
     HQ, HKV, D = shape.num_q_heads, shape.num_kv_heads, shape.head_dim
-    q, k, v = make_random_kv(B, HQ, HKV, ctx, D, device="cuda", seed=1234)
+    cases: list[Case] = []
 
-    fp16_bytes = k.numel() * 2 * 2  # K and V
-    cases = [
+    # --- fp16 reference cache -------------------------------------------
+    probe_q, probe_k, probe_v = make_random_kv(B, HQ, HKV, ctx, D, device="cuda", seed=1234)
+    fp16_bytes = probe_k.numel() * 2 * 2  # K and V
+    r_fp16 = replicas_for(fp16_bytes, l2_bytes)
+    fp16_reps = [
+        make_random_kv(B, HQ, HKV, ctx, D, device="cuda", seed=1234 + i) for i in range(r_fp16)
+    ]
+    cases.append(
         Case(
             method="fp16_sdpa",
             ctx=ctx,
             nbits=None,
             group_size=None,
-            fn=lambda q=q, k=k, v=v: baseline_fp16_sdpa(q, k, v),
+            fn=lambda t=fp16_reps[0]: baseline_fp16_sdpa(*t),
+            fns=[(lambda t=t: baseline_fp16_sdpa(*t)) for t in fp16_reps],
+            n_replicas=r_fp16,
+            footprint_bytes=r_fp16 * fp16_bytes,
             cache_bytes=fp16_bytes,
             effective_bits=16.0,
         )
-    ]
+    )
 
     for nbits in BIT_WIDTHS:
-        kq, vq = quantize_kv(k, v, nbits, group_size)
-        cbytes = kq.nbytes() + vq.nbytes()
-        ebits = kq.effective_bits_per_element()
+        kq0, vq0 = quantize_kv(probe_k, probe_v, nbits, group_size)
+        cbytes = kq0.nbytes() + vq0.nbytes()
+        ebits = kq0.effective_bits_per_element()
+        r_q = replicas_for(cbytes, l2_bytes)
+
+        # Quantize from the fp16 replicas we already have, extending if needed.
+        qreps = []
+        for i in range(r_q):
+            if i < len(fp16_reps):
+                qq, kk, vv = fp16_reps[i]
+            else:
+                qq, kk, vv = make_random_kv(B, HQ, HKV, ctx, D, device="cuda", seed=9000 + i)
+            kqi, vqi = quantize_kv(kk, vv, nbits, group_size)
+            qreps.append((qq, kqi, vqi))
 
         cases.append(
             Case(
                 method=f"dequant_sdpa_eager_{nbits}b",
-                ctx=ctx,
-                nbits=nbits,
-                group_size=group_size,
-                fn=lambda q=q, kq=kq, vq=vq: baseline_dequant_sdpa(q, kq, vq),
-                cache_bytes=cbytes,
-                effective_bits=ebits,
+                ctx=ctx, nbits=nbits, group_size=group_size,
+                fn=lambda t=qreps[0]: baseline_dequant_sdpa(*t),
+                fns=[(lambda t=t: baseline_dequant_sdpa(*t)) for t in qreps],
+                n_replicas=r_q, footprint_bytes=r_q * cbytes,
+                cache_bytes=cbytes, effective_bits=ebits,
             )
         )
         cases.append(
             Case(
                 method=f"dequant_sdpa_compiled_{nbits}b",
-                ctx=ctx,
-                nbits=nbits,
-                group_size=group_size,
-                fn=lambda q=q, kq=kq, vq=vq: baseline_dequant_sdpa_compiled(q, kq, vq),
-                cache_bytes=cbytes,
-                effective_bits=ebits,
+                ctx=ctx, nbits=nbits, group_size=group_size,
+                fn=lambda t=qreps[0]: baseline_dequant_sdpa_compiled(*t),
+                fns=[(lambda t=t: baseline_dequant_sdpa_compiled(*t)) for t in qreps],
+                n_replicas=r_q, footprint_bytes=r_q * cbytes,
+                cache_bytes=cbytes, effective_bits=ebits,
             )
         )
 
@@ -239,14 +333,17 @@ def build_cases(shape, ctx: int, batch: int, group_size: int, tuned: dict) -> li
         cases.append(
             Case(
                 method=f"fused_triton_{nbits}b",
-                ctx=ctx,
-                nbits=nbits,
-                group_size=group_size,
-                fn=lambda q=q, kq=kq, vq=vq, cfg=cfg, ws=ws, o=out_buf: fused_decode_attention(
-                    q, kq, vq, out=o, _workspace=ws, **cfg
+                ctx=ctx, nbits=nbits, group_size=group_size,
+                fn=lambda t=qreps[0], cfg=cfg, ws=ws, o=out_buf: fused_decode_attention(
+                    t[0], t[1], t[2], out=o, _workspace=ws, **cfg
                 ),
-                cache_bytes=cbytes,
-                effective_bits=ebits,
+                fns=[
+                    (lambda t=t, cfg=cfg, ws=ws, o=out_buf: fused_decode_attention(
+                        t[0], t[1], t[2], out=o, _workspace=ws, **cfg))
+                    for t in qreps
+                ],
+                n_replicas=r_q, footprint_bytes=r_q * cbytes,
+                cache_bytes=cbytes, effective_bits=ebits,
                 config=dict(cfg),
             )
         )
@@ -457,10 +554,11 @@ def main():
     print()
 
     flusher = L2Flusher()
+    l2_bytes = flusher.l2_bytes
     rows = []
     print(f"timing (samples={samples}, L2 flush buffer = {flusher.nbytes / 1e6:.0f} MB):")
     for ctx in contexts:
-        cases = build_cases(shape, ctx, args.batch, args.group_size, tuned)
+        cases = build_cases(shape, ctx, args.batch, args.group_size, tuned, l2_bytes)
         print(f"\n  --- context {ctx} ---")
         for c in cases:
             torch.cuda.synchronize()
@@ -471,7 +569,8 @@ def main():
             torch.cuda.synchronize()
             transient = torch.cuda.max_memory_allocated() - before
 
-            cold = bench_cold(c.fn, flusher, samples)
+            cold = bench_graph_rotating(c.fns, samples)
+            cold_naive = bench_cold(c.fn, flusher, max(5, samples // 5))
             pipe = bench_pipelined(c.fn, max(5, samples // 5))
             graph = bench_graph(c.fn, max(5, samples // 5))
 
@@ -488,8 +587,12 @@ def main():
                 ),
                 "transient_alloc_bytes": int(transient),
                 "config": c.config,
-                "cold": stats(cold),
-                "cold_raw_ms": cold,
+                "n_replicas": c.n_replicas,
+                "footprint_bytes": c.footprint_bytes,
+                "footprint_over_l2": (c.footprint_bytes / l2_bytes) if l2_bytes else None,
+                "cold": stats(cold) if isinstance(cold, list) else cold,
+                "cold_raw_ms": cold if isinstance(cold, list) else None,
+                "cold_naive_single_call": stats(cold_naive) if isinstance(cold_naive, list) else None,
                 "pipelined": stats(pipe) if isinstance(pipe, list) else pipe,
                 "graph": stats(graph) if isinstance(graph, list) else graph,
             }
@@ -500,12 +603,19 @@ def main():
             rows.append(row)
 
             lo = row["launch_overhead_ms"]
+            if isinstance(cold, list):
+                cold_s = (f"{row['cold']['mean_ms'] * 1e3:8.1f} +- "
+                          f"{row['cold']['std_ms'] * 1e3:4.1f} us")
+            else:
+                cold_s = f"  {cold.get('error', 'n/a')[:24]:<24}"
+            hot = row["graph"]["mean_ms"] * 1e3 if isinstance(graph, list) else float("nan")
             print(
-                f"  {c.method:<28} cold {row['cold']['mean_ms'] * 1e3:8.1f} +- "
-                f"{row['cold']['std_ms'] * 1e3:5.1f} us   "
-                f"hot {row['pipelined']['mean_ms'] * 1e3:8.1f} us   "
-                f"launch {'n/a' if lo is None else f'{lo * 1e3:5.1f} us'}   "
-                f"cache {c.cache_bytes / 1e6:6.2f} MB"
+                f"  {c.method:<28} cold {cold_s}   "
+                f"hot {hot:7.1f} us   "
+                f"launch {'n/a' if lo is None else f'{lo * 1e3:6.1f} us'}   "
+                f"cache {c.cache_bytes / 1e6:6.2f} MB x{c.n_replicas:<4} "
+                f"= {c.footprint_bytes / 1e6:6.0f} MB "
+                f"({(c.footprint_bytes / l2_bytes if l2_bytes else 0):4.1f}x L2)"
             )
 
     elapsed = time.time() - t0
