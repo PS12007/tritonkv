@@ -46,6 +46,7 @@ from pathlib import Path
 import torch
 
 from configs import BIT_WIDTHS, CONTEXT_LENGTHS, DEFAULT_GROUP_SIZE, DEFAULT_MODEL, load_model_config
+from kernels.fp16_decode_attn import fp16_decode_attention
 from kernels.fused_decode_attn import fused_decode_attention, triton_available
 from quantize import dequantize_groupwise, quantize_kv
 from reference import (
@@ -287,6 +288,27 @@ def build_cases(
             footprint_bytes=r_fp16 * fp16_bytes,
             cache_bytes=fp16_bytes,
             effective_bits=16.0,
+        )
+    )
+
+    # The control: same kernel shape, same split, unquantized fp16 K/V. Without
+    # it the fused kernel's speedup silently absorbs the flash-decoding win that
+    # has nothing to do with quantization.
+    ws16: dict = {}
+    o16 = torch.empty((B, HQ, D), device="cuda", dtype=torch.float32)
+    cases.append(
+        Case(
+            method="triton_fp16_control",
+            ctx=ctx, nbits=None, group_size=None,
+            fn=lambda t=fp16_reps[0], w=ws16, o=o16: fp16_decode_attention(
+                t[0], t[1], t[2], out=o, _workspace=w),
+            fns=[
+                (lambda t=t, w=ws16, o=o16: fp16_decode_attention(
+                    t[0], t[1], t[2], out=o, _workspace=w))
+                for t in fp16_reps
+            ],
+            n_replicas=r_fp16, footprint_bytes=r_fp16 * fp16_bytes,
+            cache_bytes=fp16_bytes, effective_bits=16.0,
         )
     )
 

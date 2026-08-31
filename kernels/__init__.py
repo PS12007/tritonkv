@@ -3,3 +3,4 @@ from .fused_decode_attn import (  # noqa: F401
     triton_available,
     pick_num_splits,
 )
+from .fp16_decode_attn import fp16_decode_attention  # noqa: F401

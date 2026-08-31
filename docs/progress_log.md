@@ -88,3 +88,106 @@ less against a fused/compiled one.
 ---
 
 <!-- entries below this line are appended as results come in -->
+
+## 2026-08-30 19:40 — Environment fixed, kernel runs, first correctness pass
+
+**Attempted:** get the kernel to actually execute.
+
+**What happened:** the `torch 2.12.0+cu130` install had been interrupted (DLL
+load failure on `caffe2_nvrtc.dll`); it completed and now imports cleanly.
+First compile of the kernel failed outright:
+
+> `NameError: Cannot access global variable LOG2E from within @jit'ed function.`
+
+Triton 3.8 only captures globals already declared `tl.constexpr`. One-line fix.
+
+**Number:** **66/66 correctness tests pass in 25.8 s** on an RTX 5060 Laptop
+(sm_120, 26 SMs, 8 GB). 2-bit passes the same kernel-vs-dequant-reference
+thresholds as 4-bit, so the stretch goal is numerically live, not abandoned.
+
+---
+
+## 2026-08-30 19:45 — The baselines were strawmen, and the "cold" timing was fiction
+
+**Attempted:** believe the first benchmark output. Failed to.
+
+**What happened:** the first run reported `hot` slower than `cold` and launch
+overhead larger than total runtime. Two separate problems, both inflating the
+kernel's win.
+
+**1. The fp16 baseline was crippled.** Every baseline went through SDPA with
+`enable_gqa=True`. Measured at S=8192 by CUDA-graph replay:
+
+| strategy | time | effective |
+|---|---|---|
+| `enable_gqa=True` (what we used) | 990 us | 8.5 GB/s |
+| dispatcher's choice, expanded KV | 746 us | 11.2 GB/s |
+| mem-efficient backend | 746 us | 11.3 GB/s |
+| **cuDNN backend** | **318 us** | **26.4 GB/s** |
+| hand-written fp16 bmm | 382 us | 22.0 GB/s |
+
+FlashAttention was never a candidate: this Windows torch build reports *"Torch
+was not compiled with flash attention"*. `reference.py` now probes all six
+strategies once per shape and caches the winner. Ranking has to be done by
+CUDA-graph replay too — WDDM's 50–300 us per-call submission cost had the probe
+preferring a 3.3 GB/s path over a 24.7 GB/s one at ctx=512.
+
+**2. "Cold" was measuring Windows, not the GPU.** `flush L2, time one call`
+reported 395 us for 43 us of GPU work: on an idle GPU that number is the WDDM
+submission path waking up. Replaced with a rotating working set — N independent
+copies of the cache, sized to exceed L2, replayed from a single CUDA graph.
+Cold and hot now agree to a few percent with sub-microsecond std.
+
+**A real bug, caught by the baseline getting *better*:** caching the probe's
+*closure* instead of its strategy *name* pinned the probe's own tensors, so
+every later call returned the first call's answer. Baseline error against fp16
+truth jumped 0.121 → 0.900. The test suite did not catch it, because the only
+assertion involving the baseline requires the kernel to be no *worse* than it.
+
+---
+
+## 2026-08-30 19:50 — The headline speedup is mostly not what it looks like
+
+**Attempted:** falsify the project's own thesis before writing it up.
+
+**What happened:** the fused kernel beats fp16 SDPA by 9–36x. But that compares
+two things at once: 4-bit storage *and* a flash-decoding split across the
+history, which PyTorch's SDPA simply does not do for `q_len == 1`. So
+`kernels/fp16_decode_attn.py` was written as a **control** — same split, same
+online softmax, same GQA amortization, same combine kernel, K/V read as plain
+fp16. The only difference is the dequantization.
+
+Hot (L2-resident), CUDA-graph replay, us per decode step:
+
+| ctx | SDPA fp16 | Triton fp16 (control) | fused 4-bit | flash-decode | quantization |
+|---|---|---|---|---|---|
+| 512 | 46.1 | 3.2 | 5.2 | 14.6x | **0.61x** |
+| 2048 | 173.9 | 6.5 | 10.1 | 26.7x | **0.64x** |
+| 8192 | 732.1 | 13.5 | 25.7 | 54.2x | **0.53x** |
+| 16384 | 1452.6 | 20.5 | 40.3 | 70.9x | **0.51x** |
+
+**Number: quantization makes the kernel ~2x SLOWER, not faster** — when the
+cache fits in L2. Nearly all of the apparent win is the split, not the fusion.
+Group size barely moves it (25.4 / 25.6 / 26.6 us at gs=16/32/64), so the
+scale+zero tile loads are not the cost; the shift/mask/convert/fma chain is.
+At 16k the fp16 path runs at ~410 GB/s (pure L2) while the 4-bit path reaches
+~64 GB/s — the fused kernel is issue-bound, not bandwidth-bound.
+
+**Then the sign flips.** With a working set 4x L2 (134 MB), so the cache
+genuinely comes from DRAM:
+
+| ctx | Triton fp16 (control) | fused 4-bit | quantization |
+|---|---|---|---|
+| 512 | 4.64 us | 6.34 us | 0.73x |
+| 2048 | 11.26 us | 59.03 us | 0.19x |
+| 8192 | 362.36 us | 32.60 us | **11.11x** |
+| 16384 | 795.11 us | 51.02 us | **15.58x** |
+
+So the real claim is conditional and much more interesting than "Nx faster":
+**the fused kernel wins exactly when the KV cache does not fit in L2, and loses
+when it does.** That is the thing worth writing up.
+
+**Caveat, not yet resolved:** those cold numbers carry +-50-100 us of variance
+and the 2048 row is not credible. Suspected laptop power/thermal throttling
+(80 W cap; idle clocks observed at 180 MHz SM / 810 MHz mem). Must be re-run
+with clock monitoring before any of it is quoted.
