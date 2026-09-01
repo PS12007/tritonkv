@@ -22,3 +22,6 @@ Thumbs.db
 
 # Claude Code local settings
 .claude/settings.local.json
+
+# Personal drafting doc, not for publication
+docs/x_posts.md
