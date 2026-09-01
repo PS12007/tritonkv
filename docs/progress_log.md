@@ -257,3 +257,124 @@ thing — build a control kernel to falsify your own thesis — and still got a
 wrong answer, because the control was the *fastest* thing being measured and so
 was the most sensitive to a slow GPU. Falsification does not help if the
 measurement apparatus is what is lying. Check the apparatus first.
+
+---
+
+## 2026-09-01 18:30 — The metadata gather was most of the inner loop
+
+**Attempted:** `next_steps.md` item 2 — attack the issue-bound
+shift/mask/convert/fma chain, on the theory that folding the zero-point out of
+the inner loop (`q·(code·scale + zero) = scale·(q·code) + zero·Σq`) was the way
+in. That is not what turned out to matter.
+
+**What happened.** Before writing the segmented dot, I looked again at what the
+inner loop actually issues, and found a much cheaper target. The per-group scale
+and zero live in memory as `(BLOCK_N, D // group_size)` — 4 values per token at
+`gs=32`. The kernel was loading them as `(BLOCK_N, D)` by indexing with
+`d // group_size`, i.e. **re-reading every parameter 32 times**, four times per
+iteration (K and V, scale and zero). Loading them at their real width and
+expanding in registers is one `tl.broadcast_to` + `tl.reshape`:
+
+| | instructions | registers | spills |
+|---|---|---|---|
+| gather (`d // GS`) | 2245 | 244 | 0 |
+| broadcast | **1653** | **128** | 0 |
+
+Both paths are **bitwise identical** — asserted over 40 cases of
+(S × nbits × group_size) in `test_correctness.py`, not merely close — so the
+whole gap is issue cost.
+
+**Measured (clock-gated, `fused_gather_meta_*` is carried as a permanent
+control row so this stays auditable):**
+
+| regime | 4-bit | 2-bit |
+|---|---|---|
+| L2-resident | 1.16 / 1.27 / 1.32 / 1.48× | 1.15 / 1.27 / 1.40 / 1.48× |
+| DRAM-resident | 1.15 / 1.05 / 1.13 / 1.24× | 1.14 / 1.06 / 1.22 / 1.32× |
+
+(ctx = 512 / 2048 / 8192 / 16384.) Bigger where the kernel is issue-bound rather
+than bandwidth-bound, which is the right signature.
+
+**The README claim this refutes.** It said: *"Group size barely moves it
+(25.4 / 25.6 / 26.6 µs at gs = 16/32/64), so the scale+zero tile loads are not
+the cost."* The measurement was right and the inference was wrong. In the gather
+path the load is indexed by `d // GS` over the **full** head dim, so it issues
+`BLOCK_N * D` loads *whatever `GS` is* — group size changes how many distinct
+values are read, never how many instructions are issued. The experiment varied
+metadata **bytes** and concluded about metadata **instructions**. A flat sweep
+was exactly what the expensive version predicts.
+
+**Two things that did *not* work, and are worth as much as the one that did.**
+
+1. *Zero-point folding* (the item next_steps predicted "could change the
+   conclusion of the whole project"). Implemented, kept behind `fold_zp=`. It is
+   **not** a speed win: 0.74–1.10× (4-bit) and 0.66–0.94× (2-bit) against the
+   broadcast path, clearing no practical-significance bar at any context in
+   either regime. An early ad-hoc A/B *did* show it winning 1.04–1.09× in DRAM;
+   the harness disagreed once both variants shared cache replicas under the
+   gate, and the disagreement is the finding — the effect is inside measurement
+   variation. It is kept because it is **more accurate**: it never rounds a
+   dequantized K value to fp16, so kernel error stays flat at 1.5e-4 instead of
+   drifting 2.3e-4 → 7.7e-4 as context grows.
+2. *The same narrow-load trick applied to the packed codes.* Bitwise identical,
+   and a **loss** (0.69–0.96× at ctx ≥ 8192). Registers go 128 → 223: the codes
+   are needed at full width regardless, so expanding them from a narrow load
+   adds a live tile without removing one. Reverted. The lesson generalizes less
+   than it first appears — the win is specific to loads whose expanded form is
+   redundant.
+
+---
+
+## 2026-09-01 18:50 — The clock gate was passing rows on a single sample
+
+**Attempted:** `next_steps.md` item 1 — close the unquotable rows. The stated
+theory was that the *slow* PyTorch baselines were sagging. It was the opposite.
+
+**What happened.** `triton_fp16_control` — the *fastest* method — kept failing
+the boost gate. The cause is ordering: `warm_clocks()` ran in the driver, then
+`bench_graph` did warmup, CUDA-graph capture and priming replays before opening
+the clock window. That stretch is CPU-bound with the GPU near idle and long
+enough for the boost to decay, so the ramp was spent before the measured window
+began. A slow baseline re-boosts inside its own first sample; a 14 µs kernel
+never does. **The gate was penalising methods for being fast.** Fixed by handing
+the ramp *into* the timing function, run after capture and before the priming
+replays (which then put the cache back, since the ramp's GEMM evicts it).
+
+That worked — and immediately exposed something worse. With the control now
+passing, I checked *how* it passed: `n_samples: 1`. **28 of 96 measurement
+windows were being judged on a single `nvidia-smi` sample**, including the rows
+the whole attribution rests on. "The GPU was boosted" verified once at 9 Hz is
+not verification; it is a measurement shorter than the sampler's period.
+
+Fixes, both from measurement rather than guesswork:
+
+- The sampler really does run at **9.2 Hz** (109 ms median gap, measured), so a
+  window must stay open well past a second to earn samples. Measurements now
+  keep sampling to `MIN_SAMPLING_SECONDS = 1.5`.
+- The gate requires `MIN_CLOCK_SAMPLES = 4`, reported as its own failure mode
+  ("too few clock samples") rather than silently passing.
+- The first attempt bounded the stretch by *sample count* (`samples * 60`),
+  which silently bound first for exactly the fast kernels that needed it — their
+  samples are cheap, so 600 of them is 0.26 s. Re-bounded in **time**.
+
+**Result:** windows with ≤ 1 clock sample went **28 → 0**; the minimum is now 13.
+Every remaining rejection is dispersion — there are no clock rejections left.
+And the attribution is now fully quotable at ctx = 512 **and** 2048 in *both*
+regimes, with all three methods passing the gate at the same context:
+
+| ctx | regime | split | quantization |
+|---|---|---|---|
+| 512 | L2-resident | 13.3× | 0.74× |
+| 512 | DRAM-resident | 10.0× | 0.97× |
+| 2048 | L2-resident | 26.2× | **0.90×** |
+| 2048 | DRAM-resident | 14.5× | **1.22×** |
+
+That is the first time the **sign flip itself** has had every input
+clock-verified at a single context. Previously it rested on rows where the fp16
+control had failed the gate.
+
+**The lesson, which is the same one as 2026-09-01 11:45 one level down:** the
+apparatus had a second failure mode underneath the one already fixed. Adding the
+clock monitor caught throttling; it did not catch *not having looked long enough
+to tell*, and a gate that answers "yes" from one sample reads identically to one
+that answers from twenty.

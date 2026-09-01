@@ -519,6 +519,135 @@ def _verdict(lo: float, hi: float) -> str:
     return "MISLEADING"
 
 
+GATHER = "fused_gather_meta_{nbits}b"
+FOLD = "fused_fold_zp_{nbits}b"
+
+
+def audit_optimizations(b: Bench, nbits: int = 4) -> list[Claim]:
+    """Adjudicate this session's two kernel changes against their own controls.
+
+    Both are measured against the *same* kernel with the same tuned config, so
+    unlike a comparison against PyTorch there is no second mechanism hiding in
+    the ratio. Both controls are also bitwise-identical to the shipped path
+    (metadata broadcast) or a documented arithmetic reordering (zero-point
+    fold), so a timing gap cannot be a correctness difference in disguise.
+    """
+    claims: list[Claim] = []
+    fused = f"fused_triton_{nbits}b"
+    gather = GATHER.format(nbits=nbits)
+    fold = FOLD.format(nbits=nbits)
+
+    # --- metadata broadcast -------------------------------------------------
+    ratios_cold, ratios_hot = {}, {}
+    for ctx in b.contexts:
+        g, f = b.cold(gather, ctx), b.cold(fused, ctx)
+        if g and f:
+            ratios_cold[ctx] = bootstrap_ratio_ci(g, f)
+        gh, fh = b.hot_raw(gather, ctx), b.hot_raw(fused, ctx)
+        if gh and fh:
+            ratios_hot[ctx] = bootstrap_ratio_ci(gh, fh)
+
+    if ratios_cold:
+        quotable = [c for c in ratios_cold if b.quotable(gather, c) and b.quotable(fused, c)]
+        lows = [ratios_cold[c][1][0] for c in quotable]
+        wins = bool(lows) and all(x > PRACTICAL_THRESHOLD for x in lows)
+        caveat = "" if quotable else (
+            " NOT CLOCK-VERIFIED: no context had both the broadcast and gather rows pass "
+            "the gate, so the DRAM-resident ratio is reported but not relied on."
+        )
+        claims.append(
+            Claim(
+                id=f"optimization.meta_broadcast.{nbits}b",
+                claim=(
+                    f"Loading the per-group scale/zero as a (BLOCK_N, n_groups) tile and "
+                    f"expanding it in registers, instead of gathering (BLOCK_N, head_dim) "
+                    f"with d // group_size, makes the {nbits}-bit kernel faster."
+                ),
+                verdict=downgrade("TRUE" if wins else "TRUE BUT CONDITIONAL", caveat),
+                evidence=(
+                    "gather / broadcast, DRAM-resident: "
+                    + ", ".join(
+                        f"{c}:{ratios_cold[c][0]:.2f}x "
+                        f"[{ratios_cold[c][1][0]:.2f},{ratios_cold[c][1][1]:.2f}]"
+                        + ("" if c in quotable else "*")
+                        for c in sorted(ratios_cold)
+                    )
+                    + "; L2-resident: "
+                    + ", ".join(
+                        f"{c}:{ratios_hot[c][0]:.2f}x" for c in sorted(ratios_hot)
+                    )
+                    + ". Rows marked * did not pass the clock/dispersion gate. The two "
+                    "paths are bitwise-identical (test_metadata_broadcast_is_bitwise_"
+                    "identical, 40 cases over S x nbits x group_size), so the gap is "
+                    "issue cost and nothing else."
+                    + caveat
+                ),
+                falsification_attempted=(
+                    "The control is the same kernel with the same tuned block size, warps "
+                    "and stages, differing in one constexpr. Registers were checked as an "
+                    "independent mechanism (244 -> 128, zero spills), and the same "
+                    "narrow-load trick applied to the packed codes was measured and "
+                    "REJECTED (0.69-0.96x at ctx>=8192, registers 128 -> 223), so the "
+                    "claim is specific to loads that shrink the live footprint rather "
+                    "than a general result about redundant loads."
+                ),
+            )
+        )
+
+    # --- zero-point fold ----------------------------------------------------
+    fold_cold, fold_hot = {}, {}
+    for ctx in b.contexts:
+        f0, f1 = b.cold(fused, ctx), b.cold(fold, ctx)
+        if f0 and f1:
+            fold_cold[ctx] = bootstrap_ratio_ci(f0, f1)
+        h0, h1 = b.hot_raw(fused, ctx), b.hot_raw(fold, ctx)
+        if h0 and h1:
+            fold_hot[ctx] = bootstrap_ratio_ci(h0, h1)
+
+    if fold_cold:
+        helps = [c for c in fold_cold if fold_cold[c][1][0] > PRACTICAL_THRESHOLD]
+        claims.append(
+            Claim(
+                id=f"optimization.zero_point_fold.{nbits}b",
+                claim=(
+                    "Folding the zero-point out of the inner loop -- computing scores as "
+                    "scale*(q.code) + zero*sum(q) with a per-group dot against the raw "
+                    "codes, instead of dequantizing K first -- makes the kernel faster."
+                ),
+                verdict="TRUE BUT CONDITIONAL" if helps else "FALSE",
+                evidence=(
+                    "baseline / folded, DRAM-resident: "
+                    + ", ".join(
+                        f"{c}:{fold_cold[c][0]:.2f}x" for c in sorted(fold_cold)
+                    )
+                    + "; L2-resident: "
+                    + ", ".join(f"{c}:{fold_hot[c][0]:.2f}x" for c in sorted(fold_hot))
+                    + ". A ratio below 1.0 means the fold is slower. "
+                    + (
+                        f"It clears the {PRACTICAL_THRESHOLD:.2f}x bar only at ctx="
+                        + ",".join(str(c) for c in helps) + "."
+                        if helps
+                        else "It clears the practical-significance bar at no context, in "
+                             "either regime, at either bit width. The arithmetic saving is "
+                             "real but it is spent on extra work on the score tile and on "
+                             "registers (128 -> 164)."
+                    )
+                ),
+                falsification_attempted=(
+                    "An earlier ad-hoc A/B of this change did show a 1.04-1.09x DRAM-side "
+                    "win at ctx>=8192, which disagreed with the harness once both were "
+                    "measured against shared cache replicas under the clock gate. The "
+                    "disagreement is itself the finding: the effect is inside measurement "
+                    "variation for 4-bit and clearly negative for 2-bit, so the earlier "
+                    "favourable number was not reproduced and is not quoted. The fold is "
+                    "kept as an option for its accuracy, not its speed."
+                ),
+            )
+        )
+
+    return claims
+
+
 def audit_attribution(b: Bench, nbits: int = 4) -> list[Claim]:
     """Split the headline speedup into flash-decoding and quantization."""
     claims: list[Claim] = []
@@ -1031,6 +1160,7 @@ def main():
         claims += audit_speed(b, nbits)
         claims += audit_memory(b, nbits)
         claims += audit_attribution(b, nbits)
+        claims += audit_optimizations(b, nbits)
     claims += audit_correctness(b)
     claims += audit_scope(b)
     claims += audit_measurement(b)

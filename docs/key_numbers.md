@@ -18,43 +18,91 @@ batch 1, one attention layer, `group_size=32`, decode step (`q_len=1`).
 
 | | value | what it means |
 |---|---|---|
-| **Flash-decoding split** | **9.7–24×** DRAM-resident, **13–69×** L2-resident | fp16 SDPA ÷ fp16 Triton control. Nothing to do with quantization. |
-| **Quantization, L2-resident** | **0.51–0.72×** | fp16 control ÷ fused 4-bit. The bits *cost* 1.4–2×. |
-| **Quantization, DRAM-resident** | **0.72–1.32×** | Same ratio, working set 3× L2. The bits pay off only at ≥ 2k tokens. |
+| **Flash-decoding split** | **10–26×** (quotable rows) | fp16 SDPA ÷ fp16 Triton control. Nothing to do with quantization. |
+| **Quantization, L2-resident** | **0.74–0.90×** | fp16 control ÷ fused 4-bit. The bits *cost* 1.1–1.35×. |
+| **Quantization, DRAM-resident** | **0.97–1.22×** (quotable), 1.26–1.47× beyond | Same ratio, working set 3× L2. The bits pay off from ~2k tokens. |
 
-The headline "36× faster than PyTorch" is the product of the first row and a
-number near 1. Quoting it as a quantization result is the error this project
+The headline "up to 70× faster than PyTorch" is the product of the first row and
+a number near 1. Quoting it as a quantization result is the error this project
 exists to avoid.
+
+**The sign flip is now fully clock-verified at a single context.** At ctx=2048,
+with all three methods passing the gate: **0.90× L2-resident, 1.22×
+DRAM-resident.** Earlier versions of this claim rested on rows where the fp16
+control had failed the gate.
 
 ---
 
 ## Timing, µs per decode step
 
-**L2-resident (CUDA-graph replay, median of 25 samples × 50 calls):**
+**L2-resident (CUDA-graph replay, median of ≥25 samples × 50 calls):**
 
-| ctx | SDPA fp16 | Triton fp16 control | fused 4-bit | fused 2-bit | split effect | quant effect |
-|---|---|---|---|---|---|---|
-| 512 | 48.7 | 3.7 | 5.3 | 6.4 | 13.2× | 0.69× |
-| 2048 | 180.6 | 7.2 | 11.0 | 11.0 | 25.2× | 0.65× |
-| 8192 | 736.2* | 14.2* | 23.5 | 23.2 | 51.7× | 0.61× |
-| 16384 | 1463.8* | 21.2 | 41.2 | 40.8 | 69.1× | 0.51× |
+| ctx | SDPA fp16 | Triton fp16 control | fused 4-bit | fused 2-bit | gather-meta 4-bit | split | quant |
+|---|---|---|---|---|---|---|---|
+| 512 | 46.7 | 3.5 | 4.7 | 4.8* | 5.5* | 13.3× | 0.74× |
+| 2048 | 178.8 | 6.8 | 7.6 | 7.7 | 9.7 | 26.2× | **0.90×** |
+| 8192 | 747.3 | 13.7* | 16.8 | 16.9* | 22.1* | 54.4× | 0.82× |
+| 16384 | 1493.7* | 21.2* | 28.9* | 29.2* | 42.7* | 70.4× | 0.74× |
 
-**DRAM-resident (rotating working set 3× L2 = 101 MB, median (IQR) of 50 samples):**
+**DRAM-resident (rotating working set 3× L2 = 101 MB, median of ≥50 samples):**
 
-| ctx | SDPA fp16 | Triton fp16 control | fused 4-bit | fused 2-bit | split effect | quant effect |
-|---|---|---|---|---|---|---|
-| 512 | 49.0 (0.1) | 5.0 (0.1) | 7.0 (0.1) | 5.9 (0.2) | 9.7× | 0.72× |
-| 2048 | 179.7 (3.1) | 12.3 (0.1) | 10.8 (0.3) | 10.4 (0.1) | 14.6× | 1.14× |
-| 8192 | 766.3 (48.6)* | 31.4 (0.5)* | 26.2 (0.5) | 25.8 (0.3) | 24.4× | 1.20× |
-| 16384 | 1525.2 (102.2)* | 63.4 (1.8) | 48.0 (1.0) | 49.7 (2.3) | 24.0× | 1.32× |
+| ctx | SDPA fp16 | Triton fp16 control | fused 4-bit | fused 2-bit | gather-meta 4-bit | split | quant |
+|---|---|---|---|---|---|---|---|
+| 512 | 50.1 | 5.0 | 5.2 | 5.2* | 6.0* | 10.0× | 0.97× |
+| 2048 | 184.1 | 12.7 | 10.4 | 9.9 | 11.0 | 14.5× | **1.22×** |
+| 8192 | 756.4 | 31.9* | 25.3 | 21.8* | 28.5* | 23.7× | 1.26× |
+| 16384 | 1501.6* | 58.8* | 40.1* | 36.2* | 49.5* | 25.5× | 1.47× |
 
-Bootstrap 95% CIs on the quantization effect (4-bit, DRAM-resident): 512
-`[0.72, 0.81]`, 2048 `[1.12, 1.17]`, 8192 `[1.20, 1.21]`, 16384 `[1.30, 1.33]`.
-The effect is small, but it is not noise.
+`gather-meta` is the same kernel with the metadata gather instead of the
+broadcast — carried as a permanent control row, see below.
 
-**Clock verification: 22 of 32 rows quotable.** A row is quotable only if every
-`nvidia-smi` sample taken during its sampling loop was ≥ 70% of the 3090 MHz
-maximum SM clock *and* its own IQR was ≤ 5% of its median.
+**Clock verification: 25 of 48 rows quotable.** A row is quotable only if
+every `nvidia-smi` sample during its sampling loop was ≥ 70% of the 3090 MHz
+maximum SM clock, its own IQR was ≤ 5% of its median, **and its clock window
+holds ≥ 4 samples**. Every rejection in this run is dispersion; there are no
+clock rejections left.
+
+---
+
+## The metadata-broadcast change
+
+The per-group scale and zero are `(BLOCK_N, D/group_size)` in memory. The kernel
+used to load them as `(BLOCK_N, D)` by indexing with `d // group_size`,
+re-reading each parameter `group_size` times, four times per loop iteration.
+Loading them at their real width and expanding in registers is bitwise
+identical:
+
+| | instructions | registers | spills |
+|---|---|---|---|
+| gather (`d // GS`) | 2245 | 244 | 0 |
+| broadcast | **1653** | **128** | 0 |
+
+**Speedup (gather ÷ broadcast), ctx = 512 / 2048 / 8192 / 16384:**
+
+| regime | 4-bit | 2-bit |
+|---|---|---|
+| L2-resident | 1.16 / 1.27 / 1.32 / 1.48× | 1.15 / 1.27 / 1.40 / 1.48× |
+| DRAM-resident | 1.15 / 1.05 / 1.13 / 1.24× | 1.14 / 1.06 / 1.22 / 1.32× |
+
+**What this refutes.** An earlier version of this file and the README said
+*"group size barely moves it, so the scale+zero tile loads are not the cost."*
+The measurement was right; the inference was wrong. In the gather path the load
+is indexed by `d // GS` over the full head dim, so it issues `BLOCK_N * D` loads
+**whatever `GS` is**. Group size changes how many distinct values are read, never
+how many instructions are issued — the experiment varied metadata *bytes* and
+concluded about metadata *instructions*.
+
+**Two rejected variants**, kept here because they bound the claim:
+
+- **Zero-point fold** (`fold_zp=True`): 0.74–1.10× (4-bit), 0.66–0.94× (2-bit).
+  Not a speed win at any context in either regime. Kept as an option because it
+  is *more accurate* — it never rounds a dequantized K value to fp16, so kernel
+  error stays flat at **1.5e-4** instead of drifting 2.3e-4 → 7.7e-4 with
+  context.
+- **The same trick on the packed codes**: bitwise identical and a **loss**
+  (0.69–0.96× at ctx ≥ 8192), registers 128 → 223. The codes are needed at full
+  width regardless, so expanding them from a narrow load adds a live tile
+  without removing one. Reverted.
 
 ---
 
@@ -77,7 +125,9 @@ is the one advantage that holds in every regime.
 
 ## Accuracy
 
-`pytest test_correctness.py -q` → **66 passed** in ~26 s.
+`pytest test_correctness.py -q` → **106 passed** in ~123 s (66 before this
+session; the 40 new ones assert the metadata gather and broadcast paths are
+bitwise identical across S × nbits × group_size).
 
 | ctx | bits | cosine vs dequant ref | rel L2 vs dequant ref | kernel vs fp16 truth | PyTorch baseline vs fp16 truth |
 |---|---|---|---|---|---|
@@ -100,19 +150,14 @@ unrealistically easy input for a quantizer.
 
 ---
 
-## Audit verdicts
+## The corrections, in order
 
-63 claims in `results/audit.md`: **24 TRUE, 20 TRUE BUT CONDITIONAL, 9
-MISLEADING, 10 FALSE.** All ten `FALSE` verdicts are this project's own claims
-about the L2-resident regime.
-
----
-
-## The correction
-
-An earlier version of this repo reported the DRAM-resident quantization effect
-as **11–15×**. It is **1.14–1.32×**. The old measurement timed the fp16 control
-while the GPU was still at idle clocks — a 9× clock range on an 80 W laptop
-part — which made the control look ~12× slower than it is. Nothing in the old
-benchmark could detect this, because it never recorded what the clocks were
-doing. That is why every row now carries its clock window.
+1. **11–15× → 1.14–1.32× (2026-09-01 morning).** The DRAM-resident quantization
+   effect was measured with the fp16 control still at idle clocks — a 9× clock
+   range on an 80 W laptop part. Nothing in that benchmark could detect it,
+   because it never recorded the clocks.
+2. **The clock gate was passing rows on one sample (2026-09-01 evening).** After
+   the gate was added, 28 of 96 measurement windows were being judged on a
+   single `nvidia-smi` sample, because the measurement was shorter than the
+   sampler's 109 ms period. Windows are now held open ≥ 1.5 s and must carry
+   ≥ 4 samples; the count is now **0 of 96**.

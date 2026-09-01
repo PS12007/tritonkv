@@ -68,46 +68,90 @@ reading plain fp16. The only difference is the dequantization.
 
 ![Where the speedup comes from](docs/plots/speedup_attribution_4b.png)
 
-**Splitting the history is worth 9–25×. The quantization is worth 0.5–1.3×.**
+**Splitting the history is worth 10–26×. The quantization is worth 0.74–1.47×.**
 
-**Hot regime (cache fits in L2), µs per decode step, CUDA-graph replay, median
-of 25 samples × 50 calls:**
-
-| ctx | SDPA fp16 | Triton fp16 (control) | fused 4-bit | fused 2-bit | flash-decode effect | quantization effect |
-|---|---|---|---|---|---|---|
-| 512 | 48.7 | 3.7 | 5.3 | 6.4 | 13.2× | **0.69×** |
-| 2048 | 180.6 | 7.2 | 11.0 | 11.0 | 25.2× | **0.65×** |
-| 8192 | 736.2* | 14.2* | 23.5 | 23.2 | 51.7× | **0.61×** |
-| 16384 | 1463.8* | 21.2 | 41.2 | 40.8 | 69.1× | **0.51×** |
-
-**Quantization makes the kernel 1.4–2× slower here, not faster.** Nearly the
-whole apparent win is the split. At 16k the fp16 path runs at ~410 GB/s (pure
-L2) while the 4-bit path reaches only ~64 GB/s — the fused kernel is issue-bound
-in the shift/mask/convert/fma chain, not bandwidth-bound. Group size barely moves
-it (25.4 / 25.6 / 26.6 µs at gs = 16/32/64), so the scale+zero tile loads are
-not the cost.
-
-**Cold regime (rotating working set, 3× L2 = 101 MB), µs per decode step,
-median (IQR) of 50 samples:**
+**Hot regime (cache fits in L2), µs per decode step, CUDA-graph replay:**
 
 | ctx | SDPA fp16 | Triton fp16 (control) | fused 4-bit | fused 2-bit | flash-decode effect | quantization effect |
 |---|---|---|---|---|---|---|
-| 512 | 49.0 (0.1) | 5.0 (0.1) | 7.0 (0.1) | 5.9 (0.2) | 9.7× | 0.72× |
-| 2048 | 179.7 (3.1) | 12.3 (0.1) | 10.8 (0.3) | 10.4 (0.1) | 14.6× | **1.14×** |
-| 8192 | 766.3 (48.6)* | 31.4 (0.5)* | 26.2 (0.5) | 25.8 (0.3) | 24.4× | **1.20×** |
-| 16384 | 1525.2 (102.2)* | 63.4 (1.8) | 48.0 (1.0) | 49.7 (2.3) | 24.0× | **1.32×** |
+| 512 | 46.7 | 3.5 | 4.7 | 4.8* | 13.3× | 0.74× |
+| 2048 | 178.8 | 6.8 | 7.6 | 7.7 | 26.2× | **0.90×** |
+| 8192 | 747.3 | 13.7* | 16.8 | 16.9* | 54.4× | 0.82× |
+| 16384 | 1493.7* | 21.2* | 28.9* | 29.2* | 70.4× | 0.74× |
+
+**Quantization makes the kernel ~1.1–1.35× slower here, not faster.** Nearly the
+whole apparent win is the split.
+
+**Cold regime (rotating working set, 3× L2 = 101 MB), µs per decode step:**
+
+| ctx | SDPA fp16 | Triton fp16 (control) | fused 4-bit | fused 2-bit | flash-decode effect | quantization effect |
+|---|---|---|---|---|---|---|
+| 512 | 50.1 | 5.0 | 5.2 | 5.2* | 10.0× | 0.97× |
+| 2048 | 184.1 | 12.7 | 10.4 | 9.9 | 14.5× | **1.22×** |
+| 8192 | 756.4 | 31.9* | 25.3 | 21.8* | 23.7× | 1.26× |
+| 16384 | 1501.6* | 58.8* | 40.1* | 36.2* | 25.5× | 1.47× |
 
 `*` = did not pass the clock-verification gate (see below) and is not quoted as
 evidence anywhere; every conclusion here rests on unstarred rows.
 
 The sign flips: once the cache genuinely comes from DRAM, 4-bit leads — but by
-**1.14–1.32×, not by an order of magnitude**.
+**1.22–1.47×, not by an order of magnitude**.
+
+**At ctx = 2048 the sign flip is now fully clock-verified**, with SDPA, the fp16
+control and the fused kernel all passing the gate at the same context: **0.90×
+L2-resident, 1.22× DRAM-resident**. Earlier versions of this claim rested on
+rows where the control had failed the gate.
 
 ![What the quantization itself buys](docs/plots/quantization_effect_4b.png)
 
 **So the real claim is conditional: the fused kernel pays for itself only when
-the KV cache does not fit in L2, and costs ~1.5–2× when it does.** At 512 tokens
-it loses in both regimes — there is not enough history to amortize anything.
+the KV cache does not fit in L2, and costs ~1.1–1.35× when it does.** At 512
+tokens it roughly breaks even in the cold regime — there is not enough history
+to amortize anything.
+
+### The inner loop was mostly loading the same 4 numbers over and over
+
+The per-group scale and zero are `(BLOCK_N, head_dim/group_size)` in memory — 4
+values per token at `group_size=32`. The kernel used to load them as
+`(BLOCK_N, head_dim)` by indexing with `d // group_size`, **re-reading each
+parameter 32 times**, four times per loop iteration (K and V, scale and zero).
+Loading them at their real width and expanding in registers is bitwise
+identical — asserted over 40 cases of (S × nbits × group_size), not merely
+close:
+
+| | instructions | registers | spills |
+|---|---|---|---|
+| gather (`d // group_size`) | 2245 | 244 | 0 |
+| broadcast | **1653** | **128** | 0 |
+
+Worth 1.16–1.48× L2-resident and 1.05–1.32× DRAM-resident, biggest where the
+kernel is issue-bound rather than bandwidth-bound. The old path is kept as a
+permanent benchmark row (`fused_gather_meta_*`) so the attribution stays
+auditable.
+
+**This refutes a claim that used to be on this page.** It said: *"Group size
+barely moves it (25.4 / 25.6 / 26.6 µs at gs = 16/32/64), so the scale+zero tile
+loads are not the cost."* The measurement was right and the inference was wrong.
+In the gather path the load is indexed by `d // group_size` over the **full**
+head dim, so it issues `BLOCK_N × head_dim` loads *whatever the group size is* —
+group size changes how many distinct values are read, never how many
+instructions are issued. The experiment varied metadata **bytes** and concluded
+about metadata **instructions**, and a flat sweep is exactly what the expensive
+version predicts.
+
+Two variants were measured and **rejected**, which is what bounds the claim:
+
+- **Folding the zero-point out of the inner loop** (`scale·(q·code) + zero·Σq`,
+  a per-group dot against the raw codes). Not faster at any context in either
+  regime: 0.74–1.10× at 4-bit, 0.66–0.94× at 2-bit. Kept as an option
+  (`fold_zp=True`) only because it is *more accurate* — it never rounds a
+  dequantized K value to fp16, so kernel error stays flat at 1.5e-4 instead of
+  drifting 2.3e-4 → 7.7e-4 as context grows.
+- **The same narrow-load trick applied to the packed codes.** Bitwise identical
+  and a **loss** (0.69–0.96× at ctx ≥ 8192); registers go 128 → 223. The codes
+  are needed at full width regardless, so expanding them from a narrow load adds
+  a live tile without removing one. Reverted. The lesson generalizes less than
+  it first looks: the win is specific to loads whose expanded form is redundant.
 
 ### Every timing on this page is clock-verified
 
@@ -127,14 +171,40 @@ samples to the sampling loop only — warmup and CUDA-graph capture are excluded
 so they neither look like throttling nor hide it. A row is **quotable** only if
 
 1. every clock sample during its sampling loop was ≥ 70% of the 3090 MHz
-   maximum, and
-2. the timing's own IQR was ≤ 5% of its median.
+   maximum,
+2. the timing's own IQR was ≤ 5% of its median, and
+3. **its clock window holds at least 4 samples.**
 
-The last full run: **22 of 32 rows quotable**. The 10 rejects are named in
+The last full run: **25 of 48 rows quotable**. The rejects are named in
 `results/benchmark.json` under `clock_monitoring.rejected_rows` and are starred
-in the tables above. Most of them are the slow PyTorch baselines, whose long
-per-sample gaps let the clocks sag — which would have *inflated* the speedups
-reported against them, so rejecting them is the conservative choice.
+in the tables above. **Every one of them is dispersion; there are no clock
+rejections left.**
+
+#### The gate had a second failure mode underneath the first one
+
+Adding the clock monitor caught throttling. It did not catch *not having looked
+long enough to tell*, and a gate that answers "the GPU was boosted" from one
+sample reads exactly like one that answers from twenty.
+
+Two things were wrong, and the fix for the first exposed the second:
+
+- **The ramp was being spent before the measurement began.** `warm_clocks()` ran
+  in the driver, but the timing function then did warmup, CUDA-graph capture and
+  priming replays before opening its clock window — a long CPU-bound stretch
+  with the GPU near idle. A slow PyTorch baseline re-boosts inside its own first
+  sample; a 14 µs kernel never does, so **the gate was penalising methods for
+  being fast**, which is the opposite of the failure it was built to catch. The
+  ramp now runs *inside* the timing function, after capture.
+- **28 of 96 measurement windows were being judged on a single `nvidia-smi`
+  sample** — including rows the attribution rests on. `nvidia-smi -lms 100`
+  actually delivers ~9 Hz (109 ms median gap, measured), so a 30 ms measurement
+  cannot earn evidence about clocks at all. Windows are now held open ≥ 1.5 s and
+  must carry ≥ 4 samples, reported as its own failure mode rather than passing
+  silently. Windows with ≤ 1 sample: **28 → 0**; the minimum is now 13.
+
+An earlier attempt bounded that stretch by *sample count* rather than time,
+which silently bound first for exactly the fast kernels that needed it — their
+samples are cheap, so 600 of them is 0.26 s. The unit mattered.
 
 ### Memory
 
@@ -159,7 +229,7 @@ allocates nothing to get there — 0.3 MB of transient workspace at 16k, against
 
 ### Correctness
 
-`python -m pytest test_correctness.py -q` → **66 passed in ~26 s**.
+`python -m pytest test_correctness.py -q` → **106 passed in ~123 s**.
 
 Two different errors are measured, and the distinction is the whole point:
 
@@ -199,16 +269,21 @@ it. Speedups are judged by a bootstrap 95% CI over the raw per-sample timings
 against a 1.05× practical-significance bar, so a difference that is really
 run-to-run jitter cannot be reported as a win.
 
-| verdict | count |
-|---|---|
-| TRUE | 24 |
-| TRUE BUT CONDITIONAL | 20 |
-| MISLEADING | 9 |
-| FALSE | 10 |
+The audit now also adjudicates each kernel change against its **own** control
+rather than against PyTorch — `optimization.meta_broadcast` (the metadata
+broadcast, versus the same kernel with the gather) and
+`optimization.zero_point_fold` (which it marks `FALSE` on speed, since it clears
+the 1.05× bar at no context in either regime).
 
-The ten `FALSE` verdicts are all this project's own claims about the L2-resident
-regime, and the audit is what puts them there. Full text in `results/audit.md`
-after a run.
+> **Stale:** the verdict counts previously quoted here (24 TRUE / 20 CONDITIONAL
+> / 9 MISLEADING / 10 FALSE) came from a run against an older
+> `results/benchmark.json`, before the `fused_gather_meta_*` and
+> `fused_fold_zp_*` rows and before the per-optimization claims existed. They
+> are deliberately not restated. Regenerate with
+> `./.venv/Scripts/python.exe audit_claims.py` and read `results/audit.md`.
+
+Historically the `FALSE` verdicts have been this project's own claims about the
+L2-resident regime, and the audit is what puts them there.
 
 ---
 
@@ -291,7 +366,7 @@ committed.
 | `kernels/fp16_decode_attn.py` | the control: identical shape, unquantized. Isolates the flash-decoding effect. |
 | `test_correctness.py` | 66 tests, explicit asserted thresholds. |
 | `benchmark.py` | timing + memory. Rotating working set for the cold regime, CUDA-graph replay for the hot one. |
-| `audit_claims.py` | adversarial self-audit: 63 claims, bootstrap CIs over raw timings, attribution against the fp16 control, and a clock-verification gate. |
+| `audit_claims.py` | adversarial self-audit: bootstrap CIs over raw timings, attribution against the fp16 control, per-optimization claims with their own controls, and a clock-verification gate. |
 | `make_plots.py` | the figures in `docs/plots/`, regenerated from `results/benchmark.json`. |
 | `docs/progress_log.md` | what was tried and what broke, written as it happened. |
 | `docs/next_steps.md` | ordered list of what is left. |

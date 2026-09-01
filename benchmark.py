@@ -179,7 +179,16 @@ class ClockMonitor:
             self.max_sm and summary["sm_mhz_min"] >= CLOCK_BOOST_FLOOR_FRAC * self.max_sm
         )
         summary["thermal_headroom"] = summary["temp_c_max"] < CLOCK_TEMP_LIMIT_C
-        summary["stable"] = bool(summary["boosted"] and summary["thermal_headroom"])
+        # A window summarized from one or two nvidia-smi samples is not evidence
+        # that the GPU held its clocks -- it is evidence that the measurement was
+        # shorter than the sampler's period. The fast kernels are exactly the ones
+        # that finish inside a single 100 ms tick, and they are also the ones a
+        # clock artefact flatters most, so "not enough samples to tell" has to be
+        # a distinct failure from "clocks sagged" rather than a silent pass.
+        summary["enough_samples"] = summary["n_samples"] >= MIN_CLOCK_SAMPLES
+        summary["stable"] = bool(
+            summary["boosted"] and summary["thermal_headroom"] and summary["enough_samples"]
+        )
         return summary
 
     def stop(self):
@@ -195,6 +204,11 @@ CLOCK_BOOST_FLOOR_FRAC = 0.70   # every sample must be >= this fraction of max S
 CLOCK_TEMP_LIMIT_C = 87.0       # above this, assume thermal throttling
 CLOCK_TARGET_FRAC = 0.80        # ramp to this fraction of max SM clock before timing
 MAX_IQR_FRAC = 0.05             # a quotable timing's IQR must be <= 5% of its median
+MIN_CLOCK_SAMPLES = 4           # a clock window built from fewer samples proves nothing
+# nvidia-smi -lms 100 delivers ~9 Hz in practice (measured: 109 ms median gap),
+# so a window has to stay open well past a second to collect a usable number of
+# clock samples. 1.5 s buys ~14.
+MIN_SAMPLING_SECONDS = 1.5
 
 
 def timing_is_tight(st) -> bool:
@@ -272,7 +286,7 @@ class L2Flusher:
 
 
 def bench_cold(fn, flusher: L2Flusher, samples: int, warmup: int = 15,
-               span: list | None = None) -> list[float]:
+               span: list | None = None, warm=None) -> list[float]:
     """Per-call latency in ms, with L2 flushed before every sample.
 
 A ``span`` list, if given, is filled with the wall-clock ``[start, end]`` of the
@@ -286,6 +300,8 @@ clocks -- are not mistaken for a throttled measurement.
 
     starts = [torch.cuda.Event(enable_timing=True) for _ in range(samples)]
     ends = [torch.cuda.Event(enable_timing=True) for _ in range(samples)]
+    if warm is not None:
+        warm()
     mark(span, 0)
     for i in range(samples):
         flusher.flush()
@@ -298,13 +314,15 @@ clocks -- are not mistaken for a throttled measurement.
 
 
 def bench_pipelined(fn, samples: int, iters: int = 50, warmup: int = 15,
-                    span: list | None = None) -> list[float]:
+                    span: list | None = None, warm=None) -> list[float]:
     """Per-call latency in ms for back-to-back calls with a hot cache."""
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
 
     out = []
+    if warm is not None:
+        warm()
     mark(span, 0)
     for _ in range(samples):
         s = torch.cuda.Event(enable_timing=True)
@@ -320,7 +338,8 @@ def bench_pipelined(fn, samples: int, iters: int = 50, warmup: int = 15,
 
 
 def bench_graph(fn, samples: int, iters: int = 50, warmup: int = 15,
-                span: list | None = None):
+                span: list | None = None, warm=None,
+                min_seconds: float = MIN_SAMPLING_SECONDS):
     """Per-call latency in ms via CUDA-graph replay (launch overhead removed).
 
     Returns ``None`` if the method cannot be captured (e.g. it allocates, or
@@ -342,13 +361,22 @@ def bench_graph(fn, samples: int, iters: int = 50, warmup: int = 15,
                 fn()
         torch.cuda.synchronize()
 
+        # Ramp the clocks *after* capture, then prime. Graph capture is a long
+        # CPU-side stretch with the GPU nearly idle, so a ramp done before it
+        # has decayed by the time the sampling loop opens -- which is exactly
+        # how the fastest methods came to fail the boost gate while the slow
+        # ones passed. Priming after the ramp also puts the cache back, since
+        # the ramp's GEMM evicts it.
+        if warm is not None:
+            warm()
         for _ in range(3):
             g.replay()
         torch.cuda.synchronize()
 
         out = []
         mark(span, 0)
-        for _ in range(samples):
+        t_start = time.time()
+        while True:
             s = torch.cuda.Event(enable_timing=True)
             e = torch.cuda.Event(enable_timing=True)
             s.record()
@@ -356,6 +384,11 @@ def bench_graph(fn, samples: int, iters: int = 50, warmup: int = 15,
             e.record()
             torch.cuda.synchronize()
             out.append(s.elapsed_time(e) / iters)
+            elapsed = time.time() - t_start
+            if len(out) >= samples and (
+                elapsed >= min_seconds or elapsed >= MAX_SAMPLING_SECONDS
+            ):
+                break
         mark(span, 1)
         del g
         return out
@@ -365,6 +398,12 @@ def bench_graph(fn, samples: int, iters: int = 50, warmup: int = 15,
 
 MAX_REPLICAS = 512
 MAX_REPLICA_BYTES = 400_000_000
+# Ceiling on how long a stretched measurement may run. The stretch is bounded in
+# *time*, not in sample count: a count cap silently binds first for the fastest
+# kernels -- the ones that need the stretch -- because their samples are cheap,
+# which is how a 0.26 s window ended up being asked to yield 4 clock samples at
+# 9 Hz.
+MAX_SAMPLING_SECONDS = 6.0
 
 
 def replicas_for(cache_bytes: int, l2_bytes: int) -> int:
@@ -383,7 +422,8 @@ def replicas_for(cache_bytes: int, l2_bytes: int) -> int:
     return int(max(1, min(MAX_REPLICAS, want, by_bytes)))
 
 
-def bench_graph_rotating(fns, samples: int, warmup: int = 3, span: list | None = None):
+def bench_graph_rotating(fns, samples: int, warmup: int = 3, span: list | None = None,
+                         warm=None, min_seconds: float = MIN_SAMPLING_SECONDS):
     """Per-call GPU time over a working set too large for L2.
 
     This replaces the obvious "flush L2, time one call" loop, which on Windows
@@ -409,13 +449,16 @@ def bench_graph_rotating(fns, samples: int, warmup: int = 3, span: list | None =
             for f in fns:
                 f()
         torch.cuda.synchronize()
+        if warm is not None:
+            warm()
         for _ in range(2):
             g.replay()
         torch.cuda.synchronize()
 
         out = []
         mark(span, 0)
-        for _ in range(samples):
+        t_start = time.time()
+        while True:
             s = torch.cuda.Event(enable_timing=True)
             e = torch.cuda.Event(enable_timing=True)
             s.record()
@@ -423,6 +466,11 @@ def bench_graph_rotating(fns, samples: int, warmup: int = 3, span: list | None =
             e.record()
             torch.cuda.synchronize()
             out.append(s.elapsed_time(e) / R)
+            elapsed = time.time() - t_start
+            if len(out) >= samples and (
+                elapsed >= min_seconds or elapsed >= MAX_SAMPLING_SECONDS
+            ):
+                break
         mark(span, 1)
         del g
         return out
@@ -590,6 +638,59 @@ def build_cases(
                 fns=[
                     (lambda t=t, cfg=cfg, ws=ws, o=out_buf: fused_decode_attention(
                         t[0], t[1], t[2], out=o, _workspace=ws, **cfg))
+                    for t in qreps
+                ],
+                n_replicas=r_q, footprint_bytes=r_q * cbytes,
+                cache_bytes=cbytes, effective_bits=ebits,
+                config=dict(cfg),
+            )
+        )
+
+        # Control for the metadata-load change: the same kernel with the same
+        # tuned config, differing only in how the per-group scale/zero tile is
+        # fetched. It is kept as a permanent row rather than a one-off A/B for
+        # the same reason the fp16 control is: without it, a later reader
+        # cannot tell how much of the fused kernel's speed is the dequant
+        # arithmetic and how much was an avoidable gather. The two produce
+        # bitwise-identical output (test_correctness.py), so any timing gap
+        # between them is pure issue cost.
+        ws_g: dict = {}
+        out_g = torch.empty((B, HQ, D), device="cuda", dtype=torch.float32)
+        cases.append(
+            Case(
+                method=f"fused_gather_meta_{nbits}b",
+                ctx=ctx, nbits=nbits, group_size=group_size,
+                fn=lambda t=qreps[0], cfg=cfg, ws=ws_g, o=out_g: fused_decode_attention(
+                    t[0], t[1], t[2], out=o, _workspace=ws, meta_bcast=False, **cfg
+                ),
+                fns=[
+                    (lambda t=t, cfg=cfg, ws=ws_g, o=out_g: fused_decode_attention(
+                        t[0], t[1], t[2], out=o, _workspace=ws, meta_bcast=False, **cfg))
+                    for t in qreps
+                ],
+                n_replicas=r_q, footprint_bytes=r_q * cbytes,
+                cache_bytes=cbytes, effective_bits=ebits,
+                config=dict(cfg),
+            )
+        )
+
+        # The zero-point-folded score path: same tuned config again, but the
+        # scores come from a per-group dot against the raw codes instead of a
+        # dequantized K tile. Carried as its own row because the effect is
+        # regime-dependent -- it is not simply better -- and a single "best of"
+        # number would hide exactly the conditional that makes it interesting.
+        ws_f: dict = {}
+        out_f = torch.empty((B, HQ, D), device="cuda", dtype=torch.float32)
+        cases.append(
+            Case(
+                method=f"fused_fold_zp_{nbits}b",
+                ctx=ctx, nbits=nbits, group_size=group_size,
+                fn=lambda t=qreps[0], cfg=cfg, ws=ws_f, o=out_f: fused_decode_attention(
+                    t[0], t[1], t[2], out=o, _workspace=ws, fold_zp=True, **cfg
+                ),
+                fns=[
+                    (lambda t=t, cfg=cfg, ws=ws_f, o=out_f: fused_decode_attention(
+                        t[0], t[1], t[2], out=o, _workspace=ws, fold_zp=True, **cfg))
                     for t in qreps
                 ],
                 n_replicas=r_q, footprint_bytes=r_q * cbytes,
@@ -844,26 +945,46 @@ def main():
                 idle clocks in between. Bracketing the whole row instead would
                 report the ramp itself as instability and hide a genuinely
                 throttled measurement inside a wide average.
+
+                The ramp is handed *into* the timing function rather than only
+                run here, because everything between this point and the opening
+                of the clock window -- warmup, CUDA-graph capture, priming
+                replays -- is CPU-bound with the GPU near idle, and long enough
+                for the boost to decay. Ramping only out here systematically
+                penalised the fastest methods: the slow PyTorch baselines re-boost
+                themselves within their own first sample, while a 14 us kernel
+                never does, so the fp16 control failed the boost gate for being
+                fast rather than for being throttled.
                 """
+                ramp_holder = {}
+
+                def ramp():
+                    if monitor is not None:
+                        ramp_holder["inner"] = warm_clocks(
+                            monitor, env["max_sm_clock_mhz"]
+                        )
+
                 r = warm_clocks(monitor, env["max_sm_clock_mhz"]) if monitor is not None else None
                 span = [None, None]
                 t_a = time.time()
-                val = fn(span)
+                val = fn(span, ramp)
                 t_b = time.time()
                 lo = span[0] if span[0] is not None else t_a
                 hi = span[1] if span[1] is not None else t_b
                 w = monitor.window(lo, hi) if monitor is not None else None
-                return val, {"ramp": r, "clocks": w,
+                return val, {"ramp": r, "ramp_inner": ramp_holder.get("inner"),
+                             "clocks": w,
                              "sampling_seconds": hi - lo, "wall_seconds": t_b - t_a}
 
             # the hot-regime numbers get bootstrapped too, so they need enough
             # samples to bootstrap: half the cold count, not a fifth
             sub = max(10, samples // 2)
-            cold, cold_clk = timed(lambda sp: bench_graph_rotating(c.fns, samples, span=sp))
+            cold, cold_clk = timed(
+                lambda sp, w: bench_graph_rotating(c.fns, samples, span=sp, warm=w))
             cold_naive, cold_naive_clk = timed(
-                lambda sp: bench_cold(c.fn, flusher, sub, span=sp))
-            pipe, pipe_clk = timed(lambda sp: bench_pipelined(c.fn, sub, span=sp))
-            graph, graph_clk = timed(lambda sp: bench_graph(c.fn, sub, span=sp))
+                lambda sp, w: bench_cold(c.fn, flusher, sub, span=sp, warm=w))
+            pipe, pipe_clk = timed(lambda sp, w: bench_pipelined(c.fn, sub, span=sp, warm=w))
+            graph, graph_clk = timed(lambda sp, w: bench_graph(c.fn, sub, span=sp, warm=w))
             clocks = cold_clk["clocks"]
 
             row = {
@@ -927,8 +1048,12 @@ def main():
                 clk = f"clk {clocks['sm_mhz_mean']:4.0f} MHz ok"
             elif not row["clock_verified"]:
                 bad = clocks if not clocks["stable"] else gclk
-                clk = f"clk {bad['sm_mhz_min']:4.0f} MHz min NOT-BOOSTED"
-                unstable.append(f"{c.method}@{ctx} (clocks)")
+                if not bad.get("enough_samples", True):
+                    clk = f"only {bad['n_samples']} clock samples TOO-SHORT"
+                    unstable.append(f"{c.method}@{ctx} (too few clock samples)")
+                else:
+                    clk = f"clk {bad['sm_mhz_min']:4.0f} MHz min NOT-BOOSTED"
+                    unstable.append(f"{c.method}@{ctx} (clocks)")
             else:
                 clk = f"IQR {row['cold']['iqr_frac_of_median']:.1%} TOO-NOISY"
                 unstable.append(f"{c.method}@{ctx} (dispersion)")
@@ -950,6 +1075,8 @@ def main():
         "max_iqr_frac": MAX_IQR_FRAC,
         "temp_limit_c": CLOCK_TEMP_LIMIT_C,
         "ramp_target_frac": CLOCK_TARGET_FRAC,
+        "min_clock_samples": MIN_CLOCK_SAMPLES,
+        "min_sampling_seconds": MIN_SAMPLING_SECONDS,
         "clocks_at_end": smi_once(),
         "n_rows": len(rows),
         "n_rows_clock_verified": sum(1 for r in rows if r.get("clock_verified")),

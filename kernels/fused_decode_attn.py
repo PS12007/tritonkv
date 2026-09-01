@@ -33,6 +33,24 @@ loaded ``P`` times, but those extra loads all hit the same cache line, so DRAM
 traffic is unchanged and the result is a dense ``(BLOCK_N, D)`` tile with no
 reshape, transpose-through-shared-memory, or unrolled accumulator list.
 
+*Narrow metadata loads.* The per-group scale and zero are loaded at their real
+shape, ``(BLOCK_N, D // group_size)``, and expanded to ``(BLOCK_N, D)`` in
+registers. The obvious alternative -- index them with ``d // group_size`` and
+let the load unit re-read each parameter ``group_size`` times -- was what this
+kernel did originally, on the same "the repeats hit the same cache line"
+reasoning as the paragraph above. That reasoning is sound about DRAM traffic and
+wrong about issue slots, and this kernel is issue-bound: the 4-bit path reached
+~64 GB/s while the fp16 control did ~410 GB/s out of L2. Loading the metadata at
+its real width cut the compiled kernel from 2245 to 1653 instructions and
+registers from 244 to 128, for a measured 1.05-1.48x depending on regime and
+context.
+
+Note what does *not* follow. The same transformation applied to the packed code
+bytes is a **loss** (0.69-0.96x at ctx >= 8192): it pushes registers back up to
+223, because the codes are needed at full width regardless, so expanding them
+from a narrow load adds a live tile without removing one. The win is specific to
+loads whose expanded form is redundant, not to redundant loads in general.
+
 *GQA amortization.* One program owns one KV head and *all* the query heads that
 share it. The dequantized K/V tile is produced once and consumed by every query
 head in the group via ``tl.dot``, so the expensive part (unpacking the cache) is
@@ -74,6 +92,52 @@ if triton is not None:
     _LOG2E = tl.constexpr(1.4426950408889634)
 
     @triton.jit
+    def _load_group_meta(
+        base, offs_n, n_mask, stride_n, stride_g,
+        BLOCK_N: tl.constexpr,
+        NG: tl.constexpr,
+        GS: tl.constexpr,
+        D: tl.constexpr,
+        BCAST: tl.constexpr,
+    ):
+        """Return a ``(BLOCK_N, D)`` fp32 tile of a per-group scale or zero.
+
+        Both branches produce identical values; they differ only in how many
+        load instructions it takes.
+
+        ``BCAST=False`` is the obvious form: index the metadata with
+        ``d // GS`` and let the load unit re-read every group parameter ``GS``
+        times. The redundant reads all hit the same cache line, so it costs no
+        DRAM traffic -- which is why it looked free -- but it still issues one
+        load per (token, dim), i.e. ``BLOCK_N * D`` of them per tile, four
+        times per iteration (K and V, scale and zero).
+
+        ``BCAST=True`` loads the ``(BLOCK_N, NG)`` tile that actually exists in
+        memory and expands it in registers. Same values, ``GS x`` fewer loads.
+        This matters here because the kernel is issue-bound, not
+        bandwidth-bound: the 4-bit path reaches ~64 GB/s while the fp16 control
+        does ~410 GB/s out of L2, so instruction count is the binding
+        constraint and DRAM traffic is not.
+        """
+        if BCAST:
+            meta = tl.load(
+                base
+                + offs_n[:, None] * stride_n
+                + tl.arange(0, NG)[None, :] * stride_g,
+                mask=n_mask[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            return tl.reshape(
+                tl.broadcast_to(meta[:, :, None], (BLOCK_N, NG, GS)), (BLOCK_N, D)
+            )
+        grp_idx = tl.arange(0, D) // GS
+        return tl.load(
+            base + offs_n[:, None] * stride_n + grp_idx[None, :] * stride_g,
+            mask=n_mask[:, None],
+            other=0.0,
+        ).to(tl.float32)
+
+    @triton.jit
     def _fused_decode_attn_split(
         Q,
         KP, KS, KZ,
@@ -95,10 +159,13 @@ if triton is not None:
         DP: tl.constexpr,
         NBITS: tl.constexpr,
         GS: tl.constexpr,
+        NG: tl.constexpr,
         BLOCK_H: tl.constexpr,
         BLOCK_N: tl.constexpr,
         SPLIT_SIZE: tl.constexpr,
         SINGLE_SPLIT: tl.constexpr,
+        BCAST_META: tl.constexpr,
+        FOLD_ZP: tl.constexpr,
     ):
         pid_bh = tl.program_id(0)
         pid_s = tl.program_id(1)
@@ -113,7 +180,6 @@ if triton is not None:
         offs_d = tl.arange(0, D)
         byte_idx = offs_d % DP                 # which packed byte holds dim d
         bit_shift = (offs_d // DP) * NBITS     # which bit-slice inside that byte
-        grp_idx = offs_d // GS                 # which quant group dim d is in
         code_mask = (1 << NBITS) - 1
 
         # (BLOCK_H, D) query tile, fp16 for tl.dot. sm_scale is applied to the
@@ -143,27 +209,70 @@ if triton is not None:
             offs_n = start_n + tl.arange(0, BLOCK_N)
             n_mask = offs_n < hi
 
-            # ---- dequantize K tile: (BLOCK_N, D) -------------------------
-            kp = tl.load(
-                kp_base + offs_n[:, None] * stride_kpn + byte_idx[None, :] * stride_kpd,
-                mask=n_mask[:, None],
-                other=0,
-            ).to(tl.int32)
-            kcode = (kp >> bit_shift[None, :]) & code_mask
-            ksc = tl.load(
-                ks_base + offs_n[:, None] * stride_ksn + grp_idx[None, :] * stride_ksg,
-                mask=n_mask[:, None],
-                other=0.0,
-            ).to(tl.float32)
-            kze = tl.load(
-                kz_base + offs_n[:, None] * stride_ksn + grp_idx[None, :] * stride_ksg,
-                mask=n_mask[:, None],
-                other=0.0,
-            ).to(tl.float32)
-            k_deq = (kcode.to(tl.float32) * ksc + kze).to(tl.float16)
+            # ---- scores from the packed K tile ---------------------------
+            if FOLD_ZP:
+                # Never materialize a dequantized K tile. Within a quant group
+                # the scale and zero are constant over d, so
+                #
+                #   sum_d q[d] * (code[d]*scale_g + zero_g)
+                #     = scale_g * sum_{d in g} q[d]*code[d] + zero_g * sum_{d in g} q[d]
+                #
+                # which turns the per-element fp32 multiply-add over a
+                # (BLOCK_N, D) tile into one dot per group against the raw
+                # codes, plus two fp32 ops on the much smaller (BLOCK_H,
+                # BLOCK_N) score tile. ``sum_{d in g} q[d]`` does not depend on
+                # the token, so it is loop-invariant and hoists out entirely.
+                qk = tl.zeros([BLOCK_H, BLOCK_N], dtype=tl.float32)
+                for g in tl.static_range(NG):
+                    offs_dg = g * GS + tl.arange(0, GS)
+                    q_g = tl.load(
+                        Q + b * stride_qb + qh[:, None] * stride_qh
+                        + offs_dg[None, :] * stride_qd,
+                        mask=h_mask[:, None],
+                        other=0.0,
+                    ).to(tl.float16)
+                    kp_g = tl.load(
+                        kp_base + offs_n[:, None] * stride_kpn
+                        + (offs_dg % DP)[None, :] * stride_kpd,
+                        mask=n_mask[:, None],
+                        other=0,
+                    ).to(tl.int32)
+                    # Codes are small non-negative integers, so fp16 holds them
+                    # exactly and the dot loses nothing to the conversion.
+                    kc_g = (
+                        (kp_g >> ((offs_dg // DP) * NBITS)[None, :]) & code_mask
+                    ).to(tl.float16)
+                    ksc_g = tl.load(
+                        ks_base + offs_n * stride_ksn + g * stride_ksg,
+                        mask=n_mask, other=0.0,
+                    ).to(tl.float32)
+                    kze_g = tl.load(
+                        kz_base + offs_n * stride_ksn + g * stride_ksg,
+                        mask=n_mask, other=0.0,
+                    ).to(tl.float32)
+                    qsum_g = tl.sum(q_g.to(tl.float32), 1)
+                    qk += tl.dot(q_g, tl.trans(kc_g), out_dtype=tl.float32) * ksc_g[None, :]
+                    qk += qsum_g[:, None] * kze_g[None, :]
+                qk = qk * qk_scale
+            else:
+                kp = tl.load(
+                    kp_base + offs_n[:, None] * stride_kpn + byte_idx[None, :] * stride_kpd,
+                    mask=n_mask[:, None],
+                    other=0,
+                ).to(tl.int32)
+                kcode = (kp >> bit_shift[None, :]) & code_mask
+                ksc = _load_group_meta(
+                    ks_base, offs_n, n_mask, stride_ksn, stride_ksg,
+                    BLOCK_N, NG, GS, D, BCAST_META,
+                )
+                kze = _load_group_meta(
+                    kz_base, offs_n, n_mask, stride_ksn, stride_ksg,
+                    BLOCK_N, NG, GS, D, BCAST_META,
+                )
+                k_deq = (kcode.to(tl.float32) * ksc + kze).to(tl.float16)
+                qk = tl.dot(q, tl.trans(k_deq), out_dtype=tl.float32) * qk_scale
 
-            # ---- scores + online softmax ---------------------------------
-            qk = tl.dot(q, tl.trans(k_deq), out_dtype=tl.float32) * qk_scale
+            # ---- online softmax ------------------------------------------
             qk = tl.where(n_mask[None, :], qk, float("-inf"))
 
             m_new = tl.maximum(m_i, tl.max(qk, 1))
@@ -181,16 +290,14 @@ if triton is not None:
                 other=0,
             ).to(tl.int32)
             vcode = (vp >> bit_shift[None, :]) & code_mask
-            vsc = tl.load(
-                vs_base + offs_n[:, None] * stride_vsn + grp_idx[None, :] * stride_vsg,
-                mask=n_mask[:, None],
-                other=0.0,
-            ).to(tl.float32)
-            vze = tl.load(
-                vz_base + offs_n[:, None] * stride_vsn + grp_idx[None, :] * stride_vsg,
-                mask=n_mask[:, None],
-                other=0.0,
-            ).to(tl.float32)
+            vsc = _load_group_meta(
+                vs_base, offs_n, n_mask, stride_vsn, stride_vsg,
+                BLOCK_N, NG, GS, D, BCAST_META,
+            )
+            vze = _load_group_meta(
+                vz_base, offs_n, n_mask, stride_vsn, stride_vsg,
+                BLOCK_N, NG, GS, D, BCAST_META,
+            )
             v_deq = (vcode.to(tl.float32) * vsc + vze).to(tl.float16)
 
             acc += tl.dot(p.to(tl.float16), v_deq, out_dtype=tl.float32)
@@ -291,6 +398,8 @@ def fused_decode_attention(
     num_warps: int = 4,
     num_stages: int = 2,
     num_splits: int | None = None,
+    meta_bcast: bool = True,
+    fold_zp: bool = False,
     out: torch.Tensor | None = None,
     _workspace: dict | None = None,
 ) -> torch.Tensor:
@@ -302,6 +411,17 @@ def fused_decode_attention(
         ``(B, HQ, D)``. Cast to fp16 internally for the tensor-core path.
     kq, vq:
         Quantized caches with ``packed`` of shape ``(B, HKV, S, D//P)``.
+    meta_bcast:
+        Load the per-group scale/zero as ``(BLOCK_N, n_groups)`` and expand in
+        registers, instead of gathering a full ``(BLOCK_N, head_dim)`` tile.
+        Numerically identical; ``False`` restores the original gather and
+        exists so the two can be measured against each other.
+    fold_zp:
+        Compute the scores with a per-group dot against the raw codes instead
+        of dequantizing K first (see ``FOLD_ZP`` in the kernel). Changes the
+        summation order and skips one fp16 rounding, so results are close to
+        but not bitwise equal to the other paths. Requires
+        ``group_size >= 16``.
     out:
         Optional preallocated ``(B, HQ, D)`` float32 output.
     _workspace:
@@ -327,6 +447,12 @@ def fused_decode_attention(
         raise ValueError(f"HQ={HQ} must be a multiple of HKV={HKV}")
     if D & (D - 1):
         raise ValueError(f"head_dim must be a power of two, got {D}")
+    if D % kq.group_size:
+        raise ValueError(f"head_dim {D} must be a multiple of group_size {kq.group_size}")
+    if fold_zp and kq.group_size < 16:
+        raise ValueError(
+            f"fold_zp needs group_size >= 16 for tl.dot, got {kq.group_size}"
+        )
 
     group = HQ // HKV
     sm_scale = 1.0 / math.sqrt(D) if sm_scale is None else sm_scale
@@ -389,10 +515,13 @@ def fused_decode_attention(
         DP=DP,
         NBITS=kq.nbits,
         GS=kq.group_size,
+        NG=D // kq.group_size,
         BLOCK_H=block_h,
         BLOCK_N=block_n,
         SPLIT_SIZE=split_size,
         SINGLE_SPLIT=single,
+        BCAST_META=meta_bcast,
+        FOLD_ZP=fold_zp,
         num_warps=num_warps,
         num_stages=num_stages,
     )

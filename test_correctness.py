@@ -287,3 +287,28 @@ def test_per_element_worst_case_not_hidden_by_aggregate():
     assert worst_relative < 0.05, (
         f"worst element is {worst_relative:.3f}x the mean |output| off"
     )
+
+
+@requires_triton
+@pytest.mark.parametrize("S", [1, 17, 512, 2048, 8192])
+@pytest.mark.parametrize("nbits", SUPPORTED_BITS)
+@pytest.mark.parametrize("group_size", [16, 32, 64, 128])
+def test_metadata_broadcast_is_bitwise_identical(S: int, nbits: int, group_size: int):
+    """The two metadata-load paths must agree to the last bit.
+
+    ``meta_bcast=True`` loads the ``(BLOCK_N, n_groups)`` scale/zero tile that
+    actually exists in memory and expands it in registers; ``False`` gathers a
+    full ``(BLOCK_N, head_dim)`` tile with ``d // group_size``. They read the
+    same fp16 values and feed them into the same arithmetic, so the outputs are
+    not merely close, they are equal -- and asserting equality rather than a
+    tolerance is what keeps the slow path from silently drifting away from the
+    fast one now that only the fast one is on by default.
+    """
+    q, k, v = make_random_kv(1, 12, 2, S, 128, device="cuda", seed=11)
+    kq, vq = quantize_kv(k, v, nbits, group_size)
+    gathered = fused_decode_attention(q, kq, vq, meta_bcast=False)
+    broadcast = fused_decode_attention(q, kq, vq, meta_bcast=True)
+    assert torch.equal(gathered, broadcast), (
+        f"S={S} nbits={nbits} gs={group_size}: max|diff| = "
+        f"{(gathered - broadcast).abs().max().item():.3e}"
+    )
