@@ -191,3 +191,69 @@ when it does.** That is the thing worth writing up.
 and the 2048 row is not credible. Suspected laptop power/thermal throttling
 (80 W cap; idle clocks observed at 180 MHz SM / 810 MHz mem). Must be re-run
 with clock monitoring before any of it is quoted.
+
+---
+
+## 2026-09-01 11:45 — The clock-monitored re-run overturns the headline
+
+**Attempted:** the task at the top of `next_steps.md` — re-run the cold
+benchmark with clock monitoring, on the theory that the +-50-100us variance and
+the incredible ctx=2048 row were power/thermal throttling.
+
+**What happened:** they were. And the throttling was not adding noise to the
+result, it was *creating* it.
+
+`benchmark.py` now runs a background `nvidia-smi -lms 100` sampler, spins the GPU
+to >=80% of max SM clock before every measurement, and attributes clock samples
+to the sampling loop only. Three iterations were needed to get the gate right:
+
+1. Bracketing the whole row and requiring <5% SM-clock spread rejected 14/16
+   rows. Wrong gate: a boosting GPU dithers several percent between samples
+   under steady load, while the timings themselves had <2% IQR.
+2. The gate that matters is **boosted, not constant** — every sample >=70% of the
+   3090 MHz max — plus the measurement's own IQR <=5% of its median. Two
+   independent gates: was the GPU at speed, and did the samples agree.
+3. Even then, slow baselines failed. The clock window was covering warmup and
+   CUDA-graph capture, during which the GPU idles back down. Added a `span`
+   out-parameter to each `bench_*` so the window covers the **sampling loop
+   only**. 13/16 on the smoke run, 22/32 on the full run.
+
+**The number that changed.** Previously reported DRAM-resident quantization
+effect (fp16 control / fused 4-bit):
+
+| ctx | before | after |
+|---|---|---|
+| 2048 | 0.19x | 1.14x |
+| 8192 | **11.11x** | 1.20x |
+| 16384 | **15.58x** | 1.32x |
+
+The fp16 control at 16k was measured at 795us. It is 63.4us. A 12.5x error, and
+the SM clock range on this part is 285 -> 3090 MHz, which is 10.8x. The control
+kernel is fast enough that its whole measurement fit inside the GPU's spin-up.
+The old benchmark could not see this because it never recorded the clocks.
+
+**So the L2-conditional finding survives, but at a tenth of the size.** The sign
+still flips — quantization costs 1.4-2x when the cache is L2-resident and pays
+1.14-1.32x when it is not — and that is still the interesting claim, because it
+is a claim about *when*, not about a factor. The 11-15x was never real.
+
+**Also done in this session:**
+
+- `audit_claims.py` gained the attribution section it was missing: flash-decoding
+  effect, quantization effect in both regimes, the L2 conditional, and a
+  `method.clock_verified` claim. It now also refuses to quote a ratio whose
+  baseline failed the clock gate — a de-boosted baseline inflates every speedup
+  measured against it, always in the flattering direction. 63 claims:
+  24 TRUE / 20 CONDITIONAL / 9 MISLEADING / **10 FALSE**, all ten of them ours.
+- `stats()` reports median/p25/p75/IQR alongside mean/std; the console and the
+  README now lead with median (IQR).
+- Raw per-sample hot-regime timings (`graph_raw_ms`) are stored, so the
+  L2-resident regime gets bootstrap CIs too rather than a bare mean.
+- `make_plots.py` + `docs/plots/` (8 figures), `docs/key_numbers.md`,
+  `docs/thread_outline.md`, and a rewritten README results section.
+
+**The lesson worth keeping:** the earlier session did the right adversarial
+thing — build a control kernel to falsify your own thesis — and still got a
+wrong answer, because the control was the *fastest* thing being measured and so
+was the most sensitive to a slow GPU. Falsification does not help if the
+measurement apparatus is what is lying. Check the apparatus first.

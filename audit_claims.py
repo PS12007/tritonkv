@@ -107,6 +107,14 @@ class Bench:
             return None
         return r["pipelined"]["mean_ms"]
 
+    def hot_raw(self, method: str, ctx: int) -> list[float] | None:
+        """Raw per-sample hot (L2-resident, graph-replay) timings, if recorded."""
+        r = self.get(method, ctx)
+        return (r or {}).get("graph_raw_ms")
+
+    def quotable(self, method: str, ctx: int) -> bool:
+        return bool((self.get(method, ctx) or {}).get("quotable"))
+
     def corr(self, ctx: int, nbits: int):
         for row in self.p["correctness"]:
             if row["ctx"] == ctx and row["nbits"] == nbits:
@@ -146,6 +154,8 @@ def audit_speed(b: Bench, nbits: int = 4) -> list[Claim]:
             verdict = "FALSE"
         else:
             verdict = "MISLEADING"
+        caveat = clock_caveat(b, ctx, fused, eager)
+        verdict = downgrade(verdict, caveat)
         claims.append(
             Claim(
                 id=f"speed.eager.{nbits}b.ctx{ctx}",
@@ -157,7 +167,7 @@ def audit_speed(b: Bench, nbits: int = 4) -> list[Claim]:
                 evidence=(
                     f"bootstrap 95% CI of the speedup ratio = [{lo:.2f}x, {hi:.2f}x] over "
                     f"{len(b.cold(fused, ctx))} cold-L2 samples per method; measurement noise "
-                    f"CV = {cvf * 100:.1f}% (fused) / {cve * 100:.1f}% (baseline)."
+                    f"CV = {cvf * 100:.1f}% (fused) / {cve * 100:.1f}% (baseline)." + caveat
                 ),
                 falsification_attempted=(
                     "Tried to show the gap is run-to-run jitter by resampling the raw "
@@ -278,6 +288,8 @@ def audit_speed(b: Bench, nbits: int = 4) -> list[Claim]:
             v = "FALSE"
         else:
             v = "MISLEADING"
+        caveat = clock_caveat(b, ctx, fused, "fp16_sdpa")
+        v = downgrade(v, caveat)
         claims.append(
             Claim(
                 id=f"speed.vs_fp16.{nbits}b.ctx{ctx}",
@@ -286,7 +298,7 @@ def audit_speed(b: Bench, nbits: int = 4) -> list[Claim]:
                     f"unquantized fp16 SDPA ({r:.2f}x)."
                 ),
                 verdict=v,
-                evidence=f"bootstrap 95% CI [{lo:.2f}x, {hi:.2f}x].",
+                evidence=f"bootstrap 95% CI [{lo:.2f}x, {hi:.2f}x]." + caveat,
                 falsification_attempted=(
                     "Compared against fp16 SDPA, which does no dequantization at all and "
                     "dispatches to a hand-tuned cuDNN/flash path. This is the comparison "
@@ -459,6 +471,285 @@ def audit_correctness(b: Bench) -> list[Claim]:
                 )
             )
     return claims
+
+
+# ---------------------------------------------------------------------------
+# Attribution: which part of the speedup is actually the quantization?
+#
+# This is the section that exists because the honest answer turned out to be
+# "mostly none of it". The kernel beats PyTorch SDPA by a large factor, but it
+# changes two things at once: it stores KV in 4 or 2 bits, *and* it splits the
+# history across SMs (flash-decoding), which PyTorch's SDPA does not do for a
+# single query token. `triton_fp16_control` is the same kernel with the same
+# split, the same online softmax and the same GQA amortization, reading plain
+# fp16 -- so the two ratios below separate the two effects.
+# ---------------------------------------------------------------------------
+
+CONTROL = "triton_fp16_control"
+
+
+def clock_caveat(b: Bench, ctx: int, *methods: str) -> str:
+    """Flag a ratio whose inputs were not measured at boost clocks.
+
+    A baseline timed while the GPU had dropped to idle clocks looks slower than
+    it is, which inflates every speedup computed against it -- in the flattering
+    direction. So a claim built on such a row says so instead of quoting it.
+    """
+    if not b.p.get("clock_monitoring"):
+        return ""
+    bad = [m for m in methods if b.get(m, ctx) and not b.quotable(m, ctx)]
+    if not bad:
+        return ""
+    return (
+        " NOT CLOCK-VERIFIED: " + ", ".join(bad) + f" at ctx={ctx} failed the boost-clock "
+        "or dispersion gate, so this ratio may be inflated by a measurement taken at "
+        "reduced clocks; treat it as conditional on a re-run."
+    )
+
+
+def downgrade(verdict: str, caveat: str) -> str:
+    return "TRUE BUT CONDITIONAL" if (caveat and verdict == "TRUE") else verdict
+
+
+def _verdict(lo: float, hi: float) -> str:
+    if lo > PRACTICAL_THRESHOLD:
+        return "TRUE"
+    if hi < 1.0:
+        return "FALSE"
+    return "MISLEADING"
+
+
+def audit_attribution(b: Bench, nbits: int = 4) -> list[Claim]:
+    """Split the headline speedup into flash-decoding and quantization."""
+    claims: list[Claim] = []
+    fused = f"fused_triton_{nbits}b"
+
+    if b.cold(CONTROL, b.contexts[0]) is None:
+        return [
+            Claim(
+                id=f"attribution.control_missing.{nbits}b",
+                claim=(
+                    f"The {nbits}-bit kernel's speedup over PyTorch is attributable to "
+                    "quantization."
+                ),
+                verdict="MISLEADING",
+                evidence=(
+                    "No fp16 control kernel is present in these results, so the measurement "
+                    "cannot separate quantization from the flash-decoding split that the "
+                    "same kernel also performs. Re-run benchmark.py with "
+                    f"{CONTROL} enabled before making any attribution claim."
+                ),
+                falsification_attempted=(
+                    "Refused to attribute the win to quantization on evidence that cannot "
+                    "distinguish the two mechanisms."
+                ),
+            )
+        ]
+
+    # --- per context: split total speedup into split-effect x quant-effect ---
+    split_only, quant_cold, quant_hot = {}, {}, {}
+    for ctx in b.contexts:
+        sdpa, ctrl, fus = b.cold("fp16_sdpa", ctx), b.cold(CONTROL, ctx), b.cold(fused, ctx)
+        if sdpa and ctrl:
+            split_only[ctx] = bootstrap_ratio_ci(sdpa, ctrl)
+        if ctrl and fus:
+            quant_cold[ctx] = bootstrap_ratio_ci(ctrl, fus)
+        h_ctrl, h_fus = b.hot_raw(CONTROL, ctx), b.hot_raw(fused, ctx)
+        if h_ctrl and h_fus:
+            quant_hot[ctx] = bootstrap_ratio_ci(h_ctrl, h_fus)
+
+    # --- Claim 1: most of the headline number is the split, not the bits ----
+    if split_only and quant_cold:
+        shared = sorted(set(split_only) & set(quant_cold))
+        worst = min(shared, key=lambda c: quant_cold[c][0]) if shared else None
+        claims.append(
+            Claim(
+                id=f"attribution.headline.{nbits}b",
+                claim=(
+                    f"The fused {nbits}-bit kernel's speedup over PyTorch SDPA shows that "
+                    "quantizing the KV cache makes decode attention faster."
+                ),
+                verdict="MISLEADING",
+                evidence=(
+                    "The kernel changes two things at once. Holding the algorithm fixed and "
+                    "varying only the storage format: an identical fp16 kernel (same split, "
+                    "same online softmax, same GQA amortization, no dequantization) already "
+                    "reaches "
+                    + ", ".join(f"{c}:{split_only[c][0]:.1f}x" for c in shared)
+                    + " against fp16 SDPA on its own. What the quantization then adds is "
+                    + ", ".join(f"{c}:{quant_cold[c][0]:.2f}x" for c in shared)
+                    + " (DRAM-resident) -- the split, not the bit width, is most of the "
+                    "headline number."
+                ),
+                falsification_attempted=(
+                    "Wrote a control kernel specifically to try to make the quantization "
+                    "look unnecessary, and it largely succeeded. The remaining question -- "
+                    "whether quantization ever pays for itself -- is answered separately "
+                    f"below (weakest DRAM-resident case: ctx={worst})."
+                    if worst is not None
+                    else "Wrote an fp16 control kernel to isolate the two effects."
+                ),
+            )
+        )
+
+    # --- Claim 2: quantization in the L2-resident (hot) regime --------------
+    for ctx, (r, lo, hi) in sorted(quant_hot.items()):
+        caveat = clock_caveat(b, ctx, fused, CONTROL)
+        v = downgrade(_verdict(lo, hi), caveat)
+        claims.append(
+            Claim(
+                id=f"attribution.quant_effect.hot.{nbits}b.ctx{ctx}",
+                claim=(
+                    f"With the KV cache resident in L2 at {ctx} tokens, reading it as "
+                    f"{nbits}-bit codes is faster than reading it as fp16."
+                ),
+                verdict=v,
+                evidence=(
+                    f"fp16 control / fused {nbits}-bit, CUDA-graph replay on an "
+                    f"L2-resident cache: {r:.2f}x, bootstrap 95% CI [{lo:.2f}x, {hi:.2f}x]. "
+                    + (
+                        f"Below 1.0x: the quantized path costs {1 / r:.2f}x more time."
+                        if hi < 1.0
+                        else ""
+                    )
+                    + caveat
+                ),
+                falsification_attempted=(
+                    "Compared against the same kernel rather than against PyTorch, so the "
+                    "only difference is the dequantization. When the bytes are already in "
+                    "L2 there is little traffic left to save and the unpack/scale/fma chain "
+                    "is pure added work -- so this is the regime where quantization is "
+                    "expected to lose, and it does."
+                ),
+            )
+        )
+
+    # --- Claim 3: quantization in the DRAM-resident (cold) regime -----------
+    for ctx, (r, lo, hi) in sorted(quant_cold.items()):
+        caveat = clock_caveat(b, ctx, fused, CONTROL)
+        v = downgrade(_verdict(lo, hi), caveat)
+        row = b.get(fused, ctx) or {}
+        over = row.get("footprint_over_l2")
+        claims.append(
+            Claim(
+                id=f"attribution.quant_effect.cold.{nbits}b.ctx{ctx}",
+                claim=(
+                    f"With the working set larger than L2 at {ctx} tokens, storing the KV "
+                    f"cache in {nbits} bits is faster than storing it in fp16."
+                ),
+                verdict=v,
+                evidence=(
+                    f"fp16 control / fused {nbits}-bit over a rotating working set "
+                    + (f"{over:.1f}x the size of L2" if over else "larger than L2")
+                    + f": {r:.2f}x, bootstrap 95% CI [{lo:.2f}x, {hi:.2f}x]." + caveat
+                ),
+                falsification_attempted=(
+                    "Same kernel, same split, same softmax; only the storage format "
+                    "differs. Both sides pay the same rotating-working-set penalty, so a "
+                    "win here is a bytes-moved win and not a caching artefact."
+                ),
+            )
+        )
+
+    # --- Claim 4: the conditional that the whole project turns on -----------
+    if quant_hot and quant_cold:
+        shared = sorted(set(quant_hot) & set(quant_cold))
+        hot_losses = [c for c in shared if quant_hot[c][2] < 1.0]
+        cold_wins = [c for c in shared if quant_cold[c][1] > PRACTICAL_THRESHOLD]
+        if hot_losses and cold_wins:
+            verdict = "TRUE BUT CONDITIONAL"
+        elif cold_wins:
+            verdict = "TRUE"
+        else:
+            verdict = "MISLEADING"
+        claims.append(
+            Claim(
+                id=f"attribution.l2_conditional.{nbits}b",
+                claim=(
+                    f"Fusing dequantization into decode attention is worth doing at "
+                    f"{nbits} bits."
+                ),
+                verdict=verdict,
+                evidence=(
+                    "The sign of the effect depends on where the KV cache lives. "
+                    "Quantization effect (fp16 control / fused), same kernel on both sides: "
+                    + "; ".join(
+                        f"ctx={c}: {quant_hot[c][0]:.2f}x L2-resident vs "
+                        f"{quant_cold[c][0]:.2f}x DRAM-resident"
+                        for c in shared
+                    )
+                    + ". Condition: the fused kernel pays for itself only once the working "
+                    f"set exceeds this GPU's "
+                    f"{(b.env.get('l2_cache_bytes') or 0) / 1e6:.0f} MB L2"
+                    + (
+                        f"; it loses at ctx={hot_losses} when the cache fits in L2."
+                        if hot_losses
+                        else "."
+                    )
+                ),
+                falsification_attempted=(
+                    "Measured both regimes with the same control kernel rather than "
+                    "reporting whichever regime flattered the result. A single "
+                    "unconditional Nx figure was available from either regime alone, and "
+                    "would have been wrong in the other."
+                ),
+            )
+        )
+
+    return claims
+
+
+def audit_measurement(b: Bench) -> list[Claim]:
+    """Were the timings taken on a GPU that was actually at boost clocks?"""
+    cm = b.p.get("clock_monitoring")
+    if not cm or not cm.get("monitored"):
+        return [
+            Claim(
+                id="method.clock_verified",
+                claim="The reported timings were taken under controlled GPU clocks.",
+                verdict="MISLEADING",
+                evidence=(
+                    "These results carry no clock telemetry, so nothing is known about what "
+                    "the SM clock was doing while they were measured. On the laptop part "
+                    "used here the idle clock is roughly a ninth of the boost clock, which "
+                    "is a larger effect than most of what is being measured."
+                ),
+                falsification_attempted=(
+                    "Checked for clock telemetry in the results file rather than assuming "
+                    "the GPU was in a steady state."
+                ),
+            )
+        ]
+    n, ok = cm.get("n_rows", 0), cm.get("n_rows_quotable", 0)
+    rejected = cm.get("rejected_rows") or []
+    return [
+        Claim(
+            id="method.clock_verified",
+            claim="The reported timings were taken under controlled GPU clocks.",
+            verdict="TRUE" if ok == n else "TRUE BUT CONDITIONAL",
+            evidence=(
+                f"{ok} of {n} rows satisfy both gates: every nvidia-smi sample taken during "
+                f"the sampling loop was at or above {cm['boost_floor_frac']:.0%} of the "
+                f"{cm['max_sm_clock_mhz']:.0f} MHz maximum SM clock, and the timing's own "
+                f"IQR was at most {cm['max_iqr_frac']:.0%} of its median. "
+                + (
+                    "Rejected and not quoted anywhere: " + ", ".join(rejected) + "."
+                    if rejected
+                    else "No row was rejected."
+                )
+            ),
+            falsification_attempted=(
+                "The GPU is an 80 W laptop RTX 5060 that idles near 285 MHz and boosts to "
+                "3090 MHz, and pinning clocks with nvidia-smi -lgc needs administrator "
+                "rights. So instead the GPU is deliberately spun up to at least "
+                f"{cm['ramp_target_frac']:.0%} of maximum before every measurement, the "
+                "clocks are sampled throughout, and the window is attributed to the "
+                "sampling loop only -- warmup and CUDA-graph capture, during which the GPU "
+                "is free to fall back to idle clocks, are excluded so they are neither "
+                "mistaken for throttling nor able to hide it."
+            ),
+        )
+    ]
 
 
 def audit_scope(b: Bench) -> list[Claim]:
@@ -739,8 +1030,10 @@ def main():
     for nbits in b.p["bit_widths"]:
         claims += audit_speed(b, nbits)
         claims += audit_memory(b, nbits)
+        claims += audit_attribution(b, nbits)
     claims += audit_correctness(b)
     claims += audit_scope(b)
+    claims += audit_measurement(b)
     if not args.no_gpu_checks:
         claims += gpu_checks(b)
 

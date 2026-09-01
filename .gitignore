@@ -13,6 +13,7 @@ env/
 # Benchmark artifacts (regenerate with `python benchmark.py`)
 results/*.json
 results/*.csv
+results/*.md
 
 # OS / editor
 .DS_Store
