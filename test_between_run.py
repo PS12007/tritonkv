@@ -41,7 +41,8 @@ def _series(mean: float, n: int = 60, jitter: float = 0.002, seed: int = 0):
 
 
 def _payload(scale: float = 1.0, *, quotable: bool = True, seed: int = 0,
-             samples: int = 50, group_size: int = 32) -> dict:
+             samples: int = 50, group_size: int = 32,
+             methods: str | None = None, preload: float = 0.0) -> dict:
     """A benchmark.json-shaped payload where `fused_triton_4b` is `scale` times
     slower than it is at scale=1.0 and everything else is held fixed."""
     base = {
@@ -77,7 +78,9 @@ def _payload(scale: float = 1.0, *, quotable: bool = True, seed: int = 0,
         "env": {},
         "correctness": [],
         "args": {"samples": samples, "passes": 1, "group_size": group_size,
-                 "model": "synthetic", "batch": 1},
+                 "model": "synthetic", "batch": 1,
+                 **({"methods": methods} if methods else {}),
+                 **({"preload": preload} if preload else {})},
         "clock_monitoring": {"monitored": False},
         "wall_clock_seconds": 1.0,
     }
@@ -570,3 +573,200 @@ def test_bandwidth_sensitivity_needs_three_rows_for_a_correlation():
     rows, corr, _ = compare_protocols.bandwidth_sensitivity(
         groups, [CTX], ["fused_triton_4b"])
     assert len(rows) < 3 and corr is None
+
+
+# ---------------------------------------------------------------------------
+# compare_protocols: the 2x2, and which of the two factors actually moved
+# ---------------------------------------------------------------------------
+#
+# `full` (12 methods, ~800 s) and `subset` (3 methods, ~205 s) differ in two
+# ways at once, so neither "the run was longer" nor "the memory system was
+# recently saturated" could be blamed. The fourth cell -- 12 methods *with* the
+# preload -- is what separates them.
+
+FEW, MANY = "attribution", "all"
+NONE, PRE = 0.0, 300.0
+LEVELS = ([FEW, MANY], [NONE, PRE])
+
+
+def _cell_group(name, *, methods=None, preload=0.0, scale=1.0, n=3, nbytes=0):
+    entries = []
+    for i in range(n):
+        d = _payload(scale, seed=i, methods=methods, preload=preload)
+        if nbytes:
+            for row in d["results"]:
+                row["cache_bytes_1layer"] = nbytes
+        entries.append((f"{name}{i}", Bench(d)))
+    return entries
+
+
+def _square(nbytes=0, **scales):
+    """The four protocol cells, in the order the real command line supplies."""
+    return {
+        "full": _cell_group("f", scale=scales.get("full", 1.0), nbytes=nbytes),
+        "subset": _cell_group("s", methods=FEW, nbytes=nbytes,
+                              scale=scales.get("subset", 1.0)),
+        "preloaded": _cell_group("p", methods=FEW, preload=PRE, nbytes=nbytes,
+                                 scale=scales.get("preloaded", 1.0)),
+        "fullpre": _cell_group("fp", preload=PRE, nbytes=nbytes,
+                               scale=scales.get("fullpre", 1.0)),
+    }
+
+
+def _cells4(few_none, few_pre, many_none, many_pre, jitter=0.0):
+    """Four cells, each given as the value it measures, with optional spread."""
+    def v(x):
+        return [x * (1 + jitter), x, x / (1 + jitter)] if jitter else [x, x, x]
+    return {(FEW, NONE): v(few_none), (FEW, PRE): v(few_pre),
+            (MANY, NONE): v(many_none), (MANY, PRE): v(many_pre)}
+
+
+def test_the_design_is_read_from_the_runs_not_from_the_labels():
+    """A label is a name this script was handed on the command line; the args
+    are what the benchmark actually did."""
+    cells, levels, note = compare_protocols.design_cells(_square())
+    assert note is None
+    assert cells == {(MANY, NONE): "full", (FEW, NONE): "subset",
+                     (FEW, PRE): "preloaded", (MANY, PRE): "fullpre"}
+    assert levels == ([FEW, MANY], [NONE, PRE]), "few methods first, then all"
+
+
+def test_method_sets_are_ordered_by_size_not_alphabetically():
+    """`all` sorts before `attribution` as a string, which would put the full
+    method set in the 'few' slot and silently invert every simple effect."""
+    _, levels, _ = compare_protocols.design_cells(_square())
+    assert levels[0][0] == FEW and levels[0][1] == MANY
+
+
+def test_two_labels_for_one_protocol_are_refused():
+    groups = _square()
+    groups["full"] = _cell_group("x", methods=FEW)   # named full, ran a subset
+    cells, _, note = compare_protocols.design_cells(groups)
+    assert cells is None and "same protocol" in note
+
+
+def test_a_group_whose_runs_disagree_about_the_protocol_is_refused():
+    groups = _square()
+    groups["full"] = [("a", Bench(_payload())),
+                      ("b", Bench(_payload(methods=FEW)))]
+    cells, _, note = compare_protocols.design_cells(groups)
+    assert cells is None and "do not share one protocol" in note and "full" in note
+
+
+def test_three_protocols_are_not_a_2x2_and_the_missing_cell_is_named():
+    """The state of the repo before the fourth protocol was run."""
+    groups = _square()
+    del groups["fullpre"]
+    cells, _, note = compare_protocols.design_cells(groups)
+    assert cells is None
+    assert "incomplete" in note and "'all', 300.0" in note
+
+
+def test_additive_factors_produce_no_interaction():
+    """If the preload costs the same 2% at both method counts, the interaction
+    is zero and both main effects come back exactly."""
+    b = 1.25
+    eff = compare_protocols.factorial_effects(
+        _cells4(b, b * 0.98, b * 1.05, b * 0.98 * 1.05), LEVELS)
+    assert eff["main_preload"] == pytest.approx(-0.02, abs=1e-9)
+    assert eff["main_methods"] == pytest.approx(0.05, abs=1e-9)
+    assert eff["interaction"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_an_effect_confined_to_one_level_shows_up_as_an_interaction():
+    """The outcome that would mean the two factors are not separable: the
+    preload does something at three methods and nothing at twelve."""
+    b = 1.25
+    eff = compare_protocols.factorial_effects(_cells4(b, b * 0.95, b, b), LEVELS)
+    assert eff["simple"]["preload_at_few"] == pytest.approx(-0.05, abs=1e-9)
+    assert eff["simple"]["preload_at_many"] == pytest.approx(0.0, abs=1e-9)
+    assert eff["interaction"] == pytest.approx(1 / 0.95 - 1, abs=1e-9)
+
+
+def test_effects_are_multiplicative_not_additive():
+    """Ratios and times live on a log scale: a factor that doubles a quantity
+    and one that halves it have to cancel, which they only do in logs."""
+    eff = compare_protocols.factorial_effects(_cells4(1.0, 2.0, 0.5, 1.0), LEVELS)
+    assert eff["main_preload"] == pytest.approx(1.0)
+    assert eff["main_methods"] == pytest.approx(-0.5)
+    assert eff["interaction"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_an_effect_smaller_than_a_cell_varies_by_is_not_resolved():
+    """Three runs per cell support 'bigger than the cell's own range' and no
+    finer claim, so the yardstick travels with every effect."""
+    b = 1.25
+    eff = compare_protocols.factorial_effects(
+        _cells4(b, b * 0.999, b * 1.05, b * 0.999 * 1.05, jitter=0.01), LEVELS)
+    assert eff["noise"] == pytest.approx(1.01 * 1.01 - 1, abs=1e-9)
+    assert eff["resolved"]["main_preload"] is False
+    assert eff["resolved"]["main_methods"] is True
+
+
+def test_factorial_ratios_recover_a_planted_preload_effect():
+    """End to end from run payloads. `quant_cold` is control/fused, so making
+    the fused kernel 2% faster in both preloaded cells plants a +2% preload
+    effect and nothing else."""
+    groups = _square(preloaded=0.98, fullpre=0.98)
+    cells, levels, note = compare_protocols.design_cells(groups)
+    assert note is None
+    recs = compare_protocols.factorial_ratios(groups, cells, levels, [CTX])
+    q = next(r for r in recs if r["name"] == "quant_cold")
+    assert q["main_preload"] == pytest.approx(0.0204, abs=0.005)
+    assert q["main_methods"] == pytest.approx(0.0, abs=0.005)
+    assert q["interaction"] == pytest.approx(0.0, abs=0.005)
+
+
+def test_factorial_rows_carry_each_row_s_achieved_bandwidth():
+    groups = _square(nbytes=1_000_000)
+    cells, levels, _ = compare_protocols.design_cells(groups)
+    rows = compare_protocols.factorial_rows(
+        groups, cells, levels, [CTX], ["fp16_sdpa", "fused_triton_4b"])
+    cold = {r["method"]: r for r in rows if r["regime"] == "cold"}
+    assert cold["fused_triton_4b"]["gb_s"] > cold["fp16_sdpa"]["gb_s"]
+    assert all(r["gb_s"] is None for r in rows if r["regime"] == "graph"), \
+        "bandwidth is only meaningful on the DRAM-resident regime"
+
+
+def test_each_protocol_gets_its_own_bandwidth_correlation():
+    """The bug this guards. The compared group used to be whichever label came
+    last on the command line, so adding a fourth protocol silently repointed an
+    already-published correlation at a different pair of runs."""
+    groups = _square(nbytes=1_000_000)
+    _, _, pair_a = compare_protocols.bandwidth_sensitivity(
+        groups, [CTX], ["fp16_sdpa", "fused_triton_4b"], other="subset")
+    _, _, pair_b = compare_protocols.bandwidth_sensitivity(
+        groups, [CTX], ["fp16_sdpa", "fused_triton_4b"], other="preloaded")
+    assert pair_a == ("full", "subset")
+    assert pair_b == ("full", "preloaded")
+
+
+def test_corr_of_drops_rows_with_no_bandwidth_rather_than_scoring_them():
+    r, n = compare_protocols.corr_of(
+        [(1.0, 1.0), (2.0, 2.0), (3.0, 3.0), (None, 4.0)])
+    assert n == 3 and r == pytest.approx(1.0)
+
+
+def test_render_declines_the_2x2_and_says_why():
+    groups = _square()
+    del groups["fullpre"]
+    recs = compare_protocols.ratio_ranges(groups, [CTX])
+    telem = compare_protocols.telemetry_agreement(groups, [CTX], ["fused_triton_4b"])
+    cells, levels, note = compare_protocols.design_cells(groups)
+    md = compare_protocols.render(recs, telem, groups, fac=[], fac_note=note,
+                                  design=cells, levels=levels)
+    assert "The 2x2" in md
+    assert "Not computed" in md and "incomplete 2x2" in md
+
+
+def test_render_reports_the_2x2_when_the_design_is_complete():
+    groups = _square(preloaded=0.98, fullpre=0.98)
+    recs = compare_protocols.ratio_ranges(groups, [CTX])
+    telem = compare_protocols.telemetry_agreement(groups, [CTX], ["fused_triton_4b"])
+    cells, levels, note = compare_protocols.design_cells(groups)
+    fac = compare_protocols.factorial_ratios(groups, cells, levels, [CTX])
+    md = compare_protocols.render(recs, telem, groups, fac=fac, fac_note=note,
+                                  design=cells, levels=levels)
+    assert "4 protocols, compared" in md
+    assert "The 2x2" in md and "Simple effects" in md
+    assert "Not computed" not in md

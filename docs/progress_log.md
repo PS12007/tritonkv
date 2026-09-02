@@ -1087,3 +1087,100 @@ to pool runs that differ in it, because it is the variable under test.
 
 `test_between_run.py`: 25 → 32 tests. 106 kernel tests pass. Audit unchanged at
 69 claims.
+
+## The fourth protocol: a pre-registration (2026-09-02, later)
+
+Written and committed **before** the runs it describes, so the prediction cannot
+be fitted to the result afterwards. The data does not exist at the time of this
+commit; `compare_protocols.py` will say so, naming the missing cell.
+
+### The confound
+
+Three protocols exist, and two things vary together across all of them:
+
+| protocol    | methods timed | preload | wall  |
+|-------------|---------------|---------|-------|
+| `full`      | 12            | 0 s     | ~800 s|
+| `subset`    | 3             | 0 s     | ~205 s|
+| `preloaded` | 3             | 300 s   | ~499 s|
+
+Every protocol that times more methods is also a longer run. So the two
+available explanations for the protocol shift — "the card is in a different
+state because 800 s of measured work preceded this row" and "the card is in a
+different state because a lot of bandwidth was pulled recently" — cannot be told
+apart by anything measured so far. `--preload` was built to test the second and
+gave a result that fits neither cleanly: it moved the subset runs *further* from
+the full runs rather than toward them.
+
+The missing cell is 12 methods **with** the preload. Adding it makes the design
+a complete 2×2 and the two factors separable:
+
+|             | no preload  | preload     |
+|-------------|-------------|-------------|
+| 3 methods   | `subset`    | `preloaded` |
+| 12 methods  | `full`      | `fullpre` ← new |
+
+`fullpre` is `benchmark.py --samples 50 --preload 300`, three runs, identical to
+`full` in every other respect.
+
+### Predictions, at `quant_cold@8192`
+
+`full` reads 1.469–1.478 there (median 1.475) and a protocol's three runs agree
+to 0.6%, so these outcomes are distinguishable rather than rhetorical.
+
+- **H1 — run length is the channel, and the preload is inert once a run is long
+  enough.** `fullpre` ≈ 1.475, within the between-run spread of `full`.
+- **H2 — the two factors are separable and additive in log space.**
+  `fullpre` ≈ 1.475 × (1.397/1.422) ≈ 1.449, i.e. −1.8%, with an interaction
+  term near zero.
+- **H3 — recent saturation dominates and swamps run length.** `fullpre` ≈
+  `preloaded` ≈ 1.397, −5.3%, with the main effect of method count near zero.
+
+Secondary, also fixed in advance: the bandwidth correlation is recomputed with
+the preload main effect alone, and is predicted to stay above +0.6. If the
+bandwidth law is about the memory subsystem's state rather than about run
+length, it should attach to the preload factor and not to the method-count one.
+
+No prediction is offered for `fused_triton_4b@16k`, which fits neither the power
+story nor the bandwidth one and is on the open list for that reason.
+
+### What each outcome would mean
+
+H1 says the shipped protocol's favourable reading is a property of it being
+*long*, and no preload can substitute for that. H3 says the shipped 1.475 is an
+artefact of not having recently saturated the memory system, and the honest
+centre of that cell is nearer 1.40. H2 says report the interval as the span of
+the whole 2×2 rather than of any one protocol. All three are publishable; H1 and
+H3 are the ones that would change what the README says.
+
+### Code, in this commit and before the data
+
+`compare_protocols.py` grew the 2×2: `design_cells` reads each run's protocol
+coordinates out of its own recorded `args` rather than off its `--label`, so a
+mislabelled run is a detected error and not a silently wrong cell; it refuses
+anything that is not a complete 2×2 and names the cell it is missing.
+`factorial_effects` reports both main effects, the four simple effects and the
+interaction, all as differences of logs — the only scale on which "the two
+factors add" is a well-posed claim — with the largest within-cell range carried
+alongside as the yardstick for calling an effect resolved. No p-values, for the
+same reason as the rest of that file.
+
+One bug fixed on the way, and it is the kind this repo keeps finding in its own
+apparatus rather than in the kernel: `bandwidth_sensitivity` compared the
+reference against *whichever group came last on the command line*. Adding a
+fourth protocol would therefore have silently repointed the published r = +0.84
+at a different pair of runs while the text around it still claimed to describe
+the old one. The compared group is now explicit and the script computes one
+correlation per protocol. Re-run on the existing three, it reproduces
+`preloaded` vs `full` at r = +0.84 exactly, and reports `subset` vs `full` at
+r = +0.85 — a pair that had never been scored, and which strengthens the law by
+holding on it too.
+
+`test_between_run.py`: 32 → 47 tests. The new ones pin the log-space arithmetic
+against hand-built cells (additive factors give zero interaction; an effect
+confined to one level shows up as one; a doubling and a halving cancel), the
+design reader against mislabelled and mixed groups, and the "resolved" rule
+against an effect smaller than its own cell noise. One of them caught a real
+shadowing bug: `render` already used `cells` as a local for table rows, so the
+new parameter of that name was clobbered before it reached the section that
+needed it.
