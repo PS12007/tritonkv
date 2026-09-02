@@ -435,6 +435,86 @@ def plot_gs128_cliff(sweep: dict):
     save(fig, "gs128_cliff")
 
 
+# ---------------------------------------------------------------------------
+# Dispersion gate (results/dispersion.json, written by analyze_dispersion.py)
+# ---------------------------------------------------------------------------
+
+
+CAUSE_SHORT = {
+    "drift (shorter windows)": "drift\n(shorter window helps)",
+    "drift + floor (shorter windows, not enough)": "drift + floor\n(helps, not enough)",
+    "tail (trimmed stat)": "tail\n(trimmed stat helps)",
+    "wander (no window length helps)": "wander\n(no window length helps)",
+    "white jitter (no window length helps)": "white jitter\n(no window length helps)",
+}
+
+
+def plot_dispersion(rows: list[dict]):
+    """What the IQR gate rejects, against what the rejected rows actually cost.
+
+    Two things in one figure because they only mean something together: the gate
+    rejects a quarter of all measurements, and the rejected measurements still
+    pin their medians an order of magnitude finer than the effects they are used
+    to establish.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(13.4, 4.6),
+                             gridspec_kw={"width_ratios": [1.3, 1], "wspace": 0.42})
+
+    ax = axes[0]
+    for label, colour, sel in (
+        ("passes the gate", MUTED, [d for d in rows if d["cause"] == "passes"]),
+        ("fails the gate", S2, [d for d in rows if d["cause"] != "passes"]),
+    ):
+        ax.scatter([d["iqr_frac"] * 100 for d in sel],
+                   [d["median_ci_halfwidth_frac"] * 100 for d in sel],
+                   s=26, color=colour, alpha=0.8, edgecolor="none", label=label)
+    ax.axvline(5.0, color=INK2, lw=1.2, ls="--")
+    ax.text(5.3, ax.get_ylim()[1] * 0.93, "gate: IQR = 5%", fontsize=8.5, color=INK2)
+    # The band the conclusions actually live in. Nothing in this plot comes close
+    # to it, which is the point.
+    ax.axhspan(10, 50, color=S1, alpha=0.10, zorder=0)
+    ax.text(ax.get_xlim()[1] * 0.98, 18, "effects reported: 10-50%",
+            fontsize=8.5, color=S1, ha="right")
+    ax.set_yscale("log")
+    ax.legend(loc="lower right", fontsize=9)
+    style(ax, "Rejected rows still pin their medians",
+          subtitle="one point per measurement; y from a block bootstrap",
+          xlabel="per-sample IQR (% of median)",
+          ylabel="median uncertainty (+-% of median)")
+
+    ax = axes[1]
+    fails = [d for d in rows if d["cause"] != "passes"]
+    counts: dict[str, int] = {}
+    for d in fails:
+        counts[d["cause"]] = counts.get(d["cause"], 0) + 1
+    order = sorted(counts, key=lambda c: counts[c])
+    # Blue for the causes a shorter window would help, orange for the ones no
+    # window length touches -- the distinction the whole exercise was about.
+    colours = [S1 if c.startswith("drift") else (S3 if c.startswith("tail") else S2)
+               for c in order]
+    y = np.arange(len(order))
+    ax.barh(y, [counts[c] for c in order], 0.62, color=colours)
+    for yi, c in zip(y, order):
+        ax.text(counts[c] + 0.14, yi, str(counts[c]), va="center", fontsize=9.5,
+                fontweight="bold", color=INK)
+    ax.set_yticks(y)
+    ax.set_yticklabels([CAUSE_SHORT.get(c, c) for c in order], fontsize=8.2,
+                       linespacing=1.25)
+    ax.set_xlim(0, max(counts.values()) * 1.25)
+    style(ax, f"...and only {sum(n for c, n in counts.items() if c.startswith('drift'))}"
+              f" of {len(fails)} failures are drift",
+          subtitle="both fixes this repo proposed assumed drift",
+          xlabel="measurements")
+
+    figure_header(
+        fig,
+        "Auditing the quality gate instead of the kernel",
+        "IQR describes how the card behaved during the window. It does not describe\n"
+        "how well the reported number is pinned, and here the two come apart.",
+    )
+    save(fig, "dispersion_gate")
+
+
 def measure_registers() -> dict:
     """Compile both shipped paths and read the register count back."""
     import torch
@@ -468,6 +548,12 @@ def main():
     print(f"figures -> {PLOTS}")
     plot_broadcast_speedup(payload)
     plot_clock_samples(payload)
+    disp = _sweep(ROOT / "results" / "dispersion.json")
+    if disp:
+        plot_dispersion(disp)
+    else:
+        print("  (skipped dispersion_gate: no results/dispersion.json --"
+              " run analyze_dispersion.py)")
     sweep = _sweep(ROOT / "results" / "gs_sweep.json")
     if sweep:
         plot_gs_saturation(sweep)

@@ -324,7 +324,7 @@ broadcast, versus the same kernel with the gather) and
 the 1.05× bar at no context in either regime).
 
 Current run against `results/benchmark.json` (2026-09-01 19:00):
-**67 claims — 21 TRUE / 25 TRUE BUT CONDITIONAL / 9 MISLEADING / 12 FALSE.**
+**68 claims — 21 TRUE / 25 TRUE BUT CONDITIONAL / 10 MISLEADING / 12 FALSE.**
 Regenerate with `./.venv/Scripts/python.exe audit_claims.py` (~20 s) and read
 `results/audit.md`. Two of those verdicts moved this session for reasons that
 were in the auditor rather than in the kernel:
@@ -335,6 +335,45 @@ were in the auditor rather than in the kernel:
   DRAM-resident 1.08× at ctx=8192 — on a row that had failed the clock and
   dispersion gate. That claim now applies the same gate as its neighbour and
   reads `FALSE`, like the 2-bit one always did.
+
+### The confidence intervals were too narrow
+
+Every CI here was an i.i.d. bootstrap. `analyze_dispersion.py` measures lag-1
+autocorrelation of up to **0.72** on these timing series — the card wanders
+rather than jittering — so the samples are not independent and the i.i.d.
+interval is up to **1.95× narrower** than the data supports. Since every verdict
+turns on whether an interval clears a bar, too narrow is too confident, in the
+flattering direction. The resample is now **circular-block**.
+
+Two corrections landed inside that fix. *Moving* blocks under-weight the ends of
+a series, which shifts an interval's centre rather than its width, and that alone
+promoted one claim from `CONDITIONAL` to `TRUE`; circular blocks weight every
+sample equally. That still did not settle it, because the claim was on a knife
+edge — its CI low moved from 1.04973 to 1.05019 against a 1.05 bar. `_verdict`
+was a step function evaluated at the threshold, so any rounding decision became a
+verdict; it now requires the deciding endpoint to clear the bar by at least 10%
+of the interval's own width.
+
+With both in place, **no verdict changes.** The correlation correction moved
+nothing; the apparent movement was the missing margin.
+
+### What the dispersion gate actually measures
+
+23 of 48 rows fail the `IQR ≤ 5% of median` half of the gate.
+`analyze_dispersion.py` decomposes all 96 measurements to find out whether the
+two fixes this repo had written down — shorter windows, or longer ones — would
+work. Mostly they would not: only **8 of 25** failures carry a significant trend,
+and **13 of 25** have neither a trend nor an outlier tail, which is the card's
+own wander and no window length changes it.
+
+Meanwhile the failing rows pin their medians to **±0.69%** (median; worst
+±3.36%) against ±0.16% for passing rows, while the effects reported here are
+10–50%. So a starred row means *the card was restless*, not *the number is
+unknown*.
+
+**The gate is unchanged.** Loosening a gate because it is inconvenient is how the
+numbers this project exists to avoid get published. What changed is that the
+audit now states this against itself, as `method.dispersion_gate`.
 
 Historically the `FALSE` verdicts have been this project's own claims about the
 L2-resident regime, and the audit is what puts them there.

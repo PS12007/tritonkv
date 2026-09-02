@@ -33,7 +33,7 @@ the sign flip is now fully clock-verified with every input passing the gate:
 ## Do this first
 
 Nothing is blocking. `results/audit.{md,json}` are current (regenerated
-2026-09-01 21:22, **67 claims: 21 TRUE / 25 CONDITIONAL / 9 MISLEADING /
+2026-09-01 22:30, **68 claims: 21 TRUE / 25 CONDITIONAL / 10 MISLEADING /
 12 FALSE**), and the audit now takes ~20 s rather than ~13 min, so re-run it
 after any benchmark run without thinking about it:
 
@@ -45,16 +45,26 @@ after any benchmark run without thinking about it:
 
 ## Open work, in order
 
-1. **Close the remaining dispersion rejects.** The clock half of the gate is
-   solved; what is left is genuine timing dispersion, concentrated at ctx=512
-   (measurements near the CUDA-event resolution floor, where a 5 µs median
-   cannot easily hold IQR ≤ 5%) and at ctx=16384 (long windows in which the
-   80 W part drifts thermally). Two honest options, and they point opposite
-   ways: shorten windows to reduce drift, or lengthen them to average it out.
-   Note the tension with the clock gate — `MIN_SAMPLING_SECONDS = 1.5` exists
-   precisely to keep windows long enough to earn clock samples. A per-regime
-   setting is probably the answer, and should be justified by measurement of the
-   drift, not chosen by taste.
+1. **Decide what to do about the dispersion rejects, now that they are
+   diagnosed.** `analyze_dispersion.py` decomposed all 96 measurements: only
+   8 of 25 failures carry a significant trend (so shorter windows help 8 rows,
+   not 23), 13 have neither trend nor tail, and the failing rows pin their
+   medians to +-0.69% anyway. The two fixes this file used to propose are
+   therefore mostly answering a question the data does not ask. What is left is
+   a **presentation** decision, not a measurement one, and it should be made
+   deliberately:
+
+   - report the median's CI alongside the IQR in `benchmark.py`, so a starred
+     row carries the number that actually bears on the conclusion (needs a
+     re-run to take effect, and does not change the gate); and/or
+   - add a *second* tier -- "gate-failed but median pinned to <1%" -- so the
+     attribution tables can use those rows with an explicit qualifier instead
+     of dropping them.
+
+   Do **not** widen `MAX_IQR_FRAC`. The four rows whose failure is a tail would
+   be fixed by a trimmed statistic, which is a defensible change on its own
+   merits; the seven "drift + floor" rows would genuinely benefit from a shorter
+   window, and ctx=512 is where four of them are.
 
 2. **Where the metadata-load curve actually bends.** `sweep_group_size.py` ran
    the sweep on both paths and the prediction ("broadcast sloped, gather flat")
@@ -103,6 +113,13 @@ after any benchmark run without thinking about it:
 - The audit's speed: `bootstrap_ratio_ci` is vectorized (13 min -> 20 s), with
   the stdlib version kept as the definition and `--check-bootstrap` comparing
   them on real rows (worst disagreement 2.3% of a CI width).
+- The audit's **statistics**: the resample is circular-block, not i.i.d., because
+  the series are serially correlated (lag-1 up to 0.72) and i.i.d. intervals were
+  up to 1.95x too narrow. `_verdict` also requires the deciding CI endpoint to
+  clear its bar by 10% of the interval's own width, so a claim cannot be settled
+  by a rounding difference. Both together changed **no** verdict.
+- The dispersion decomposition itself (`analyze_dispersion.py`) and the
+  `method.dispersion_gate` claim that reports it against this project's own gate.
 
 ## Things that were tried and rejected — do not redo without new evidence
 

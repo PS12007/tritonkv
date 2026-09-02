@@ -481,3 +481,83 @@ whole table. So this is a fact about the control row, not about the kernel — b
 it closes a number that had been sitting in this repo unexplained since the first
 week, and it is a second example of the session's theme, that **fewer
 instructions is not the same thing as less work.**
+
+---
+
+## 2026-09-01 22:20 — The dispersion rejects, and the CI that was too narrow
+
+**Attempted:** `next_steps.md` item 1 — close the 23 of 48 rows failing the
+dispersion half of the gate. That file offered two fixes pointing opposite ways
+(shorter windows to reduce drift, longer ones to average it out) and said the
+choice should be made by measuring the drift. So `analyze_dispersion.py`
+decomposes every rejected series before touching anything, into the three things
+that would call for different fixes: a **trend** across the sample index (a
+shorter window helps), a **tail** of interrupted samples (a trimmed statistic
+helps), and **wander or white jitter** with no trend at all (no window length
+helps, because IQR is a property of the sample distribution and does not shrink
+with more samples).
+
+**What happened.** Across 96 measurements, 25 fail:
+
+| cause | count | where |
+|---|---|---|
+| drift — a shorter window fixes it | 1 | ctx=16384 |
+| drift, but not enough on its own | 7 | ctx=512 ×4, 8192 ×2, 16384 ×1 |
+| tail — a trimmed statistic fixes it | 4 | spread |
+| wander (lag-1 ≥ 0.25), no fix by window length | 6 | ctx=8192 ×2, 16384 ×4 |
+| white jitter, no fix by window length | 7 | ctx=512 ×3, 2048 ×1, 16384 ×3 |
+
+Only **8 of 25** carry a statistically significant trend; **13 of 25** have
+neither a trend nor a tail. So the premise of both proposed fixes is mostly
+wrong, and the thermal-drift story that motivated them describes one row.
+
+Two things worth recording about the method. First, significance rather than
+r-squared decides what counts as a trend: the fp16 control's DRAM-resident rows
+fall **19–23% across their window** with an r² of 0.09–0.16, because the noise
+around that decline is loud. An r²-based test filed the largest systematic
+effect in the run as jitter. Second, the classification is keyed on *what each
+fix would do*, not on a statistic, because a label nobody can act on is not a
+diagnosis.
+
+**Then the useful part.** If the spread is not drift, how badly does it actually
+hurt? A moving-block bootstrap of each rejected row's median says: not at all.
+The failing measurements pin their medians to **±0.69%** (median; worst
+±3.36%), against ±0.16% for the passing ones — while the effects these tables
+report are 10–50%. A starred row means *the card was restless*, not *the number
+is unknown*.
+
+**The gate is deliberately left exactly as it was.** Loosening a gate because it
+is inconvenient is how the numbers this project exists to avoid get published.
+What changed instead is that the auditor now says all of this out loud, as
+`method.dispersion_gate` — a MISLEADING verdict against the claim that a rejected
+row's median cannot be trusted.
+
+**And the analysis found a real defect one level up.** The rejected rows are not
+just dispersed, they are *serially correlated* — lag-1 autocorrelation up to
+**0.72**. Every confidence interval in `audit_claims.py` was an i.i.d.
+bootstrap, which assumes exactly the independence the data does not have. On
+these rows the i.i.d. interval is up to **1.95× too narrow**, and every verdict
+here is decided by whether an interval clears a bar. Too narrow means too
+confident, in the flattering direction. Fixed with a circular-block resample.
+
+**Two corrections inside that fix, both caught by checking rather than by
+reasoning:**
+
+1. The first version used *moving* blocks. Samples near either end of a series
+   can only be reached by the few blocks that overlap them, so the ends are
+   under-weighted and the resampled mean drifts toward the middle of the run —
+   which shifts the interval's **centre**, not just its width. It promoted one
+   claim from CONDITIONAL to TRUE: a reweighting artefact dressed as a
+   statistical correction. Circular blocks weight every sample equally.
+2. That did not fix it, which was the more interesting outcome. The claim was
+   sitting on a knife edge: its CI low moved from **1.04973 to 1.05019** against
+   a 1.05 bar — five parts in a hundred thousand, on a pair of series with no
+   measurable autocorrelation. `_verdict` was a step function evaluated exactly
+   at the threshold, so any rounding decision anywhere became a verdict. It now
+   requires the deciding endpoint to clear the bar by at least 10% of the
+   interval's own width, and says so in the evidence when it does not.
+
+**Result:** with the block bootstrap *and* the margin, **zero verdicts change**.
+The correlation correction did not move a single conclusion; the one apparent
+change was the missing margin all along. 68 claims: **21 TRUE / 25 CONDITIONAL /
+10 MISLEADING / 12 FALSE**.

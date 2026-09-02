@@ -36,6 +36,13 @@ RESULTS_DIR = Path(__file__).parent / "results"
 PRACTICAL_THRESHOLD = 1.05
 BOOTSTRAP_N = 10000
 CI = 0.95
+# Resample in contiguous blocks rather than i.i.d. Consecutive timing samples on
+# this card are serially correlated (lag-1 up to 0.72 -- see
+# `analyze_dispersion.py`), and an i.i.d. bootstrap reports an interval up to
+# 1.95x narrower than the data supports. Every claim here is decided by whether a
+# CI clears a bar, so an interval that is too narrow is a verdict that is too
+# confident, in the flattering direction.
+BLOCK_BOOTSTRAP = True
 
 
 @dataclass
@@ -76,15 +83,46 @@ def _bootstrap_ratio_ci_py(num, den, n=BOOTSTRAP_N, ci=CI, seed=0):
     return statistics.fmean(num) / statistics.fmean(den), lo, hi
 
 
-def _bootstrap_ratio_ci_np(num, den, n=BOOTSTRAP_N, ci=CI, seed=0):
-    """Same estimator, resampled as two (n, len) integer index matrices."""
+def _resample_means(a, rng, n_boot: int, block: bool):
+    """``n_boot`` resampled means of ``a``, i.i.d. or in moving blocks.
+
+    The i.i.d. form assumes each timing sample is independent of the one before
+    it. That assumption is measurably false here -- ``analyze_dispersion.py``
+    finds lag-1 autocorrelation up to 0.72 on the L2-resident series, because the
+    card wanders rather than jittering. Resampling in contiguous blocks of length
+    ~n**(1/3) keeps that short-range structure, which is what stops the interval
+    from being narrower than the data supports.
+    """
+    import numpy as np
+
+    n = a.size
+    if not block:
+        return a[rng.integers(0, n, size=(n_boot, n))].mean(axis=1)
+    # Circular blocks, not moving ones. With moving blocks a sample near either
+    # end of the series can only be picked up by the few blocks that reach it, so
+    # the ends are under-weighted and the resampled mean drifts toward the middle
+    # of the run. On a series with any trend that shifts the interval's *centre*,
+    # which is how the first version of this change turned one verdict from
+    # CONDITIONAL to TRUE -- a reweighting artefact wearing the costume of a
+    # statistical correction. Wrapping the index makes every sample equally
+    # likely, so the only thing blocking changes is the width.
+    L = max(2, int(round(n ** (1 / 3))))
+    n_blocks = -(-n // L)
+    starts = rng.integers(0, n, size=(n_boot, n_blocks))
+    offs = np.arange(L)
+    flat = (starts[:, :, None] + offs[None, None, :]).reshape(n_boot, -1)[:, :n] % n
+    return a[flat].mean(axis=1)
+
+
+def _bootstrap_ratio_ci_np(num, den, n=BOOTSTRAP_N, ci=CI, seed=0, block=BLOCK_BOOTSTRAP):
+    """Same estimator, resampled as index matrices; blocked unless told otherwise."""
     import numpy as np
 
     a = np.asarray(num, dtype=np.float64)
     b = np.asarray(den, dtype=np.float64)
     rng = np.random.default_rng(seed)
-    ra = a[rng.integers(0, a.size, size=(n, a.size))].mean(axis=1)
-    rb = b[rng.integers(0, b.size, size=(n, b.size))].mean(axis=1)
+    ra = _resample_means(a, rng, n, block)
+    rb = _resample_means(b, rng, n, block)
     with np.errstate(divide="ignore", invalid="ignore"):
         ratios = np.where(rb > 0, ra / rb, np.inf)
     ratios.sort()
@@ -100,12 +138,16 @@ def bootstrap_ratio_ci(num: list[float], den: list[float], n=BOOTSTRAP_N, ci=CI,
     ratio is the speedup. Resampling both independently is right here: the
     samples are separate timed runs, not paired measurements.
 
-    Two implementations, because this is a measuring instrument and this project
-    has already been bitten twice by an instrument rather than by the kernel.
-    The vectorized path is what runs; the stdlib path above is the definition,
-    and ``--check-bootstrap`` measures how far apart they land on the real rows.
-    They draw from different generators, so they are not expected to agree to the
-    last digit -- only to agree far more tightly than the intervals are wide.
+    Resampling is **blocked** by default (``BLOCK_BOOTSTRAP``), because the
+    samples are serially correlated and the i.i.d. form understates the interval
+    by up to 1.95x on these rows.
+
+    Three implementations, because this is a measuring instrument and this
+    project has already been bitten repeatedly by an instrument rather than by
+    the kernel: the stdlib i.i.d. loop above is the definition, the vectorized
+    i.i.d. path checks the vectorization against it, and the blocked path is what
+    actually runs. ``--check-bootstrap`` reports both comparisons on real rows --
+    vectorization should be a no-op, and blocking should widen.
     """
     try:
         return _bootstrap_ratio_ci_np(num, den, n, ci, seed)
@@ -114,22 +156,34 @@ def bootstrap_ratio_ci(num: list[float], den: list[float], n=BOOTSTRAP_N, ci=CI,
 
 
 def check_bootstrap(b, pairs, n=BOOTSTRAP_N) -> str:
-    """Report the largest disagreement between the two bootstrap paths."""
-    worst = (0.0, None)
+    """Two comparisons: is the vectorization faithful, and how much does blocking widen?
+
+    The first should be a no-op and is only there to catch a bad rewrite. The
+    second is the one that matters -- it is the size of the error that was in
+    every interval this auditor printed before the block resample went in.
+    """
+    worst_vec, worst_widen = (0.0, None), (0.0, None)
     lines = []
     for label, num, den in pairs:
-        r1 = _bootstrap_ratio_ci_np(num, den, n=n)
-        r2 = _bootstrap_ratio_ci_py(num, den, n=n)
-        width = r1[2] - r1[1]
-        d_lo, d_hi = abs(r1[1] - r2[1]), abs(r1[2] - r2[2])
-        frac = max(d_lo, d_hi) / width if width > 0 else float("inf")
+        iid_np = _bootstrap_ratio_ci_np(num, den, n=n, block=False)
+        iid_py = _bootstrap_ratio_ci_py(num, den, n=n)
+        blocked = _bootstrap_ratio_ci_np(num, den, n=n, block=True)
+        width = iid_np[2] - iid_np[1]
+        delta = max(abs(iid_np[1] - iid_py[1]), abs(iid_np[2] - iid_py[2]))
+        frac = delta / width if width > 0 else float("inf")
+        widen = (blocked[2] - blocked[1]) / width if width > 0 else float("inf")
         lines.append(
-            f"  {label:<34} np [{r1[1]:.4f},{r1[2]:.4f}]  py [{r2[1]:.4f},{r2[2]:.4f}]  "
-            f"max endpoint delta = {max(d_lo, d_hi):.5f} = {frac * 100:.1f}% of CI width"
+            f"  {label:<34} iid [{iid_np[1]:.4f},{iid_np[2]:.4f}]  "
+            f"block [{blocked[1]:.4f},{blocked[2]:.4f}]  "
+            f"widen {widen:.2f}x   vectorization delta {frac * 100:.1f}% of CI width"
         )
-        if frac > worst[0]:
-            worst = (frac, label)
-    lines.append(f"  worst: {worst[1]} at {worst[0] * 100:.1f}% of its CI width")
+        if frac > worst_vec[0]:
+            worst_vec = (frac, label)
+        if widen > worst_widen[0]:
+            worst_widen = (widen, label)
+    lines.append(f"  worst vectorization disagreement: {worst_vec[1]} "
+                 f"at {worst_vec[0] * 100:.1f}% of its CI width")
+    lines.append(f"  widest blocking effect: {worst_widen[1]} at {worst_widen[0]:.2f}x")
     return "\n".join(lines)
 
 
@@ -569,11 +623,46 @@ def downgrade(verdict: str, caveat: str) -> str:
     return "TRUE BUT CONDITIONAL" if (caveat and verdict == "TRUE") else verdict
 
 
+# How close a deciding CI endpoint may sit to its bar before the verdict is
+# treated as undecided, expressed as a fraction of the interval's own width. A
+# claim separated from the threshold by a thousandth of its uncertainty has not
+# been established; it has been rounded into place.
+BORDERLINE_FRAC = 0.10
+
+
+def _is_borderline(value: float, bar: float, lo: float, hi: float) -> bool:
+    w = hi - lo
+    return w > 0 and abs(value - bar) < BORDERLINE_FRAC * w
+
+
+def borderline_note(lo: float, hi: float) -> str:
+    """Say so, in the evidence, when a verdict rests on a hair."""
+    for value, bar, name in ((lo, PRACTICAL_THRESHOLD, "practical-significance bar"),
+                             (hi, 1.0, "1.00x line")):
+        if _is_borderline(value, bar, lo, hi):
+            return (f" BORDERLINE: the deciding endpoint sits {abs(value - bar):.4f} from "
+                    f"the {name}, which is {abs(value - bar) / (hi - lo) * 100:.1f}% of the "
+                    f"interval's own width -- close enough that the verdict turns on the "
+                    f"resampling scheme rather than on the data, so it is reported as "
+                    f"conditional.")
+    return ""
+
+
 def _verdict(lo: float, hi: float) -> str:
+    """Verdict from a CI, with a margin requirement on the deciding endpoint.
+
+    Without the margin this was a step function evaluated at the bar. Switching
+    the bootstrap from i.i.d. to block resampling moved one CI low from 1.04973
+    to 1.05019 -- five parts in a hundred thousand, on a series with no
+    measurable autocorrelation -- and that alone turned a claim from CONDITIONAL
+    to TRUE. Nothing about the kernel changed. A threshold with no margin turns
+    every rounding decision into a verdict.
+    """
     if lo > PRACTICAL_THRESHOLD:
-        return "TRUE"
+        return ("TRUE BUT CONDITIONAL"
+                if _is_borderline(lo, PRACTICAL_THRESHOLD, lo, hi) else "TRUE")
     if hi < 1.0:
-        return "FALSE"
+        return "MISLEADING" if _is_borderline(hi, 1.0, lo, hi) else "FALSE"
     return "MISLEADING"
 
 
@@ -608,7 +697,14 @@ def audit_optimizations(b: Bench, nbits: int = 4) -> list[Claim]:
     if ratios_cold:
         quotable = [c for c in ratios_cold if b.quotable(gather, c) and b.quotable(fused, c)]
         lows = [ratios_cold[c][1] for c in quotable]
-        wins = bool(lows) and all(x > PRACTICAL_THRESHOLD for x in lows)
+        wins = bool(lows) and all(
+            x > PRACTICAL_THRESHOLD
+            and not _is_borderline(x, PRACTICAL_THRESHOLD, x, ratios_cold[c][2])
+            for c, x in zip(quotable, lows)
+        )
+        edge = [c for c in quotable
+                if _is_borderline(ratios_cold[c][1], PRACTICAL_THRESHOLD,
+                                  ratios_cold[c][1], ratios_cold[c][2])]
         caveat = "" if quotable else (
             " NOT CLOCK-VERIFIED: no context had both the broadcast and gather rows pass "
             "the gate, so the DRAM-resident ratio is reported but not relied on."
@@ -638,6 +734,11 @@ def audit_optimizations(b: Bench, nbits: int = 4) -> list[Claim]:
                     "paths are bitwise-identical (test_metadata_broadcast_is_bitwise_"
                     "identical, 40 cases over S x nbits x group_size), so the gap is "
                     "issue cost and nothing else."
+                    + ("" if not edge else
+                       " The DRAM-resident interval at ctx="
+                       + ",".join(str(c) for c in edge)
+                       + " ends within a tenth of its own width of the 1.05x bar, so that"
+                         " row does not settle anything on its own.")
                     + caveat
                 ),
                 falsification_attempted=(
@@ -805,6 +906,7 @@ def audit_attribution(b: Bench, nbits: int = 4) -> list[Claim]:
     for ctx, (r, lo, hi) in sorted(quant_hot.items()):
         caveat = clock_caveat(b, ctx, fused, CONTROL)
         v = downgrade(_verdict(lo, hi), caveat)
+        caveat = caveat + borderline_note(lo, hi)
         claims.append(
             Claim(
                 id=f"attribution.quant_effect.hot.{nbits}b.ctx{ctx}",
@@ -837,6 +939,7 @@ def audit_attribution(b: Bench, nbits: int = 4) -> list[Claim]:
     for ctx, (r, lo, hi) in sorted(quant_cold.items()):
         caveat = clock_caveat(b, ctx, fused, CONTROL)
         v = downgrade(_verdict(lo, hi), caveat)
+        caveat = caveat + borderline_note(lo, hi)
         row = b.get(fused, ctx) or {}
         over = row.get("footprint_over_l2")
         claims.append(
@@ -956,6 +1059,98 @@ def audit_measurement(b: Bench) -> list[Claim]:
                 "sampling loop only -- warmup and CUDA-graph capture, during which the GPU "
                 "is free to fall back to idle clocks, are excluded so they are neither "
                 "mistaken for throttling nor able to hide it."
+            ),
+        )
+    ]
+
+
+def audit_dispersion(b: Bench) -> list[Claim]:
+    """Audit the dispersion gate itself: is it rejecting rows for the right reason?
+
+    The gate asks whether the per-sample IQR is within 5% of the median. That is
+    a property of how the card behaved, not of how well the reported number is
+    pinned -- and those come apart, because the median's uncertainty shrinks with
+    more samples while the IQR does not. This claim exists so the difference is
+    written down rather than left for a reader to discover.
+    """
+    try:
+        from analyze_dispersion import classify, describe
+    except Exception as exc:  # numpy missing, or the module moved
+        return [
+            Claim(
+                id="method.dispersion_gate",
+                claim="Rows rejected for timing dispersion were rejected for a reason that "
+                      "affects the numbers quoted from them.",
+                verdict="MISLEADING",
+                evidence=f"not evaluated: {type(exc).__name__}: {exc}",
+                falsification_attempted="n/a",
+            )
+        ]
+
+    rows = []
+    for r in b.p["results"]:
+        for raw_key, regime in (("cold_raw_ms", "DRAM-resident"),
+                                ("graph_raw_ms", "L2-resident")):
+            xs = r.get(raw_key)
+            if not xs:
+                continue
+            d = describe(xs)
+            if d is None:
+                continue
+            d.update(method=r["method"], ctx=r["ctx"], regime=regime)
+            d["cause"] = classify(d)
+            rows.append(d)
+    fails = [d for d in rows if d["cause"] != "passes"]
+    if not fails:
+        return []
+
+    causes: dict[str, int] = {}
+    for d in fails:
+        causes[d["cause"]] = causes.get(d["cause"], 0) + 1
+    drift = sum(n for c, n in causes.items() if c.startswith("drift"))
+    unfixable = sum(n for c, n in causes.items()
+                    if "no window length helps" in c)
+    worst = max(fails, key=lambda d: d["median_ci_halfwidth_frac"])
+    med_ci = statistics.median(d["median_ci_halfwidth_frac"] for d in fails)
+    passing = [d["median_ci_halfwidth_frac"] for d in rows if d["cause"] == "passes"]
+
+    return [
+        Claim(
+            id="method.dispersion_gate",
+            claim=(
+                "A measurement rejected by the IQR half of the gate is a measurement "
+                "whose reported median cannot be trusted."
+            ),
+            verdict="MISLEADING",
+            evidence=(
+                f"{len(fails)} of {len(rows)} measurements fail IQR <= 5% of median. Their "
+                f"medians are nonetheless pinned to a median of "
+                f"+-{med_ci * 100:.2f}% (moving-block bootstrap, 95%), worst case "
+                f"+-{worst['median_ci_halfwidth_frac'] * 100:.2f}% "
+                f"({worst['method']} ctx={worst['ctx']} {worst['regime']}, per-sample IQR "
+                f"{worst['iqr_frac'] * 100:.1f}%)"
+                + (f", against +-{statistics.median(passing) * 100:.2f}% for the "
+                   f"{len(passing)} that pass" if passing else "")
+                + ". The effects these tables report are 10-50%, so on every failing row "
+                "the quoted median is pinned an order of magnitude finer than the effect "
+                "it is used to establish. The gate is not measuring what its name suggests: "
+                "per-sample IQR describes the card's behaviour during the window, and the "
+                "median's precision describes the number. Both are worth having; only the "
+                "second bears on any conclusion drawn here. The gate is kept as-is and "
+                "unchanged -- loosening a gate because it is inconvenient is how the "
+                "numbers this project exists to avoid get published -- but a starred row "
+                "means 'the card was restless', not 'the number is unknown'."
+            ),
+            falsification_attempted=(
+                f"Decomposed every failing series into trend, serial correlation and tail "
+                f"(`analyze_dispersion.py`) to check whether the two fixes proposed in "
+                f"next_steps.md would work. They largely would not: only {drift} of "
+                f"{len(fails)} failures carry a statistically significant trend that a "
+                f"shorter window would reduce, while {unfixable} have no trend and no "
+                f"outlier tail -- for those the spread is the card's own wander and no "
+                f"window length changes it. Causes found: "
+                + "; ".join(f"{c} x{n}" for c, n in sorted(causes.items()))
+                + "."
             ),
         )
     ]
@@ -1261,6 +1456,7 @@ def main():
     claims += audit_correctness(b)
     claims += audit_scope(b)
     claims += audit_measurement(b)
+    claims += audit_dispersion(b)
     if not args.no_gpu_checks:
         claims += gpu_checks(b)
 
