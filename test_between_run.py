@@ -19,6 +19,7 @@ import pytest
 import audit_claims
 import between_run
 import clock_excursions
+import compare_protocols
 from audit_claims import Bench
 
 CTX = 2048
@@ -460,3 +461,74 @@ def test_a_preloaded_run_is_not_pooled_with_a_plain_one(tmp_path, monkeypatch):
     with pytest.raises(SystemExit) as e:
         between_run.main()
     assert "refusing to pool" in str(e.value)
+
+
+# ---------------------------------------------------------------------------
+# compare_protocols: are two protocols measuring the same thing?
+# ---------------------------------------------------------------------------
+
+
+def _proto_group(name, *, scale=1.0, power=75.0, n=2):
+    """A labelled group of runs where the fused kernel's speed and the reported
+    power draw can be dialled independently."""
+    entries = []
+    for i in range(n):
+        d = _payload(scale, seed=i)
+        for row in d["results"]:
+            for regime in ("cold", "graph"):
+                row["clocks"][regime]["clocks"].update({
+                    "sm_mhz_mean": 2700.0, "power_w_mean": power,
+                    "temp_c_mean": 70.0, "n_samples": 14,
+                })
+        entries.append((f"{name}{i}", Bench(d)))
+    return entries
+
+
+def test_identical_protocols_are_not_flagged():
+    groups = {"a": _proto_group("a"), "b": _proto_group("b")}
+    recs = compare_protocols.ratio_ranges(groups, [CTX])
+    assert recs
+    assert not any(any(r["disjoint_from_base"].values()) for r in recs)
+
+
+def test_a_shifted_protocol_is_flagged_as_disjoint():
+    """The finding this script exists to produce: one protocol's range missing
+    the reference protocol's entirely."""
+    groups = {"full": _proto_group("full"), "subset": _proto_group("sub", scale=1.2)}
+    recs = compare_protocols.ratio_ranges(groups, [CTX])
+    q = next(r for r in recs if r["name"] == "quant_cold")
+    assert q["disjoint_from_base"]["subset"] is True
+    assert q["shift_from_base"]["subset"] < -0.1
+
+
+def test_the_first_label_is_the_reference():
+    groups = {"full": _proto_group("full"), "subset": _proto_group("sub", scale=1.2)}
+    recs = compare_protocols.ratio_ranges(groups, [CTX])
+    q = next(r for r in recs if r["name"] == "quant_cold")
+    assert set(q["disjoint_from_base"]) == {"subset"}, "reference compares to others"
+
+
+def test_power_difference_is_reported_per_row_not_averaged():
+    """The correction this test is named for.
+
+    Comparing a whole-run mean power hid the effect, because on a part pinned at
+    its limit that average is flat by construction. The per-row figure is what
+    carries the signal, so it has to survive into the record.
+    """
+    groups = {"full": _proto_group("full", power=74.2),
+              "subset": _proto_group("sub", power=76.6)}
+    telem = compare_protocols.telemetry_agreement(
+        groups, [CTX], ["triton_fp16_control"])
+    assert telem
+    pw = telem[0]["telemetry"]["power W"]
+    assert pw["per_group"] == {"full": 74.2, "subset": 76.6}
+    assert pw["spread_frac"] == pytest.approx(76.6 / 74.2 - 1)
+
+
+def test_render_names_the_reference_protocol():
+    groups = {"full": _proto_group("full"), "subset": _proto_group("sub", scale=1.2)}
+    recs = compare_protocols.ratio_ranges(groups, [CTX])
+    telem = compare_protocols.telemetry_agreement(groups, [CTX], ["fused_triton_4b"])
+    md = compare_protocols.render(recs, telem, groups)
+    assert "Reference protocol: **`full`**" in md
+    assert "not interchangeable" in md

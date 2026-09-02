@@ -126,17 +126,24 @@ re-run it after any benchmark run without thinking about it:
    everything this repo says. Do it before quoting a hard interval externally,
    not before drawing any conclusion here.
 
-   **Still unexplained, and the most interesting loose end:** the subset runs
-   differ from the full runs on rows where *every monitored variable matches* —
-   SM clock to 0.4%, memory clock identical at 11001 MHz, power to 0.3 W,
-   temperature to 1 °C, same sample counts — and yet
-   `triton_fp16_control@8192` reads 31.4–32.1 µs against 32.6–32.8. Something
-   about how much work precedes a row changes its timing by ~2% and the clock
-   monitor cannot see it. Relatedly, `between_run.py` reports **r = +0.71**
-   between a row's between-run time movement and its memory-clock movement,
-   leaving about half the variance elsewhere. These are probably the same gap.
-   Candidates not yet tested: DVFS residency below the sampler's 109 ms period,
-   L2/TLB state left by preceding methods, and driver-side power budgeting.
+   **The channel is power, not clock — corrected 2026-09-02.** This item used
+   to say the protocol gap was invisible in the telemetry. It is not; the figure
+   being compared was a whole-run power average, which is flat by construction
+   because the card sits at its limit most of the time. `compare_protocols.py`
+   compares per row and finds **r = −0.57** between a row's power shift and its
+   time shift across 24 shared rows: more power, less time, at identical SM and
+   memory clocks. `triton_fp16_control@8192` runs 3.9% faster on 3.1% more
+   power with the memory clock identical at 11001 MHz.
+
+   That is about a third of the variance, not all of it — `fused_triton_4b@16k`
+   runs 2.0% faster on +0.2% power and stays unexplained — and it is probably
+   the same gap as the half of between-run variance that `between_run.py`'s
+   **r = +0.71** memory-clock correlation leaves over. What is left to test:
+   whether power draw is *caused* by the protocol (fewer resident allocations,
+   less preceding compilation) or is itself downstream of something else.
+   `--preload` is the first probe: if integrated load is what matters, a
+   preloaded subset run should move toward the full run's power *and* its
+   timings together.
 
 4. **2-bit still deserves a decision, not a table row.** Numerically unusable
    (rel L2 ≈ 0.7) under per-token grouping along `head_dim`. KIVI's result is

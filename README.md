@@ -533,11 +533,29 @@ reason that is known.** Three subset runs against the three full ones:
 | `split_only` | 8192 | 22.585–23.046 | **23.299–23.710** |
 
 Two of twelve ratios miss the full-run range entirely, and the spread at the
-headline cell is 13% against 0.6%. And nothing in the telemetry accounts for it:
-SM clocks agree to 0.4%, mean power to 0.3 W, temperature to 1 °C, sample counts
-are identical, and at ctx=8192 cold the memory clock is 11001 MHz in both — yet
-`triton_fp16_control@8192` reads 31.4–32.1 µs against 32.6–32.8. **How much work
-precedes a row changes its timing by ~2%, and the clock monitor cannot see it.**
+headline cell is 13% against 0.6%.
+
+The first version of this section said no telemetry accounted for it. That was
+wrong, and the way it was wrong is the usual way: the power figure being compared
+was a *whole-run* average, which is flat by construction because the card sits at
+its limit most of the time. Per row, `compare_protocols.py` finds the channel:
+
+| row | time | power | SM clock | mem clock |
+|---|---|---|---|---|
+| `triton_fp16_control` @8k cold | **−3.9%** | **+3.1%** | +0.03% | identical |
+| `triton_fp16_control` @16k cold | **+10.1%** | **−3.5%** | +0.13% | — |
+| `fp16_sdpa` @512 L2 | **+1.1%** | **−6.2%** | +0.02% | — |
+
+Across all 24 shared rows the correlation between a row's power shift and its
+time shift is **r = −0.57**: more power, less time, *at the same reported
+clocks*. So the clocks are not the whole instrument. On an 80 W part the reported
+clock is a mean sampled at 9.2 Hz, and two rows can hold the same mean clock
+while drawing different power and therefore achieving different throughput.
+
+That accounts for roughly a third of the variance, not all of it —
+`fused_triton_4b@16k cold` runs 2.0% faster on +0.2% power, which this does not
+explain. But "the power draw differs" is a considerably better description than
+"unexplained", and it was one per-row query away the whole time.
 
 **The excursion came back on demand.** `sub3` produced 1.277× at ctx=8192 — the
 historical number to three decimals — with the fused row at **10334 MHz** instead
