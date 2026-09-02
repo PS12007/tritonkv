@@ -616,10 +616,22 @@ MEM_CLOCK_TOL = 0.03
 def mem_clock_caveat(b: Bench, ctx: int, regime: str, *methods: str) -> str:
     """Flag a ratio whose two rows ran at different memory clocks.
 
-    Within-window memory P-state changes are handled by the gate. This is the
-    other half: two rows measured minutes apart can each be perfectly stable and
-    still sit in *different* states, and in the DRAM-resident regime that is a
-    22% bandwidth difference landing entirely on one side of the ratio.
+    This is not a scheduling artefact, which is what it first looked like. On an
+    80 W part the two clock domains share a power budget, so **the kernel is one
+    of the things that sets the memory clock**: a bandwidth-hungry baseline pulls
+    it up, a 5 us kernel does not. Measured across two independent full runs, a
+    method's mean memory clock reproduces to a median of 86 MHz out of ~10,500 --
+    it is a property of the workload, not of when it ran. Interleaving the
+    methods was tried on that hypothesis and changed nothing (mismatches over 3%:
+    12/20 sequential, 14/20 interleaved; the two passes of a single row agree to
+    0.14%).
+
+    So "hold the clock fixed and vary only the kernel" is not available here
+    without the administrator rights that `nvidia-smi -lgc` needs. What is being
+    compared is kernel A at the clock A induces against kernel B at the clock B
+    induces -- arguably the honest comparison for a latency question, since it is
+    what a user would actually get, but not a controlled experiment, and the
+    difference belongs in the evidence rather than in a footnote.
     """
     if regime != "cold":
         return ""
@@ -631,12 +643,20 @@ def mem_clock_caveat(b: Bench, ctx: int, regime: str, *methods: str) -> str:
     if (hi - lo) / lo <= MEM_CLOCK_TOL:
         return ""
     detail = ", ".join(f"{m} {v:.0f} MHz" for m, v in clocks.items() if v)
+    faster = max(clocks, key=lambda m: clocks[m] or 0)
+    direction = (
+        "The numerator ran faster than it would have at the denominator's clock, so "
+        "this ratio is understated." if faster == methods[0] else
+        "The denominator ran faster than it would have at the numerator's clock, so "
+        "this ratio is overstated."
+    )
     return (
         f" MEMORY CLOCK MISMATCH: the two rows ran at different memory clocks "
-        f"({detail}), a {(hi / lo - 1) * 100:.0f}% bandwidth difference that falls "
-        f"entirely on one side of this DRAM-resident ratio. The gate checks that each "
-        f"window was internally stable; it cannot check that two windows an hour apart "
-        f"were in the same P-state."
+        f"({detail}), a {(hi / lo - 1) * 100:.0f}% bandwidth difference falling entirely "
+        f"on one side of this DRAM-resident ratio. {direction} This is not fixable by "
+        f"scheduling -- each kernel induces its own memory P-state on a power-shared "
+        f"part, reproducibly (86 MHz median across two independent runs), and "
+        f"interleaving the methods was measured and changed nothing."
     )
 
 

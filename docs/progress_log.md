@@ -715,3 +715,80 @@ the 1.27×. So this is not a bias with a convenient sign, it is a bias with no
 sign at all — which is worse, because it cannot be argued away in either
 direction. The fix is structural: measure the methods **interleaved** rather than
 in sequence, so a slow drift in clock state lands on all of them equally.
+
+
+---
+
+## 2026-09-02 00:20 — Interleaving the methods, measured and thrown away
+
+**Attempted:** the last known bias. The audit's between-row check kept firing on
+the DRAM-resident quantization claims: two rows that get divided by each other had
+averaged different memory P-states, up to 13% of bandwidth on one side. The
+obvious cause is that the methods are measured one to completion, so the two rows
+in a ratio are minutes apart, and the obvious fix is to measure them round-robin
+so any slow drift lands on all of them equally.
+
+Implemented as `--passes`, with the per-pass sample series pooled and the per-pass
+clock windows merged (`merge_clock_records`, combining verdicts with `all` rather
+than averaging — one throttled pass is a throttled measurement). Full run at two
+passes: **1520 s against 861 s.**
+
+**It bought nothing.**
+
+| | sequential | interleaved |
+|---|---|---|
+| quotable rows | 39/48 | 39/48 |
+| ratios with > 3% memory-clock mismatch | 12/20 | 14/20 |
+| median mismatch | 5.5% | 4.9% |
+| DRAM-resident median IQR | 1.53% | 1.49% |
+
+**The number that explains why** is the agreement between a row's own two passes:
+a median of **0.14%**. There is no slow drift for interleaving to average away.
+
+And then the check that settles it. Comparing the two independent full runs, a
+method's mean memory clock reproduces to a median of **86 MHz out of ~10,500** —
+0.8%, with only 3 of 48 rows moving more than 400 MHz. The memory clock a row
+runs at is a property of *the method and context*, not of when it was measured:
+
+```
+triton_fp16_control       11169 MHz        fused_fold_zp_4b       10488 MHz
+fused_triton_2b           10919 MHz        dequant_sdpa_eager_4b  10477 MHz
+fused_triton_4b           10773 MHz        fused_gather_meta_4b   10193 MHz
+fp16_sdpa                 10624 MHz        fused_gather_meta_2b   10163 MHz
+```
+
+On a power-shared 80 W part **the kernel is one of the things that sets the
+clock**. A bandwidth-hungry baseline pulls the memory clock up; a 5 µs kernel does
+not. So "hold the clock fixed and vary only the kernel" is not available here
+without the administrator rights `nvidia-smi -lgc` needs, and no amount of
+scheduling substitutes for it.
+
+**What is actually being compared, then**, is kernel A at the clock A induces
+against kernel B at the clock B induces. For a latency question that is arguably
+the honest comparison — it is what a user gets — but it is not a controlled
+experiment, and the audit now says which way each instance leans instead of only
+that it exists. The systematic part is worth stating plainly: `triton_fp16_control`
+has the **highest** mean memory clock of any method, in both runs. It is the
+denominator's competitor in every quantization ratio, so this bias makes the
+reported quantization benefit **understated** — 4 of the 5 flagged claims lean
+that way.
+
+`--passes` defaults back to 1. The flag stays so the negative result can be
+re-run, and because someone on a desktop card with pinnable clocks may find it
+does something there.
+
+**One reporting bug found on the way.** The rejection line printed the *cold* IQR
+whatever failed, so a row rejected for its L2-resident dispersion was reported as
+`IQR 1.1% TOO-NOISY` — a number that comfortably passes the gate it was being
+blamed for. It now names the regime that failed.
+
+**Where this leaves the run.** The interleaved run is kept as the current
+`results/benchmark.json` (`passes: 2` is recorded in it). 39/48 quotable, and the
+audit reads **68 claims: 29 TRUE / 17 CONDITIONAL / 10 MISLEADING / 12 FALSE**.
+
+One thing not to gloss over: the DRAM-resident quantization ratio at ctx=8192
+moved **1.27× → 1.47×** between the two runs, because `fused_triton_4b@8192` is
+one of the three rows whose memory clock did shift between them (9934 → 11001
+MHz). The bootstrap CI on either number is ±0.01. The CI is describing sampling
+noise inside one run and says nothing about which P-state that run happened to
+land in, and the long-context numbers should be read with that gap in mind.

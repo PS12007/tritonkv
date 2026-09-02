@@ -91,12 +91,22 @@ after any benchmark run without thinking about it:
    now quotable with every input passing simultaneously — it previously leaned on
    rows that did not.
 
-   Also check the **between-row** memory clocks while you are there. The audit
-   flags a ratio whose two rows averaged different memory P-states
-   (`mem_clock_caveat`), and on the pre-fix data it fired on all four
-   DRAM-resident quantization claims at ctx ≥ 8192. If it still fires after the
-   ramp fix, the honest options are to interleave the methods within a context
-   rather than measuring them in sequence, or to state the bound explicitly.
+   The **between-row** memory-clock mismatch is now understood and is not
+   fixable on this machine: each kernel induces its own memory P-state on a
+   power-shared part (reproducible to 86 MHz across independent runs), and
+   interleaving was measured and changed nothing. What is left is to decide how
+   loudly to say it. The systematic direction is favourable — the fp16 control
+   has the highest mean memory clock of any method, which *understates* the
+   quantization benefit — so the honest move is to state the bound rather than
+   to keep flagging each instance.
+
+   Note also that the DRAM-resident quantization ratio at ctx=8192 moved
+   1.27× → 1.47× between two runs, because one row's memory P-state differed
+   between them, while the bootstrap CI on either is ±0.01. **The CI describes
+   sampling noise within a run and nothing about which P-state that run landed
+   in.** Reporting a run-to-run interval alongside it, from two or three full
+   runs, would be the honest fix and is the single most valuable remaining
+   measurement in this file.
 
 4. **2-bit still deserves a decision, not a table row.** Numerically unusable
    (rel L2 ≈ 0.7) under per-token grouping along `head_dim`. KIVI's result is
@@ -155,6 +165,13 @@ after any benchmark run without thinking about it:
   have discarded precisely the measurements the fix improved. Oscillation inside
   a window is noise both methods sit in equally; the bias is *between* rows, and
   that is where the check now lives.
+- **Interleaving the methods** (`--passes 2`). Implemented, measured over a full
+  run, and it changed nothing: 39/48 quotable either way, mismatches over 3%
+  went 12/20 → 14/20, and the run took 1520 s instead of 861 s. The premise was
+  wrong — a row's two passes agree to 0.14%, so there is no drift to average, and
+  a method's mean memory clock reproduces across independent runs to 86 MHz out
+  of ~10,500. The clock is set by the workload, not by the schedule. The flag
+  remains, defaulting to 1.
 - **Widening `MAX_IQR_FRAC`.** Not tried, and deliberately not tried. See
   `method.dispersion_gate` in the audit for what the gate does and does not
   measure — the answer to a gate that rejects too much is to fix the

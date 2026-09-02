@@ -323,10 +323,10 @@ broadcast, versus the same kernel with the gather) and
 `optimization.zero_point_fold` (which it marks `FALSE` on speed, since it clears
 the 1.05× bar at no context in either regime).
 
-Current run against `results/benchmark.json` (2026-09-01 23:30):
-**68 claims — 28 TRUE / 18 TRUE BUT CONDITIONAL / 10 MISLEADING / 12 FALSE.**
-Seven claims moved from conditional to established when the clock ramp was
-fixed, and none of them because a threshold was relaxed.
+Current run against `results/benchmark.json` (2026-09-02 00:10, two interleaved
+passes): **68 claims — 29 TRUE / 17 TRUE BUT CONDITIONAL / 10 MISLEADING /
+12 FALSE.** Eight claims moved from conditional to established when the clock
+ramp was fixed, and none of them because a threshold was relaxed.
 Regenerate with `./.venv/Scripts/python.exe audit_claims.py` (~20 s) and read
 `results/audit.md`. Two of those verdicts moved this session for reasons that
 were in the auditor rather than in the kernel:
@@ -409,14 +409,40 @@ gate problem: warm the memory system first and the drift loses its direction, an
 what remains is oscillation both methods sit in equally — noise in a ratio, not
 bias.
 
-**The bias case is real and lives between rows.** Two rows measured minutes apart
-can each be internally stable and still average different P-states, which in the
-DRAM-resident regime is a 20% bandwidth difference on one side of a ratio. The
-audit now checks that, and on the pre-fix data it fires on the four DRAM-resident
-quantization claims at ctx ≥ 8192. The bias points *away* from this project's
-thesis — the control ran at the higher memory clock, which makes the reported
-quantization benefit understated rather than inflated — but that is a fact about
-one run, not a property of the measurement.
+### The remaining bias is not a scheduling problem, and cannot be fixed here
+
+Two rows that get divided by each other can each be internally stable and still
+average different memory P-states — up to 13% of bandwidth on one side of a
+DRAM-resident ratio. The obvious cause is that the methods are measured one to
+completion, so the two rows are minutes apart; the obvious fix is to interleave
+them. That was implemented (`--passes`) and measured over a full run at two
+passes, 1520 s against 861 s:
+
+| | sequential | interleaved |
+|---|---|---|
+| quotable rows | 39/48 | 39/48 |
+| ratios with > 3% memory-clock mismatch | 12/20 | 14/20 |
+| DRAM-resident median IQR | 1.53% | 1.49% |
+
+It bought nothing, and the reason is more useful than the fix would have been. A
+row's own two passes agree to a median of **0.14%** — there is no slow drift to
+average away. And across two independent full runs a method's mean memory clock
+reproduces to a median of **86 MHz out of ~10,500**. The clock a row runs at is a
+property of *the method*, not of when it ran: on a power-shared 80 W part the
+kernel is one of the things that sets the clock, so a bandwidth-hungry baseline
+pulls the memory clock up and a 5 µs kernel does not.
+
+So "hold the clock fixed and vary only the kernel" is not available without the
+administrator rights `nvidia-smi -lgc` needs. What is being compared is kernel A
+at the clock A induces against kernel B at the clock B induces — arguably the
+honest comparison for a latency question, but not a controlled experiment, and
+the audit now says which way each instance leans rather than only that it exists.
+The systematic part: `triton_fp16_control` has the highest mean memory clock of
+any method in both runs, and it is the competitor in every quantization ratio, so
+this makes the reported quantization benefit **understated**. Four of the five
+flagged claims lean that way.
+
+`--passes` defaults to 1. The flag stays so the negative result can be re-run.
 
 ### What the dispersion gate actually measures
 

@@ -174,16 +174,16 @@ class ClockMonitor:
     def window(self, t0: float, t1: float, mem_sensitive: bool = False) -> dict | None:
         """Summarize the clocks observed while [t0, t1] was being measured.
 
-        ``mem_sensitive`` says whether the memory clock belongs in the verdict.
-        It does for the DRAM-resident measurements and does not for the
-        L2-resident ones, and that is a measured distinction rather than a
-        judgement: across the 96 windows in the run that exposed this, a memory
-        P-state change inside a DRAM-resident window came with a median timing
-        trend of -5.6% and 9 of 22 windows failing dispersion, against -0.9% and
-        1 of 26 where it held. In the L2-resident windows the same split gives
-        -1.6% / 1 of 12 against -3.1% / 14 of 36 -- the data is in L2, the memory
-        clock is not on the critical path, and gating on it there would reject
-        twelve windows for a reason that demonstrably does not touch them.
+        ``mem_sensitive`` marks the measurements the memory clock can actually
+        reach -- the DRAM-resident ones. It is recorded, not enforced: see the
+        note on ``mem_stable`` below for why gating on the memory clock was tried
+        and thrown away. The flag survives because it is the right label to carry
+        into ``audit_claims.py``, which does use it, and because the distinction
+        it draws is measured rather than assumed: in the run that exposed all
+        this, a memory P-state change inside a DRAM-resident window came with a
+        median timing trend of -5.6% and 9 of 22 windows failing dispersion,
+        against -0.9% and 1 of 26 where it held; in the L2-resident windows the
+        same split gives -1.6% / 1 of 12 against -3.1% / 14 of 36, i.e. nothing.
         """
         vals = [s for (t, s) in self.samples if t0 <= t <= t1]
         if not vals:
@@ -653,6 +653,48 @@ def stats(xs: list[float]) -> dict:
     }
 
 
+
+def merge_clock_records(records: list[dict]) -> dict:
+    """Fold one measurement's per-pass clock windows into a single summary.
+
+    Interleaved passes mean every method now has several windows for the same
+    measurement, minutes apart. The merged view answers the question the row-level
+    gate asks -- "was the GPU in a fit state the whole time this number was being
+    collected" -- so the per-pass verdicts are combined with `all`, not averaged:
+    one throttled pass is a throttled measurement.
+
+    The per-pass records are kept alongside under ``per_pass`` so nothing is lost
+    to the summary.
+    """
+    wins = [r["clocks"] for r in records if r and r.get("clocks")]
+    out = {
+        "per_pass": records,
+        "sampling_seconds": sum(r.get("sampling_seconds") or 0.0 for r in records),
+        "wall_seconds": sum(r.get("wall_seconds") or 0.0 for r in records),
+        "ramp": records[0].get("ramp") if records else None,
+        "ramp_inner": records[0].get("ramp_inner") if records else None,
+        "passes": len(records),
+    }
+    if not wins:
+        out["clocks"] = None
+        return out
+    total = sum(w["n_samples"] for w in wins) or 1
+    m = {"n_samples": sum(w["n_samples"] for w in wins)}
+    for k in SMI_KEYS:
+        m[f"{k}_min"] = min(w[f"{k}_min"] for w in wins)
+        m[f"{k}_max"] = max(w[f"{k}_max"] for w in wins)
+        m[f"{k}_mean"] = sum(w[f"{k}_mean"] * w["n_samples"] for w in wins) / total
+    m["sm_spread_frac"] = (m["sm_mhz_max"] - m["sm_mhz_min"]) / (m["sm_mhz_mean"] or 1.0)
+    m["mem_spread_frac"] = (m["mem_mhz_max"] - m["mem_mhz_min"]) / (m["mem_mhz_mean"] or 1.0)
+    m["mem_clock_constant"] = m["mem_mhz_min"] == m["mem_mhz_max"]
+    m["mem_stable"] = m["mem_spread_frac"] <= MAX_IQR_FRAC
+    m["mem_sensitive"] = any(w.get("mem_sensitive") for w in wins)
+    for k in ("boosted", "thermal_headroom", "enough_samples", "stable"):
+        m[k] = all(bool(w.get(k)) for w in wins)
+    out["clocks"] = m
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Benchmark case construction
 # ---------------------------------------------------------------------------
@@ -1003,6 +1045,10 @@ def main():
     ap.add_argument("--batch", type=int, default=1)
     ap.add_argument("--group-size", type=int, default=DEFAULT_GROUP_SIZE)
     ap.add_argument("--samples", type=int, default=50)
+    ap.add_argument("--passes", type=int, default=1,
+                    help="interleaved measurement passes over the method list. "
+                         "Defaults to 1 because 2 was measured and bought "
+                         "nothing -- see the comment on the timing loop")
     ap.add_argument("--quick", action="store_true")
     ap.add_argument("--no-tune", action="store_true")
     ap.add_argument("--no-clock-monitor", action="store_true",
@@ -1017,6 +1063,7 @@ def main():
 
     contexts = (512, 2048) if args.quick else CONTEXT_LENGTHS
     samples = 8 if args.quick else args.samples
+    passes = max(1, args.passes)
 
     shape, provenance = load_model_config(args.model)
     print(f"model : {shape.name}  ({provenance})")
@@ -1065,76 +1112,139 @@ def main():
     l2_bytes = flusher.l2_bytes
     rows = []
     unstable = []
-    print(f"\ntiming (samples={samples}, L2 flush buffer = {flusher.nbytes / 1e6:.0f} MB):")
+    print(f"\ntiming (samples={samples} x {passes} interleaved pass"
+          f"{'es' if passes != 1 else ''}, "
+          f"L2 flush buffer = {flusher.nbytes / 1e6:.0f} MB):")
     for ctx in contexts:
         cases = build_cases(shape, ctx, args.batch, args.group_size, tuned, l2_bytes)
         print(f"\n  --- context {ctx} ---")
+        # `passes` measures the methods round-robin rather than one method to
+        # completion. It defaults to 1, and the reason is worth keeping.
+        #
+        # The problem it was written for is real: the audit's between-row check
+        # finds DRAM-resident ratios whose two rows averaged different memory
+        # P-states, up to 13% of bandwidth on one side. The theory was that this
+        # is slow drift -- rows divided by each other are measured minutes apart
+        # -- and that interleaving would spread the drift over every method
+        # equally.
+        #
+        # Measured, at 2 passes over a full run (1520 s against 861 s):
+        #
+        #   * quotable rows: 39/48 either way.
+        #   * mismatches over 3%: 12/20 sequential, 14/20 interleaved.
+        #   * the two passes of a row agree to a median of **0.14%**.
+        #
+        # That last number is the one that settles it. There is no slow drift for
+        # interleaving to average away. Comparing the two independent full runs,
+        # a method's mean memory clock reproduces to a median of **86 MHz** out
+        # of ~10,500 -- it is a property of the method and context, not of when
+        # the measurement happened. Each workload induces its own memory P-state,
+        # because on a power-shared 80 W part the kernel is one of the things
+        # that sets the clock.
+        #
+        # So the mismatch cannot be scheduled away, and the flag is kept only so
+        # the negative result can be re-run.
+        acc = {c.method: {k: [] for k in
+                          ("cold", "cold_naive", "pipe", "graph",
+                           "cold_clk", "cold_naive_clk", "pipe_clk", "graph_clk")}
+               for c in cases}
+        errors: dict[str, dict] = {}
+        transients: dict[str, int] = {}
+        for pass_i in range(passes):
+            if passes > 1:
+                print(f"    pass {pass_i + 1}/{passes}")
+            for c in cases:
+                torch.cuda.synchronize()
+                if pass_i == 0:
+                    torch.cuda.empty_cache()
+                    torch.cuda.reset_peak_memory_stats()
+                    before = torch.cuda.memory_allocated()
+                    c.fn()
+                    torch.cuda.synchronize()
+                    transients[c.method] = torch.cuda.max_memory_allocated() - before
+
+                def timed(fn, mem_sensitive: bool = False):
+                    """Run one measurement with the clocks ramped first, and record them.
+
+                    Each of the four measurements gets its own ramp and its own clock
+                    window, because they are minutes apart and the GPU drops back to
+                    idle clocks in between. Bracketing the whole row instead would
+                    report the ramp itself as instability and hide a genuinely
+                    throttled measurement inside a wide average.
+
+                    The ramp is handed *into* the timing function rather than only
+                    run here, because everything between this point and the opening
+                    of the clock window -- warmup, CUDA-graph capture, priming
+                    replays -- is CPU-bound with the GPU near idle, and long enough
+                    for the boost to decay. Ramping only out here systematically
+                    penalised the fastest methods: the slow PyTorch baselines re-boost
+                    themselves within their own first sample, while a 14 us kernel
+                    never does, so the fp16 control failed the boost gate for being
+                    fast rather than for being throttled.
+                    """
+                    ramp_holder = {}
+
+                    def ramp():
+                        if monitor is not None:
+                            ramp_holder["inner"] = warm_clocks(
+                                monitor, env["max_sm_clock_mhz"]
+                            )
+
+                    # The outer ramp gets no memory-settle wait. Everything between
+                    # here and the clock window -- warmup, graph capture, priming --
+                    # is long enough for both clock domains to decay, which is why
+                    # the inner ramp exists at all; paying the settle wait twice buys
+                    # nothing and roughly doubles the cost of every row.
+                    r = (warm_clocks(monitor, env["max_sm_clock_mhz"], mem_wait_s=0.0)
+                         if monitor is not None else None)
+                    span = [None, None]
+                    t_a = time.time()
+                    val = fn(span, ramp)
+                    t_b = time.time()
+                    lo = span[0] if span[0] is not None else t_a
+                    hi = span[1] if span[1] is not None else t_b
+                    w = (monitor.window(lo, hi, mem_sensitive=mem_sensitive)
+                         if monitor is not None else None)
+                    return val, {"ramp": r, "ramp_inner": ramp_holder.get("inner"),
+                                 "clocks": w,
+                                 "sampling_seconds": hi - lo, "wall_seconds": t_b - t_a}
+
+                # the hot-regime numbers get bootstrapped too, so they need enough
+                # samples to bootstrap: half the cold count, not a fifth
+                sub = max(10, samples // 2)
+                cold, cold_clk = timed(
+                    lambda sp, w: bench_graph_rotating(c.fns, samples, span=sp, warm=w),
+                    mem_sensitive=True)
+                cold_naive, cold_naive_clk = timed(
+                    lambda sp, w: bench_cold(c.fn, flusher, sub, span=sp, warm=w),
+                    mem_sensitive=True)
+                pipe, pipe_clk = timed(lambda sp, w: bench_pipelined(c.fn, sub, span=sp, warm=w))
+                graph, graph_clk = timed(lambda sp, w: bench_graph(c.fn, sub, span=sp, warm=w))
+                for key, val, clk in (("cold", cold, cold_clk),
+                                      ("cold_naive", cold_naive, cold_naive_clk),
+                                      ("pipe", pipe, pipe_clk),
+                                      ("graph", graph, graph_clk)):
+                    a = acc[c.method]
+                    if isinstance(val, list):
+                        a[key].extend(val)
+                    else:
+                        # A method that cannot be captured fails the same way on
+                        # every pass; keep the first error and stop pretending
+                        # there are samples.
+                        errors.setdefault(f"{c.method}:{key}", val)
+                    a[key + "_clk"].append(clk)
+
         for c in cases:
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-            torch.cuda.reset_peak_memory_stats()
-            before = torch.cuda.memory_allocated()
-            c.fn()
-            torch.cuda.synchronize()
-            transient = torch.cuda.max_memory_allocated() - before
-
-            def timed(fn, mem_sensitive: bool = False):
-                """Run one measurement with the clocks ramped first, and record them.
-
-                Each of the four measurements gets its own ramp and its own clock
-                window, because they are minutes apart and the GPU drops back to
-                idle clocks in between. Bracketing the whole row instead would
-                report the ramp itself as instability and hide a genuinely
-                throttled measurement inside a wide average.
-
-                The ramp is handed *into* the timing function rather than only
-                run here, because everything between this point and the opening
-                of the clock window -- warmup, CUDA-graph capture, priming
-                replays -- is CPU-bound with the GPU near idle, and long enough
-                for the boost to decay. Ramping only out here systematically
-                penalised the fastest methods: the slow PyTorch baselines re-boost
-                themselves within their own first sample, while a 14 us kernel
-                never does, so the fp16 control failed the boost gate for being
-                fast rather than for being throttled.
-                """
-                ramp_holder = {}
-
-                def ramp():
-                    if monitor is not None:
-                        ramp_holder["inner"] = warm_clocks(
-                            monitor, env["max_sm_clock_mhz"]
-                        )
-
-                # The outer ramp gets no memory-settle wait. Everything between
-                # here and the clock window -- warmup, graph capture, priming --
-                # is long enough for both clock domains to decay, which is why
-                # the inner ramp exists at all; paying the settle wait twice buys
-                # nothing and roughly doubles the cost of every row.
-                r = (warm_clocks(monitor, env["max_sm_clock_mhz"], mem_wait_s=0.0)
-                     if monitor is not None else None)
-                span = [None, None]
-                t_a = time.time()
-                val = fn(span, ramp)
-                t_b = time.time()
-                lo = span[0] if span[0] is not None else t_a
-                hi = span[1] if span[1] is not None else t_b
-                w = (monitor.window(lo, hi, mem_sensitive=mem_sensitive)
-                     if monitor is not None else None)
-                return val, {"ramp": r, "ramp_inner": ramp_holder.get("inner"),
-                             "clocks": w,
-                             "sampling_seconds": hi - lo, "wall_seconds": t_b - t_a}
-
-            # the hot-regime numbers get bootstrapped too, so they need enough
-            # samples to bootstrap: half the cold count, not a fifth
-            sub = max(10, samples // 2)
-            cold, cold_clk = timed(
-                lambda sp, w: bench_graph_rotating(c.fns, samples, span=sp, warm=w),
-                mem_sensitive=True)
-            cold_naive, cold_naive_clk = timed(
-                lambda sp, w: bench_cold(c.fn, flusher, sub, span=sp, warm=w),
-                mem_sensitive=True)
-            pipe, pipe_clk = timed(lambda sp, w: bench_pipelined(c.fn, sub, span=sp, warm=w))
-            graph, graph_clk = timed(lambda sp, w: bench_graph(c.fn, sub, span=sp, warm=w))
+            a = acc[c.method]
+            transient = transients.get(c.method, 0)
+            cold = a["cold"] or errors.get(f"{c.method}:cold", {"error": "no samples"})
+            cold_naive = a["cold_naive"] or errors.get(f"{c.method}:cold_naive")
+            pipe = a["pipe"] or errors.get(f"{c.method}:pipe", {"error": "no samples"})
+            graph = a["graph"] or errors.get(f"{c.method}:graph", {"error": "no samples"})
+            cold_clk = merge_clock_records(a["cold_clk"])
+            cold_naive_clk = merge_clock_records(a["cold_naive_clk"])
+            pipe_clk = merge_clock_records(a["pipe_clk"])
+            graph_clk = merge_clock_records(a["graph_clk"])
             clocks = cold_clk["clocks"]
 
             row = {
@@ -1210,8 +1320,14 @@ def main():
                     clk = f"clk {bad['sm_mhz_min']:4.0f} MHz min NOT-BOOSTED"
                     unstable.append(f"{c.method}@{ctx} (clocks)")
             else:
-                clk = f"IQR {row['cold']['iqr_frac_of_median']:.1%} TOO-NOISY"
-                unstable.append(f"{c.method}@{ctx} (dispersion)")
+                # Name the regime that actually failed. This printed the cold
+                # IQR unconditionally, so a row rejected for its L2-resident
+                # dispersion was reported as "IQR 1.1% TOO-NOISY" -- a number
+                # that passes the gate it is being blamed for.
+                which = "cold" if not timing_is_tight(row["cold"]) else "hot"
+                frac = row["cold" if which == "cold" else "graph"]["iqr_frac_of_median"]
+                clk = f"{which} IQR {frac:.1%} TOO-NOISY"
+                unstable.append(f"{c.method}@{ctx} (dispersion, {which})")
             hot = row["graph"]["median_ms"] * 1e3 if isinstance(graph, list) else float("nan")
             print(
                 f"  {c.method:<28} cold {cold_s}   "
@@ -1246,6 +1362,7 @@ def main():
         "model": shape.as_dict(),
         "model_provenance": provenance,
         "args": vars(args),
+        "passes": passes,
         "contexts": list(contexts),
         "bit_widths": list(BIT_WIDTHS),
         "tuned_config": {f"{c}_{b}bit": v for (c, b), v in tuned.items()},
