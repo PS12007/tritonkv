@@ -418,7 +418,8 @@ def main():
     # many times, and a subset run pooled with a full one would compare rows
     # measured under different amounts of preceding GPU work.
     sig = {(p["args"]["samples"], p["args"]["passes"], p["args"]["group_size"],
-            p["args"].get("methods"), tuple(p["contexts"])) for p in payloads}
+            p["args"].get("methods"), p["args"].get("preload", 0.0) or 0.0,
+            tuple(p["contexts"])) for p in payloads}
     if len(sig) > 1:
         raise SystemExit(f"runs differ in configuration, refusing to pool: {sig}")
 

@@ -445,3 +445,18 @@ def test_render_reports_the_rate_and_the_gate():
     assert "Rate, by run group" in md
     assert "median MHz" in md
     assert "excursion" in md.lower()
+
+
+def test_a_preloaded_run_is_not_pooled_with_a_plain_one(tmp_path, monkeypatch):
+    """`--preload` deliberately changes the GPU's integrated load before timing.
+    That is the variable under test, so two runs that differ in it are two
+    experiments."""
+    plain, warmed = _payload(1.0), _payload(1.0)
+    warmed["args"]["preload"] = 300.0
+    a, b = tmp_path / "plain.json", tmp_path / "warm.json"
+    a.write_text(json.dumps(plain), encoding="utf-8")
+    b.write_text(json.dumps(warmed), encoding="utf-8")
+    monkeypatch.setattr("sys.argv", ["between_run.py", str(a), str(b)])
+    with pytest.raises(SystemExit) as e:
+        between_run.main()
+    assert "refusing to pool" in str(e.value)

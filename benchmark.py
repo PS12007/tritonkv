@@ -321,6 +321,58 @@ def _ramp_buffers():
     return _RAMP_BUFFERS["src"], _RAMP_BUFFERS["dst"]
 
 
+def preload(monitor: ClockMonitor | None, seconds: float) -> dict:
+    """Run the ramp workload for a fixed duration before any timing begins.
+
+    Written to test one hypothesis, and it is worth stating what it is not.
+
+    A run that times 3 methods per context and one that times 12 disagree by up
+    to 2% on rows where every monitored variable matches. Two explanations were
+    available. The first -- slow drift, so a row measured later in a run reads
+    differently from one measured earlier -- is **refuted** by the interleaved
+    run already in the tree: measuring every method twice round-robin moves the
+    per-row mean memory clock by a median of +0.00%, with the direction split
+    15/48 up. Position inside a warm run does not matter.
+
+    The second is *total* sustained load: the card's governor, thermal mass and
+    power budget integrate over the whole run, so a 210 s run and a 775 s run
+    are in different states throughout, independent of where a row sits. That
+    predicts a subset run given enough preceding load should converge on the
+    full run's numbers, and this flag is how that gets tested rather than
+    argued.
+
+    The per-row ramp cannot answer it: it is bounded at a few seconds and stops
+    as soon as the clocks settle, which is a statement about the instantaneous
+    state, not the integrated one.
+    """
+    if seconds <= 0:
+        return {"seconds": 0.0, "ran": False}
+    a = torch.randn(2048, 2048, device="cuda", dtype=torch.float16)
+    b = torch.randn(2048, 2048, device="cuda", dtype=torch.float16)
+    src, dst = _ramp_buffers()
+    t0 = time.time()
+    before = monitor.latest() if (monitor and monitor.available) else None
+    n = 0
+    while time.time() - t0 < seconds:
+        for _ in range(8):
+            a = (a @ b) * 0.0009765625
+            dst.copy_(src, non_blocking=True)
+        torch.cuda.synchronize()
+        n += 1
+    del a, b
+    after = monitor.latest() if (monitor and monitor.available) else None
+    return {
+        "seconds": time.time() - t0,
+        "ran": True,
+        "iterations": n,
+        "sm_mhz_before": before["sm_mhz"] if before else None,
+        "sm_mhz_after": after["sm_mhz"] if after else None,
+        "mem_mhz_before": before["mem_mhz"] if before else None,
+        "mem_mhz_after": after["mem_mhz"] if after else None,
+        "temp_c_after": after.get("temp_c") if after else None,
+    }
+
+
 def warm_clocks(monitor: ClockMonitor | None, max_sm: float | None,
                 target_frac: float = CLOCK_TARGET_FRAC, timeout_s: float = 20.0,
                 min_spin_s: float = 0.4,
@@ -1093,6 +1145,12 @@ def main():
                          "the same experiment, not a different experiment. "
                          "Recorded in the JSON, and between_run.py refuses to "
                          "pool runs whose method sets differ.")
+    ap.add_argument("--preload", type=float, default=0.0, metavar="SECONDS",
+                    help="run the ramp workload for this long before any timing "
+                         "starts. Defaults to 0. Exists to test whether the "
+                         "gap between a short run and a long one is *total* "
+                         "sustained load rather than position within the run -- "
+                         "see the docstring on preload(). Recorded in the JSON.")
     ap.add_argument("--quick", action="store_true")
     ap.add_argument("--no-tune", action="store_true")
     ap.add_argument("--no-clock-monitor", action="store_true",
@@ -1156,6 +1214,15 @@ def main():
     l2_bytes = flusher.l2_bytes
     rows = []
     unstable = []
+    preload_info = preload(monitor, args.preload)
+    if preload_info["ran"]:
+        print(f"\npreload: {preload_info['seconds']:.0f} s of ramp workload before "
+              f"any timing (SM {preload_info['sm_mhz_before'] or 0:.0f} -> "
+              f"{preload_info['sm_mhz_after'] or 0:.0f} MHz, mem "
+              f"{preload_info['mem_mhz_before'] or 0:.0f} -> "
+              f"{preload_info['mem_mhz_after'] or 0:.0f} MHz, "
+              f"{preload_info['temp_c_after'] or 0:.0f} C)")
+
     print(f"\ntiming (samples={samples} x {passes} interleaved pass"
           f"{'es' if passes != 1 else ''}, "
           f"L2 flush buffer = {flusher.nbytes / 1e6:.0f} MB):")
@@ -1410,6 +1477,7 @@ def main():
         "model_provenance": provenance,
         "args": vars(args),
         "passes": passes,
+        "preload": preload_info,
         "contexts": list(contexts),
         "bit_widths": list(BIT_WIDTHS),
         "tuned_config": {f"{c}_{b}bit": v for (c, b), v in tuned.items()},
