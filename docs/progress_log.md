@@ -561,3 +561,102 @@ reasoning:**
 The correlation correction did not move a single conclusion; the one apparent
 change was the missing margin all along. 68 claims: **21 TRUE / 25 CONDITIONAL /
 10 MISLEADING / 12 FALSE**.
+
+---
+
+## 2026-09-01 23:10 — I was warming up the wrong half of the machine
+
+**Attempted:** `next_steps.md` item 3 — the attribution is only fully quotable at
+ctx ≤ 2048 because `triton_fp16_control` keeps failing at 8192 and 16384. The
+dispersion decomposition said those two rows fall **19.3% and 22.6% across their
+own measurement window**, the largest systematic effect anywhere in the run. A
+19% decline is not jitter. Something was still ramping.
+
+**It was not the SM clock.** Those windows pass that gate — SM min 2445–2490 MHz
+against a 2472 MHz floor. It was the **memory** clock. The P-states on this part
+are 405 MHz at deep idle, **12001 MHz at light idle**, and **9001 or 11001 MHz
+under load**: an 80 W laptop chip shares power between the domains, so the memory
+clock comes *down* when the SMs start working, and then moves between those two
+states — a 20% swing. A bandwidth-bound measurement spanning that is two
+measurements averaged together.
+
+The monitor had been computing `mem_clock_constant` since the clock work began.
+It had never been used.
+
+| DRAM-resident windows | n | median trend | median IQR | fail IQR ≤ 5% |
+|---|---|---|---|---|
+| memory clock changed | 22 | **−5.6%** | 3.8% | **9** |
+| memory clock held | 26 | −0.9% | 1.7% | 1 |
+
+**The cause, and it is embarrassing in a useful way.** The pre-measurement ramp
+was a 2048×2048 fp16 GEMM. That is compute-bound and works out of cache: it
+drives the SM clock hard and asks the memory system for essentially nothing, so
+the governor had no reason to move the memory clock until the *measurement*
+started touching DRAM. Every ramp in this project has been warming the half of
+the machine that was already fine.
+
+The ramp now runs a DRAM-sized copy alongside the GEMM, and waits for the memory
+clock to stop changing rather than for the SM clock to cross a line.
+
+**Two bugs inside that fix, both caught by running it rather than reading it.**
+
+1. The wait was unbounded, and under load the clock oscillates rather than
+   settling, so it is never satisfied: every ramp ran to its 20 s timeout and a
+   two-context smoke run stopped finishing. Bounded at 2.5 s, with the outcome
+   *reported* rather than enforced.
+2. It targeted the highest memory clock ever seen — which is the **idle** 12001
+   MHz, a value no measurement will ever run at. The ramp was waiting for a clock
+   the measurement cannot reach. The ceiling is now learned only from samples
+   taken while the GPU is busy.
+
+**And then the change I was most confident about, measured and rejected.** The
+obvious companion to the ramp fix was to put memory-clock stability into the
+gate, the way SM clock stability already is. It rejects **every** DRAM-resident
+row — rows whose timing IQRs are 0.4–2%. A gate that refuses a measurement that
+tight is not measuring measurement quality.
+
+The decisive evidence is sharper than that, and it points the opposite way from
+the intuition. Comparing the same 48 measurements before and after the ramp fix:
+
+| | median \|trend\| | median IQR | IQR > 5% | memory-clock spread |
+|---|---|---|---|---|
+| L2-resident, old ramp | 2.4% | 1.6% | 5/24 | mostly 0% |
+| L2-resident, new ramp | **0.2%** | **0.7%** | **3/24** | ~19% |
+| DRAM-resident, old ramp | 2.0% | 1.8% | 5/24 | 0% or ~21% |
+| DRAM-resident, new ramp | 1.9% | 1.8% | **2/24** | ~19% |
+
+**The ramp that made the measurements better made the memory clock move more.**
+Gating on memory-clock movement would have thrown out precisely the measurements
+the fix improved. (Caveat on that table: the "new" numbers come from a
+`--quick` run at 8 samples against a full run at 50, so the trend estimates are
+noisier; the clean comparison is the full re-run this entry is waiting on. The
+direction is not subtle, though — the largest old drifts, −13% to −16% at
+ctx=512, are gone.)
+
+What the memory clock was, all along, was a **ramp** problem wearing the costume
+of a gate problem. Warm the memory system first and the drift loses its
+direction; what remains is oscillation that both methods sit in equally, which is
+noise in a ratio rather than bias, and which the dispersion gate and the median's
+own CI already account for.
+
+**The bias case is real, and it lives between rows.** Two rows measured minutes
+apart can each be internally fine and still average different P-states, and in
+the DRAM-resident regime that is a 20% bandwidth difference landing entirely on
+one side of a ratio. `audit_claims.py` now checks exactly that, and on the old
+data it fires on four claims — including the two carrying the project's headline
+conditional:
+
+```
+attribution.quant_effect.cold.4b.ctx8192   fused 9144 MHz vs control 10287 MHz (12%)
+attribution.quant_effect.cold.4b.ctx16384  fused 9770 MHz vs control 10287 MHz  (5%)
+attribution.quant_effect.cold.2b.ctx8192   fused 9001 MHz vs control 10287 MHz (14%)
+attribution.quant_effect.cold.2b.ctx16384  fused 9858 MHz vs control 10287 MHz  (4%)
+```
+
+The direction deserves stating precisely rather than dramatically. The ratio is
+`control_time / fused_time`, and it is the **control** that ran at the higher
+memory clock — so the control was faster than it would have been alongside the
+fused kernel, the numerator is smaller, and the reported quantization benefit is
+**understated** rather than inflated. The long-context sign flip is not an
+artefact of this. But "the bias happens to point away from my thesis" is a fact
+about one run, not a property of the measurement.

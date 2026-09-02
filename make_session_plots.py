@@ -515,6 +515,87 @@ def plot_dispersion(rows: list[dict]):
     save(fig, "dispersion_gate")
 
 
+# ---------------------------------------------------------------------------
+# Memory-clock gate (results/benchmark.json)
+# ---------------------------------------------------------------------------
+
+
+def _window_rows(payload: dict) -> list[dict]:
+    """Per-measurement trend and memory-clock behaviour, from the raw samples."""
+    out = []
+    for r in payload["results"]:
+        for key, raw, regime in (("cold", "cold_raw_ms", "DRAM-resident"),
+                                 ("graph", "graph_raw_ms", "L2-resident")):
+            c = ((r.get("clocks") or {}).get(key) or {}).get("clocks")
+            xs = r.get(raw)
+            if not c or not xs or len(xs) < 8:
+                continue
+            a = np.asarray(xs, dtype=float)
+            t = np.arange(a.size, dtype=float)
+            slope = np.polyfit(t, a, 1)[0]
+            med = float(np.median(a))
+            p25, p75 = np.percentile(a, [25, 75])
+            out.append({
+                "regime": regime,
+                "mem_held": bool(c["mem_clock_constant"]),
+                "trend_pct": float(slope * (a.size - 1) / med * 100.0),
+                "iqr_pct": float((p75 - p25) / med * 100.0),
+            })
+    return out
+
+
+def plot_mem_clock_gate(payload: dict):
+    """The memory clock explains the DRAM-resident drift, and nothing else.
+
+    The right-hand panel is the reason the new gate is conditional on regime: the
+    exception is measured, not chosen, and the same picture in the other regime
+    shows no effect to gate on.
+    """
+    rows = _window_rows(payload)
+    if not rows:
+        return
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.4), sharey=True)
+    rng = np.random.default_rng(0)
+
+    for ax, regime in zip(axes, ("DRAM-resident", "L2-resident")):
+        groups = [("memory clock\nchanged", False, S2), ("memory clock\nheld", True, MUTED)]
+        for i, (label, held, colour) in enumerate(groups):
+            sel = [d for d in rows if d["regime"] == regime and d["mem_held"] == held]
+            if not sel:
+                continue
+            y = [d["trend_pct"] for d in sel]
+            x = i + (rng.random(len(y)) - 0.5) * 0.22
+            ax.scatter(x, y, s=30, color=colour, alpha=0.75, edgecolor="none")
+            m = float(np.median(y))
+            ax.plot([i - 0.26, i + 0.26], [m, m], color=INK, lw=2.0, zorder=4)
+            ax.text(i + 0.30, m, f"median {m:+.1f}%", va="center", fontsize=9,
+                    color=INK)
+            # Axis-fraction y: the data limits are still growing while the
+            # groups are drawn, so a data-space position lands on a point.
+            ax.text(i, 0.015, f"n={len(sel)}", ha="center", va="bottom",
+                    transform=ax.get_xaxis_transform(), fontsize=8.5, color=INK2)
+        ax.axhline(0.0, color=INK2, lw=1.0, ls="--", zorder=1)
+        ax.set_xticks([0, 1])
+        ax.set_xticklabels([g[0] for g in groups], fontsize=9)
+        ax.set_xlim(-0.55, 1.75)
+        style(ax, regime,
+              subtitle=("bandwidth-bound: the memory clock is on the critical path"
+                        if regime == "DRAM-resident"
+                        else "data is in L2: it is not"),
+              ylabel=("timing drift across the window (%)"
+                      if regime == "DRAM-resident" else None))
+
+    figure_header(
+        fig,
+        "The warm-up drove the SM clock and never touched memory",
+        "So the memory P-state stepped up during the measurement instead of before it.\n"
+        "Under load this card runs memory at 9001 or 11001 MHz - a 20% swing - and a\n"
+        "bandwidth-bound window spanning that step is two measurements averaged.\n"
+        "Each point is one measurement; y is the trend across its own window.",
+    )
+    save(fig, "mem_clock_gate")
+
+
 def measure_registers() -> dict:
     """Compile both shipped paths and read the register count back."""
     import torch
@@ -548,6 +629,7 @@ def main():
     print(f"figures -> {PLOTS}")
     plot_broadcast_speedup(payload)
     plot_clock_samples(payload)
+    plot_mem_clock_gate(payload)
     disp = _sweep(ROOT / "results" / "dispersion.json")
     if disp:
         plot_dispersion(disp)

@@ -115,6 +115,17 @@ class ClockMonitor:
     def __init__(self, interval_ms: int = 100, max_sm: float | None = None):
         self.interval_ms = interval_ms
         self.max_sm = max_sm
+        # Highest memory clock seen *while the GPU was busy*, and when the clock
+        # last changed. Two reasons it is not simply the maximum.
+        #
+        # `nvidia-smi --query-gpu=clocks.max.memory` reports 12001 MHz here, and
+        # the card does reach it -- at idle. Under load this 80 W part shares
+        # power between the domains and runs the memory at 9001 or 11001, so the
+        # ceiling that matters is the loaded one. Targeting the idle ceiling made
+        # the ramp's stopping condition unreachable, and every ramp ran to its
+        # cap: the ramp was waiting for a clock the measurement will never see.
+        self.mem_seen_max: float = 0.0
+        self.mem_last_change: float = 0.0
         self.samples: list[tuple[float, dict]] = []
         self.proc = None
         self._thread = None
@@ -145,15 +156,35 @@ class ClockMonitor:
             if len(parts) != len(SMI_KEYS):
                 continue
             try:
-                self.samples.append((time.time(), {k: float(v) for k, v in zip(SMI_KEYS, parts)}))
+                sample = {k: float(v) for k, v in zip(SMI_KEYS, parts)}
             except ValueError:
                 continue
+            now = time.time()
+            mem = sample["mem_mhz"]
+            prev = self.samples[-1][1]["mem_mhz"] if self.samples else None
+            if prev is not None and mem != prev:
+                self.mem_last_change = now
+            if sample.get("util_pct", 0.0) >= LOADED_UTIL_PCT:
+                self.mem_seen_max = max(self.mem_seen_max, mem)
+            self.samples.append((now, sample))
 
     def latest(self) -> dict | None:
         return self.samples[-1][1] if self.samples else None
 
-    def window(self, t0: float, t1: float) -> dict | None:
-        """Summarize the clocks observed while [t0, t1] was being measured."""
+    def window(self, t0: float, t1: float, mem_sensitive: bool = False) -> dict | None:
+        """Summarize the clocks observed while [t0, t1] was being measured.
+
+        ``mem_sensitive`` says whether the memory clock belongs in the verdict.
+        It does for the DRAM-resident measurements and does not for the
+        L2-resident ones, and that is a measured distinction rather than a
+        judgement: across the 96 windows in the run that exposed this, a memory
+        P-state change inside a DRAM-resident window came with a median timing
+        trend of -5.6% and 9 of 22 windows failing dispersion, against -0.9% and
+        1 of 26 where it held. In the L2-resident windows the same split gives
+        -1.6% / 1 of 12 against -3.1% / 14 of 36 -- the data is in L2, the memory
+        clock is not on the critical path, and gating on it there would reject
+        twelve windows for a reason that demonstrably does not touch them.
+        """
         vals = [s for (t, s) in self.samples if t0 <= t <= t1]
         if not vals:
             near = [s for (t, s) in self.samples if t0 - 1.0 <= t <= t1 + 1.0]
@@ -186,8 +217,46 @@ class ClockMonitor:
         # clock artefact flatters most, so "not enough samples to tell" has to be
         # a distinct failure from "clocks sagged" rather than a silent pass.
         summary["enough_samples"] = summary["n_samples"] >= MIN_CLOCK_SAMPLES
+        # The memory clock is a step function on this card -- 9001 or 11001 MHz,
+        # a 22% jump -- and it was being computed here and then ignored. It should
+        # not have been: of the 48 DRAM-resident measurements in the run that
+        # exposed this, the 22 whose memory clock changed inside the window have a
+        # median timing trend of -5.6% and 9 IQR failures, against -0.9% and 1
+        # failure for the 26 where it held. A memory-bound measurement taken
+        # across a memory P-state change is two measurements averaged together.
+        summary["mem_at_ceiling"] = bool(
+            self.mem_seen_max and summary["mem_mhz_min"] >= self.mem_seen_max
+        )
+        summary["mem_sensitive"] = bool(mem_sensitive)
+        mem_mean = summary["mem_mhz_mean"] or 1.0
+        summary["mem_spread_frac"] = (
+            summary["mem_mhz_max"] - summary["mem_mhz_min"]) / mem_mean
+        summary["mem_stable"] = summary["mem_spread_frac"] <= MAX_IQR_FRAC
+        # `mem_stable` is recorded and reported, and deliberately NOT part of the
+        # verdict. It was, briefly, and the measurement said no: with the
+        # bandwidth-aware ramp in place, DRAM-resident rows span a 9001 <-> 11001
+        # MHz memory P-state (a 20% swing) and hold timing IQRs of 0.4-2%. A gate
+        # that rejects a row whose numbers are that tight is not measuring
+        # measurement quality.
+        #
+        # What the memory clock actually was, was a *ramp* problem. The old
+        # warm-up was a cache-resident GEMM: it drove the SM clock and asked the
+        # memory system for nothing, so the P-state rose during the measurement
+        # and left a systematic downward drift -- 22 of 48 DRAM-resident windows
+        # with a median trend of -5.6% against -0.9% where it held. Warming the
+        # memory system first removes the direction. What remains is oscillation
+        # both methods sit in equally, which is noise in a ratio rather than
+        # bias, and which the dispersion gate and the median's own CI already
+        # account for.
+        #
+        # The bias case is real but lives between rows, not inside one: two rows
+        # measured minutes apart can average different P-states, and in the
+        # DRAM-resident regime that is a 20% bandwidth difference on one side of
+        # a ratio. `mem_mhz_mean` is recorded per row so `audit_claims.py` can
+        # check exactly that, which is where the check belongs.
         summary["stable"] = bool(
-            summary["boosted"] and summary["thermal_headroom"] and summary["enough_samples"]
+            summary["boosted"] and summary["thermal_headroom"]
+            and summary["enough_samples"]
         )
         return summary
 
@@ -209,6 +278,16 @@ MIN_CLOCK_SAMPLES = 4           # a clock window built from fewer samples proves
 # so a window has to stay open well past a second to collect a usable number of
 # clock samples. 1.5 s buys ~14.
 MIN_SAMPLING_SECONDS = 1.5
+# How long the memory clock must hold its highest observed value before a ramp
+# counts as finished. ~5 samples at the measured 9.2 Hz.
+MEM_SETTLE_SECONDS = 0.55
+# A sample counts as "under load" above this utilization. Only loaded samples
+# define the reachable memory-clock ceiling.
+LOADED_UTIL_PCT = 50.0
+# ...and how long to keep waiting for that before giving up. The card oscillates
+# between its two memory P-states under sustained load, so "settled" is not
+# always reachable; an unbounded wait just stops the benchmark from running.
+MEM_MAX_WAIT_SECONDS = 2.5
 
 
 def timing_is_tight(st) -> bool:
@@ -220,29 +299,88 @@ def timing_is_tight(st) -> bool:
     )
 
 
+_RAMP_BUFFERS: dict = {}
+
+
+def _ramp_buffers():
+    """Buffers for the bandwidth half of the ramp, allocated once and reused.
+
+    Sized several times L2 so the copy has to go to DRAM. Allocated lazily and
+    cached because re-allocating ~256 MB before every measurement would perturb
+    the allocator state the measurement is about to run in.
+    """
+    if "src" not in _RAMP_BUFFERS:
+        try:
+            props = torch.cuda.get_device_properties(torch.cuda.current_device())
+            l2 = getattr(props, "L2_cache_size", 0) or 0
+        except Exception:
+            l2 = 0
+        nbytes = max(int(128e6), int(4 * l2))
+        _RAMP_BUFFERS["src"] = torch.empty(nbytes, dtype=torch.int8, device="cuda")
+        _RAMP_BUFFERS["dst"] = torch.empty(nbytes, dtype=torch.int8, device="cuda")
+    return _RAMP_BUFFERS["src"], _RAMP_BUFFERS["dst"]
+
+
 def warm_clocks(monitor: ClockMonitor | None, max_sm: float | None,
                 target_frac: float = CLOCK_TARGET_FRAC, timeout_s: float = 20.0,
-                min_spin_s: float = 0.4) -> dict:
-    """Spin the GPU until the SM clock boosts, so timings start at boost clocks.
+                min_spin_s: float = 0.4,
+                mem_settle_s: float = MEM_SETTLE_SECONDS,
+                mem_wait_s: float = MEM_MAX_WAIT_SECONDS) -> dict:
+    """Spin the GPU until *both* clock domains have settled, then return.
 
     ``nvidia-smi -lgc`` would pin the clocks outright, but it needs
     administrator rights, so the portable substitute is to give the GPU enough
     work that its own governor ramps up, then measure immediately afterwards.
+
+    Two things the first version of this got wrong, in the same way:
+
+    * **The workload.** It was a 2048x2048 fp16 GEMM, which is compute-bound and
+      works out of cache. It drives the SM clock and asks the memory system for
+      almost nothing, so the memory clock was still in a low P-state when the
+      measurement began and stepped up *during* it. The DRAM-resident rows are
+      exactly the ones that care. The ramp now runs a DRAM-sized copy alongside
+      the GEMM.
+    * **The stopping rule.** It stopped as soon as the SM clock crossed a
+      threshold, so a clock still on its way up counted as arrived. It now also
+      waits for the memory clock to reach the highest value this process has seen
+      and *hold* it for ``mem_settle_s`` -- a stopping rule about having stopped
+      changing rather than about having passed a line.
+
+    That memory wait is bounded (``mem_wait_s``) and its outcome is reported
+    rather than enforced. The first version was unbounded, and on a card that
+    oscillates between its two memory P-states under load the condition is simply
+    never satisfied: every ramp ran to the 20 s timeout and a two-context smoke
+    run stopped finishing. Waiting forever for a clock that will not settle is
+    not more rigorous than giving up and saying so -- the row's own gate
+    (``mem_clock_constant``) is what refuses the measurement, and it can only do
+    that if the measurement happens.
     """
     a = torch.randn(2048, 2048, device="cuda", dtype=torch.float16)
     b = torch.randn(2048, 2048, device="cuda", dtype=torch.float16)
+    src, dst = _ramp_buffers()
     t0 = time.time()
     target = (max_sm * target_frac) if max_sm else None
     reached = False
+    mem_settled = False
+    sm_reached_at = t0
     while True:
-        for _ in range(24):
+        for _ in range(8):
             a = (a @ b) * 0.0009765625
+            dst.copy_(src, non_blocking=True)
         torch.cuda.synchronize()
         el = time.time() - t0
         cur = monitor.latest() if (monitor and monitor.available) else None
         if target and cur and cur["sm_mhz"] >= target:
+            if not reached:
+                sm_reached_at = time.time()
             reached = True
-            if el >= min_spin_s:
+            mem_settled = bool(
+                monitor.mem_seen_max
+                and cur["mem_mhz"] >= monitor.mem_seen_max
+                and (time.time() - monitor.mem_last_change) >= mem_settle_s
+            )
+            waited = time.time() - sm_reached_at
+            if el >= min_spin_s and (mem_settled or waited >= mem_wait_s):
                 break
         if el >= timeout_s or (target is None and el >= min_spin_s):
             break
@@ -251,8 +389,11 @@ def warm_clocks(monitor: ClockMonitor | None, max_sm: float | None,
     return {
         "spin_seconds": time.time() - t0,
         "sm_mhz_after": cur["sm_mhz"] if cur else None,
+        "mem_mhz_after": cur["mem_mhz"] if cur else None,
+        "mem_ceiling_seen": monitor.mem_seen_max if monitor else None,
         "target_mhz": target,
         "reached_target": reached,
+        "mem_settled": mem_settled,
     }
 
 
@@ -937,7 +1078,7 @@ def main():
             torch.cuda.synchronize()
             transient = torch.cuda.max_memory_allocated() - before
 
-            def timed(fn):
+            def timed(fn, mem_sensitive: bool = False):
                 """Run one measurement with the clocks ramped first, and record them.
 
                 Each of the four measurements gets its own ramp and its own clock
@@ -964,14 +1105,21 @@ def main():
                             monitor, env["max_sm_clock_mhz"]
                         )
 
-                r = warm_clocks(monitor, env["max_sm_clock_mhz"]) if monitor is not None else None
+                # The outer ramp gets no memory-settle wait. Everything between
+                # here and the clock window -- warmup, graph capture, priming --
+                # is long enough for both clock domains to decay, which is why
+                # the inner ramp exists at all; paying the settle wait twice buys
+                # nothing and roughly doubles the cost of every row.
+                r = (warm_clocks(monitor, env["max_sm_clock_mhz"], mem_wait_s=0.0)
+                     if monitor is not None else None)
                 span = [None, None]
                 t_a = time.time()
                 val = fn(span, ramp)
                 t_b = time.time()
                 lo = span[0] if span[0] is not None else t_a
                 hi = span[1] if span[1] is not None else t_b
-                w = monitor.window(lo, hi) if monitor is not None else None
+                w = (monitor.window(lo, hi, mem_sensitive=mem_sensitive)
+                     if monitor is not None else None)
                 return val, {"ramp": r, "ramp_inner": ramp_holder.get("inner"),
                              "clocks": w,
                              "sampling_seconds": hi - lo, "wall_seconds": t_b - t_a}
@@ -980,9 +1128,11 @@ def main():
             # samples to bootstrap: half the cold count, not a fifth
             sub = max(10, samples // 2)
             cold, cold_clk = timed(
-                lambda sp, w: bench_graph_rotating(c.fns, samples, span=sp, warm=w))
+                lambda sp, w: bench_graph_rotating(c.fns, samples, span=sp, warm=w),
+                mem_sensitive=True)
             cold_naive, cold_naive_clk = timed(
-                lambda sp, w: bench_cold(c.fn, flusher, sub, span=sp, warm=w))
+                lambda sp, w: bench_cold(c.fn, flusher, sub, span=sp, warm=w),
+                mem_sensitive=True)
             pipe, pipe_clk = timed(lambda sp, w: bench_pipelined(c.fn, sub, span=sp, warm=w))
             graph, graph_clk = timed(lambda sp, w: bench_graph(c.fn, sub, span=sp, warm=w))
             clocks = cold_clk["clocks"]
@@ -1045,9 +1195,14 @@ def main():
             if clocks is None or gclk is None:
                 clk = "clk n/a"
             elif row["quotable"]:
+                # Annotate a P-state span rather than rejecting on it: the row is
+                # quotable, and the note is what a later comparison against
+                # another row needs in order to notice a bandwidth mismatch.
                 clk = f"clk {clocks['sm_mhz_mean']:4.0f} MHz ok"
+                if not clocks.get("mem_stable", True):
+                    clk += f" (mem {clocks['mem_mhz_min']:.0f}-{clocks['mem_mhz_max']:.0f})"
             elif not row["clock_verified"]:
-                bad = clocks if not clocks["stable"] else gclk
+                bad = clocks if not clocks["stable"] else gclk  # cold first, then hot
                 if not bad.get("enough_samples", True):
                     clk = f"only {bad['n_samples']} clock samples TOO-SHORT"
                     unstable.append(f"{c.method}@{ctx} (too few clock samples)")

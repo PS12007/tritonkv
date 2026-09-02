@@ -227,6 +227,12 @@ class Bench:
     def quotable(self, method: str, ctx: int) -> bool:
         return bool((self.get(method, ctx) or {}).get("quotable"))
 
+    def mem_clock(self, method: str, ctx: int, regime: str = "cold") -> float | None:
+        """Mean memory clock during one row's measurement window, if recorded."""
+        r = self.get(method, ctx) or {}
+        w = ((r.get("clocks") or {}).get(regime) or {}).get("clocks") or {}
+        return w.get("mem_mhz_mean")
+
     def corr(self, ctx: int, nbits: int):
         for row in self.p["correctness"]:
             if row["ctx"] == ctx and row["nbits"] == nbits:
@@ -600,6 +606,40 @@ def audit_correctness(b: Bench) -> list[Claim]:
 CONTROL = "triton_fp16_control"
 
 
+# Two rows whose mean memory clocks differ by more than this are not comparable
+# in the DRAM-resident regime. The card has two memory P-states here, 9001 and
+# 11001 MHz, so anything above a few percent means the two measurements ran in
+# different states rather than dithering within one.
+MEM_CLOCK_TOL = 0.03
+
+
+def mem_clock_caveat(b: Bench, ctx: int, regime: str, *methods: str) -> str:
+    """Flag a ratio whose two rows ran at different memory clocks.
+
+    Within-window memory P-state changes are handled by the gate. This is the
+    other half: two rows measured minutes apart can each be perfectly stable and
+    still sit in *different* states, and in the DRAM-resident regime that is a
+    22% bandwidth difference landing entirely on one side of the ratio.
+    """
+    if regime != "cold":
+        return ""
+    clocks = {m: b.mem_clock(m, ctx, "cold") for m in methods}
+    vals = [v for v in clocks.values() if v]
+    if len(vals) < 2:
+        return ""
+    lo, hi = min(vals), max(vals)
+    if (hi - lo) / lo <= MEM_CLOCK_TOL:
+        return ""
+    detail = ", ".join(f"{m} {v:.0f} MHz" for m, v in clocks.items() if v)
+    return (
+        f" MEMORY CLOCK MISMATCH: the two rows ran at different memory clocks "
+        f"({detail}), a {(hi / lo - 1) * 100:.0f}% bandwidth difference that falls "
+        f"entirely on one side of this DRAM-resident ratio. The gate checks that each "
+        f"window was internally stable; it cannot check that two windows an hour apart "
+        f"were in the same P-state."
+    )
+
+
 def clock_caveat(b: Bench, ctx: int, *methods: str) -> str:
     """Flag a ratio whose inputs were not measured at boost clocks.
 
@@ -937,7 +977,8 @@ def audit_attribution(b: Bench, nbits: int = 4) -> list[Claim]:
 
     # --- Claim 3: quantization in the DRAM-resident (cold) regime -----------
     for ctx, (r, lo, hi) in sorted(quant_cold.items()):
-        caveat = clock_caveat(b, ctx, fused, CONTROL)
+        caveat = (clock_caveat(b, ctx, fused, CONTROL)
+                  + mem_clock_caveat(b, ctx, "cold", fused, CONTROL))
         v = downgrade(_verdict(lo, hi), caveat)
         caveat = caveat + borderline_note(lo, hi)
         row = b.get(fused, ctx) or {}

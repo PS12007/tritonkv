@@ -357,6 +357,65 @@ of the interval's own width.
 With both in place, **no verdict changes.** The correlation correction moved
 nothing; the apparent movement was the missing margin.
 
+### The warm-up was warming the wrong half of the machine
+
+`triton_fp16_control` — the *fastest* method, and the one the whole attribution
+rests on — kept failing at long context. Its DRAM-resident timings fall **19.3%
+and 22.6% across a single measurement window** at ctx 8192 and 16384. That is not
+jitter.
+
+It was not the SM clock; those windows pass that gate (SM min 2445–2490 MHz
+against a 2472 MHz floor). It was the **memory** clock. The P-states here are
+405 MHz at deep idle, **12001 MHz at light idle**, and **9001 or 11001 MHz under
+load** — an 80 W part shares power between the domains, so the memory clock comes
+*down* when the SMs start working and then moves between those two states, a 20%
+swing. The DRAM-resident measurements are bandwidth-bound, so a window spanning
+that is two measurements averaged together.
+
+| DRAM-resident windows | n | median trend | median IQR | fail IQR ≤ 5% |
+|---|---|---|---|---|
+| memory clock changed | 22 | **−5.6%** | 3.8% | **9** |
+| memory clock held | 26 | −0.9% | 1.7% | 1 |
+
+**The cause.** The pre-measurement ramp was a 2048×2048 fp16 GEMM: compute-bound,
+working out of cache. It drives the SM clock hard and asks the memory system for
+almost nothing, so the governor had no reason to move the memory clock until the
+*measurement* started touching DRAM. Every ramp in this project had been warming
+the half of the machine that was already fine. It now runs a DRAM-sized copy
+alongside the GEMM, waits for the memory clock to stop changing rather than for
+the SM clock to cross a line, and learns the reachable ceiling from samples taken
+while the GPU is *busy* — the idle 12001 MHz is a clock no measurement will ever
+run at, and targeting it made the stopping condition unreachable.
+
+**The obvious companion change was measured and rejected.** Putting memory-clock
+stability into the gate, the way SM stability already is, rejects *every*
+DRAM-resident row — rows whose timing IQRs are 0.4–2%. And the evidence points
+the opposite way from the intuition: comparing the same 48 measurements before
+and after the ramp fix,
+
+| | median \|trend\| | median IQR | IQR > 5% | memory-clock spread |
+|---|---|---|---|---|
+| L2-resident, old ramp | 2.4% | 1.6% | 5/24 | mostly 0% |
+| L2-resident, new ramp | **0.2%** | **0.7%** | **3/24** | ~19% |
+| DRAM-resident, old ramp | 2.0% | 1.8% | 5/24 | 0% or ~21% |
+| DRAM-resident, new ramp | 1.9% | 1.8% | **2/24** | ~19% |
+
+The ramp that made the measurements better made the memory clock move *more*, so
+a gate on memory-clock movement would have discarded exactly the measurements the
+fix improved. The memory clock was a **ramp** problem wearing the costume of a
+gate problem: warm the memory system first and the drift loses its direction, and
+what remains is oscillation both methods sit in equally — noise in a ratio, not
+bias.
+
+**The bias case is real and lives between rows.** Two rows measured minutes apart
+can each be internally stable and still average different P-states, which in the
+DRAM-resident regime is a 20% bandwidth difference on one side of a ratio. The
+audit now checks that, and on the pre-fix data it fires on the four DRAM-resident
+quantization claims at ctx ≥ 8192. The bias points *away* from this project's
+thesis — the control ran at the higher memory clock, which makes the reported
+quantization benefit understated rather than inflated — but that is a fact about
+one run, not a property of the measurement.
+
 ### What the dispersion gate actually measures
 
 23 of 48 rows fail the `IQR ≤ 5% of median` half of the gate.
