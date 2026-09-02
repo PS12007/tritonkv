@@ -78,10 +78,22 @@ after any benchmark run without thinking about it:
    the current claim ("the win crossed the knee") does not depend on where
    exactly it is.
 
-3. **The attribution is only fully quotable at ctx ≤ 2048.** The 8192 and 16384
-   rows still lose either `fp16_sdpa` or `triton_fp16_control` to dispersion in
-   any given run, so the long-context sign flip is reported but leans on rows
-   that did not all pass simultaneously. Fixing (1) fixes this.
+3. **Re-check the long-context attribution against the new run.** The 8192 and
+   16384 rows used to lose `triton_fp16_control` to dispersion, and the cause is
+   now known and fixed: the ramp never touched the memory system, so the memory
+   P-state stepped up *during* those bandwidth-bound measurements (−19.3% and
+   −22.6% across their own windows). With the ramp warming DRAM too, those rows
+   should hold. Confirm it against the run that produced the current
+   `results/benchmark.json`, and re-check whether the long-context sign flip is
+   now quotable with every input passing simultaneously — it previously leaned on
+   rows that did not.
+
+   Also check the **between-row** memory clocks while you are there. The audit
+   flags a ratio whose two rows averaged different memory P-states
+   (`mem_clock_caveat`), and on the pre-fix data it fired on all four
+   DRAM-resident quantization claims at ctx ≥ 8192. If it still fires after the
+   ramp fix, the honest options are to interleave the methods within a context
+   rather than measuring them in sequence, or to state the bound explicitly.
 
 4. **2-bit still deserves a decision, not a table row.** Numerically unusable
    (rel L2 ≈ 0.7) under per-token grouping along `head_dim`. KIVI's result is
@@ -120,6 +132,11 @@ after any benchmark run without thinking about it:
   by a rounding difference. Both together changed **no** verdict.
 - The dispersion decomposition itself (`analyze_dispersion.py`) and the
   `method.dispersion_gate` claim that reports it against this project's own gate.
+- The bandwidth-aware clock ramp: a DRAM-sized copy alongside the GEMM, a
+  stopping rule that waits for the memory clock to stop changing (bounded, and
+  reported rather than enforced), and a ceiling learned only from samples taken
+  while the GPU is busy. The old ramp drove the SM clock and asked memory for
+  nothing, which is why the P-state moved inside the measurement.
 
 ## Things that were tried and rejected — do not redo without new evidence
 
@@ -128,6 +145,17 @@ after any benchmark run without thinking about it:
   ad-hoc A/B suggested otherwise; the harness disagreed and the harness wins.
 - **Narrow-load + register broadcast for the packed codes.** Bitwise identical,
   measurably slower at long context (registers 128 → 223). Reverted.
+- **Gating on memory-clock stability.** The obvious companion to the ramp fix,
+  and wrong: it rejects every DRAM-resident row, including rows with 0.4–2%
+  timing IQR. The ramp fix that cut L2-resident median |trend| from 2.4% to 0.2%
+  also made the memory-clock spread go from mostly 0% to ~19%, so the gate would
+  have discarded precisely the measurements the fix improved. Oscillation inside
+  a window is noise both methods sit in equally; the bias is *between* rows, and
+  that is where the check now lives.
+- **Widening `MAX_IQR_FRAC`.** Not tried, and deliberately not tried. See
+  `method.dispersion_gate` in the audit for what the gate does and does not
+  measure — the answer to a gate that rejects too much is to fix the
+  measurement, which is what the ramp work did.
 
 ## Session hygiene note
 
