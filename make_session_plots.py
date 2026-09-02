@@ -31,6 +31,18 @@ from make_plots import (
 RECORDED = {
     "instructions": {"gather": 2245, "broadcast": 1653},
     "code_bcast_regs": 223,
+    # Median within-window timing drift before the ramp was made bandwidth-aware,
+    # by regime and by whether the memory clock moved during the window. Recorded
+    # rather than recomputed because the benchmark.json it came from has been
+    # overwritten by the post-fix run -- which is the point of the figure.
+    "mem_drift_before": {
+        ("DRAM-resident", False): -5.6, ("DRAM-resident", True): -0.9,
+        ("L2-resident", False): -1.6, ("L2-resident", True): -3.1,
+    },
+    "mem_windows_before": {
+        ("DRAM-resident", False): 22, ("DRAM-resident", True): 26,
+        ("L2-resident", False): 12, ("L2-resident", True): 36,
+    },
     # clock samples per measurement window, full run before the min-sample fix
     "clock_hist_before": {1: 28, 2: 5, 3: 2, 4: 4, 8: 2, 9: 19, 10: 14,
                           11: 1, 12: 2, 13: 1, 14: 2, 17: 5, 18: 3,
@@ -568,8 +580,18 @@ def plot_mem_clock_gate(payload: dict):
             ax.scatter(x, y, s=30, color=colour, alpha=0.75, edgecolor="none")
             m = float(np.median(y))
             ax.plot([i - 0.26, i + 0.26], [m, m], color=INK, lw=2.0, zorder=4)
-            ax.text(i + 0.30, m, f"median {m:+.1f}%", va="center", fontsize=9,
+            ax.text(i + 0.30, m, f"now {m:+.1f}%", va="center", fontsize=9,
                     color=INK)
+            # The same statistic before the ramp was made bandwidth-aware. It
+            # cannot be recomputed -- the run it came from has been replaced by
+            # the one plotted here -- so it is drawn as a recorded reference.
+            before = RECORDED["mem_drift_before"].get((regime, held))
+            if before is not None:
+                nb = RECORDED["mem_windows_before"].get((regime, held))
+                ax.plot([i - 0.26, i + 0.26], [before, before], color=MUTED,
+                        lw=1.8, ls=(0, (4, 2)), zorder=4)
+                ax.text(i + 0.30, before, f"was {before:+.1f}%  (n={nb})",
+                        va="center", fontsize=8.5, color=MUTED)
             # Axis-fraction y: the data limits are still growing while the
             # groups are drawn, so a data-space position lands on a point.
             ax.text(i, 0.015, f"n={len(sel)}", ha="center", va="bottom",
@@ -587,11 +609,12 @@ def plot_mem_clock_gate(payload: dict):
 
     figure_header(
         fig,
-        "The warm-up drove the SM clock and never touched memory",
-        "So the memory P-state stepped up during the measurement instead of before it.\n"
-        "Under load this card runs memory at 9001 or 11001 MHz - a 20% swing - and a\n"
-        "bandwidth-bound window spanning that step is two measurements averaged.\n"
-        "Each point is one measurement; y is the trend across its own window.",
+        "Warming the memory system first removed the systematic drift",
+        "The old warm-up was a cache-resident GEMM: it drove the SM clock and asked the\n"
+        "memory system for nothing, so the P-state stepped up during the measurement.\n"
+        "Points are measurements AFTER the fix; dashed lines are the same medians\n"
+        "BEFORE it (recorded - that run has been replaced). Note the fix made the\n"
+        "memory clock move MORE, which is why it is not something to gate on.",
     )
     save(fig, "mem_clock_gate")
 

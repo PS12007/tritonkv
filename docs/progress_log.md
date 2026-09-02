@@ -660,3 +660,58 @@ fused kernel, the numerator is smaller, and the reported quantization benefit is
 **understated** rather than inflated. The long-context sign flip is not an
 artefact of this. But "the bias happens to point away from my thesis" is a fact
 about one run, not a property of the measurement.
+
+
+---
+
+## 2026-09-01 23:45 — The re-run, which is the only thing that settles it
+
+`benchmark.py --samples 50` against the bandwidth-aware ramp, 861 s.
+
+**Quotable rows: 25/48 → 39/48.** Every remaining rejection is dispersion; there
+are no clock rejections at all. Running the dispersion decomposition again:
+**9 of 96 measurements fail, down from 25** — 4 drift, 2 wander, 3 white jitter.
+The failing rows now pin their medians to ±1.60% against ±0.14% for the passing
+ones.
+
+**Audit: 68 claims, 28 TRUE / 18 CONDITIONAL / 10 MISLEADING / 12 FALSE**
+(was 21 / 25 / 10 / 12). Seven claims moved from conditional to established, and
+not one of them moved because a threshold was relaxed — the measurement got
+better.
+
+**The attribution, recomputed.** `×` is `fp16_sdpa / triton_fp16_control` for the
+split and `triton_fp16_control / fused_triton_4b` for the quantization, so above
+1.00 means the thing helps:
+
+| ctx | split, L2 | split, DRAM | quant, L2 | quant, DRAM | all three rows quotable |
+|---|---|---|---|---|---|
+| 512 | 14.1× | 10.4× | 0.72× | 0.91× | **yes** |
+| 2048 | 26.1× | 15.9× | **0.90×** | **1.17×** | **yes** |
+| 8192 | 53.3× | 23.4× | 0.83× | 1.27× | no |
+| 16384 | 68.3× | 24.8× | 0.63× | 1.36× | no |
+
+The headline is unchanged and better supported: the win is the flash-decoding
+split, and quantization is a rounding error on top of it whose *sign* depends on
+whether the working set fits in L2. Two contexts now have every input passing the
+gate simultaneously rather than one, and ctx=512 says something the old data
+could not — at short context quantization loses in **both** regimes, which is a
+cleaner statement of the conditional than "it pays above L2".
+
+**What is left, and it is the last known bias.** The audit's memory-clock check
+still fires on five DRAM-resident claims, because the methods are measured in
+sequence and rows minutes apart average different P-states:
+
+```
+cold.4b.ctx512    fused 10430 vs control 11358 MHz   (9%)
+cold.4b.ctx2048   fused 11358 vs control 11001 MHz   (3%)
+cold.4b.ctx8192   fused  9934 vs control 11001 MHz  (11%)
+cold.2b.ctx512    fused 10068 vs control 11358 MHz  (13%)
+cold.2b.ctx2048   fused 11334 vs control 11001 MHz   (3%)
+```
+
+Note the direction is not consistent: at ctx=2048 the *fused* kernel had the
+faster memory, which inflates the 1.17×; at 8192 the control did, which deflates
+the 1.27×. So this is not a bias with a convenient sign, it is a bias with no
+sign at all — which is worse, because it cannot be argued away in either
+direction. The fix is structural: measure the methods **interleaved** rather than
+in sequence, so a slow drift in clock state lands on all of them equally.

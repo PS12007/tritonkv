@@ -323,8 +323,10 @@ broadcast, versus the same kernel with the gather) and
 `optimization.zero_point_fold` (which it marks `FALSE` on speed, since it clears
 the 1.05× bar at no context in either regime).
 
-Current run against `results/benchmark.json` (2026-09-01 19:00):
-**68 claims — 21 TRUE / 25 TRUE BUT CONDITIONAL / 10 MISLEADING / 12 FALSE.**
+Current run against `results/benchmark.json` (2026-09-01 23:30):
+**68 claims — 28 TRUE / 18 TRUE BUT CONDITIONAL / 10 MISLEADING / 12 FALSE.**
+Seven claims moved from conditional to established when the clock ramp was
+fixed, and none of them because a threshold was relaxed.
 Regenerate with `./.venv/Scripts/python.exe audit_claims.py` (~20 s) and read
 `results/audit.md`. Two of those verdicts moved this session for reasons that
 were in the auditor rather than in the kernel:
@@ -418,7 +420,7 @@ one run, not a property of the measurement.
 
 ### What the dispersion gate actually measures
 
-23 of 48 rows fail the `IQR ≤ 5% of median` half of the gate.
+After the ramp fix, 9 of 48 rows fail the `IQR ≤ 5% of median` half of the gate — it was 23 before, and the analysis below is what the 23 looked like.
 `analyze_dispersion.py` decomposes all 96 measurements to find out whether the
 two fixes this repo had written down — shorter windows, or longer ones — would
 work. Mostly they would not: only **8 of 25** failures carry a significant trend,

@@ -13,9 +13,10 @@ Everything below is verified on this machine, not assumed.
   **RTX 5060 Laptop, sm_120, 26 SMs, 8 GB, 33.6 MB L2, 80 W**.
   Run things as `./.venv/Scripts/python.exe ...` — no activation needed.
 - `python -m pytest test_correctness.py -q` → **106 passed in ~89 s**.
-- `python benchmark.py --samples 50` → ~7.5 min, clock-monitored, writes
-  `results/benchmark.json`. Last run: **25/48 rows quotable**, and every
-  rejection is dispersion — there are no clock rejections left.
+- `python benchmark.py --samples 50` → ~14 min, clock-monitored, writes
+  `results/benchmark.json`. Last run: **39/48 rows quotable** (was 25/48
+  before the ramp fix), and every rejection is dispersion — there are no
+  clock rejections left. Run it with `python -u` or the log stays buffered.
 - `python make_plots.py` → 8 figures in `docs/plots/`;
   `python make_session_plots.py` → 6 more (2 need `results/gs_sweep.json`).
 - `python sweep_group_size.py --contexts 512 2048 8192` → ~3.5 min, 24 cells,
@@ -24,17 +25,19 @@ Everything below is verified on this machine, not assumed.
 - README, `docs/key_numbers.md`, `docs/thread_outline.md`.
 
 **The headline finding, in its current form:** the fused kernel's win over
-PyTorch SDPA is almost entirely the flash-decoding split (10–26× on quotable
-rows), not the quantization. Quantization *costs* ~1.1–1.35× when the KV cache
-is L2-resident and pays 1.22–1.47× when the working set exceeds L2. At ctx=2048
-the sign flip is now fully clock-verified with every input passing the gate:
-**0.90× L2-resident, 1.22× DRAM-resident.**
+PyTorch SDPA is almost entirely the flash-decoding split (10–68× on quotable
+rows), not the quantization. Quantization *costs* 1.11–1.58× when the KV cache
+is L2-resident and pays 1.17–1.48× when the working set exceeds L2 and the
+context is 2k or more. Two contexts now have every input passing the gate
+simultaneously: **ctx=512 → 0.72× L2 / 0.91× DRAM** (quantization loses in
+*both* regimes at short context) and **ctx=2048 → 0.90× L2 / 1.17× DRAM**
+(the sign flip itself).
 
 ## Do this first
 
 Nothing is blocking. `results/audit.{md,json}` are current (regenerated
-2026-09-01 22:30, **68 claims: 21 TRUE / 25 CONDITIONAL / 10 MISLEADING /
-12 FALSE**), and the audit now takes ~20 s rather than ~13 min, so re-run it
+2026-09-01 23:35 against the post-ramp-fix benchmark, **68 claims: 28 TRUE /
+18 CONDITIONAL / 10 MISLEADING / 12 FALSE**), and the audit now takes ~20 s rather than ~13 min, so re-run it
 after any benchmark run without thinking about it:
 
 ```
