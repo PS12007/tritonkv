@@ -532,3 +532,41 @@ def test_render_names_the_reference_protocol():
     md = compare_protocols.render(recs, telem, groups)
     assert "Reference protocol: **`full`**" in md
     assert "not interchangeable" in md
+
+
+def test_bandwidth_sensitivity_orders_rows_by_achieved_bandwidth():
+    """The predictive form of the protocol finding.
+
+    A row pulling little DRAM bandwidth cannot care what state the memory
+    subsystem is in. Build two protocols where only the high-bandwidth method
+    shifts, and the correlation must come out strongly positive.
+    """
+    def group(name, shift_fast):
+        entries = []
+        for i in range(2):
+            d = _payload(1.0, seed=i)
+            for row in d["results"]:
+                # fp16_sdpa is slow over the same bytes -> low achieved GB/s;
+                # fused_triton_4b is fast over them -> high.
+                row["cache_bytes_1layer"] = 1_000_000
+                if row["method"] == "fused_triton_4b":
+                    row["cold"]["median_ms"] *= shift_fast
+            entries.append((f"{name}{i}", Bench(d)))
+        return entries
+
+    groups = {"base": group("b", 1.0), "other": group("o", 0.90)}
+    rows, corr, pair = compare_protocols.bandwidth_sensitivity(
+        groups, [CTX], ["fp16_sdpa", "fused_triton_4b"])
+    assert pair == ("base", "other")
+    by = {r["method"]: r for r in rows}
+    # fused is 12.5x faster over identical bytes, so 12.5x the achieved GB/s.
+    assert by["fused_triton_4b"]["gb_s"] > by["fp16_sdpa"]["gb_s"]
+    assert by["fused_triton_4b"]["shift"] == pytest.approx(-0.10, abs=0.01)
+    assert by["fp16_sdpa"]["shift"] == pytest.approx(0.0, abs=0.001)
+
+
+def test_bandwidth_sensitivity_needs_three_rows_for_a_correlation():
+    groups = {"base": _proto_group("b"), "other": _proto_group("o")}
+    rows, corr, _ = compare_protocols.bandwidth_sensitivity(
+        groups, [CTX], ["fused_triton_4b"])
+    assert len(rows) < 3 and corr is None

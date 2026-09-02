@@ -599,6 +599,71 @@ one run reached once. The median needs no tie-break. That was caught by reading
 the output and disbelieving a 15% "drop", not by a test — there is a test for it
 now.
 
+### The measurement protocol is one of the variables
+
+`--preload SECONDS` was added to test a specific prediction: if the gap between a
+3-method run and a 12-method run is *total* sustained load, then giving the short
+run 300 s of saturating work beforehand should move it toward the long run's
+numbers. (Position within a run was already ruled out — the interleaved run moves
+a row's mean memory clock by a median of +0.00% between its two passes.)
+
+**The prediction was wrong, and informatively so.** Preloading did not move the
+short runs toward the full runs; it moved them further in the same direction.
+Three runs per protocol, DRAM-resident, ctx=8192:
+
+| protocol | fp16 control | power | `quant_cold` |
+|---|---|---|---|
+| full (12 methods/ctx) | 32.61–32.78 µs | 74.2–74.6 W | **1.469–1.478** |
+| subset (3 methods/ctx) | 31.42–32.14 µs | 75.4–76.8 W | **1.277–1.445** |
+| subset + 300 s preload | 30.27–31.13 µs | 74.6–76.9 W | **1.395–1.402** |
+
+The SM clock is 2761–2772 MHz in all three and the memory clock is 11001 MHz in
+all three. The control still moves 7.3%.
+
+**What predicts the movement is achieved bandwidth.** Time each row's own
+DRAM-resident bytes against its own DRAM-resident time and the pattern is flat:
+
+| row | achieved GB/s | shift under preload |
+|---|---|---|
+| `triton_fp16_control` @8k | 257 | **−7.3%** |
+| `fused_triton_4b` @8k | 118 | −2.2% |
+| `fused_triton_4b` @512 | 32 | +0.0% |
+| `fp16_sdpa` (every context) | 11–12 | **+0.0 to −0.3%** |
+
+**r = +0.84 between a row's achieved bandwidth and the size of its protocol
+shift**, over 12 rows. A row that barely touches DRAM cannot care what state the
+memory subsystem is in; a row that saturates it is entirely at its mercy. That
+makes the finding predictive rather than descriptive — you can say in advance
+which rows a change of protocol will move.
+
+It also says which *ratios* are exposed, and the answer is uncomfortable. The
+quantization ratio divides the highest-bandwidth row in the benchmark (the fp16
+control, 257 GB/s) by a much lower one (the fused kernel, 118 GB/s), so it
+inherits the whole difference. `speedup_vs_sdpa` divides an 11 GB/s row by a
+118 GB/s row and barely moves (±1.6%). **The fp16 control exists to make the
+comparison fair, and the same property that makes it a good control — the same
+algorithm reading 4× the bytes — makes it the most protocol-sensitive row here.**
+
+Three things follow, and the second is the one that costs something.
+
+**The conditional survives.** No verdict changes. `quant_cold` at 8k is ≥1.39
+under every protocol, `quant_hot` is ≤0.82 under every protocol, and the
+L2-resident half is nearly protocol-immune (+2.3%) precisely because neither of
+its rows pulls much DRAM bandwidth.
+
+**The shipped protocol reports the most favourable number of the three.**
+`quant_cold@8192` is 1.475 under the full protocol and 1.397 under the preloaded
+one — 5.3% lower — against a between-run spread of 0.6% within the full protocol.
+That is a bias in the flattering direction and it is larger than the interval this
+repo has been quoting. The honest range for that cell across everything measured
+is **1.28–1.48**, not 1.469–1.478.
+
+**"Hold everything fixed and vary only the kernel" now has a third thing that
+will not hold still.** The clock was the first, the power state the second, and
+the measurement schedule is the third — and unlike the other two it is fully
+under the experimenter's control, which makes it the one worth reporting rather
+than lamenting. `compare_protocols.py` is what checks it.
+
 ### What the dispersion gate actually measures
 
 After the ramp fix, 9 of 48 rows fail the `IQR ≤ 5% of median` half of the gate — it was 23 before, and the analysis below is what the 23 looked like.
@@ -680,7 +745,7 @@ python -m venv .venv
 .venv/Scripts/python.exe -m pip install -r requirements.txt
 
 .venv/Scripts/python.exe -m pytest test_correctness.py -q   # 106 tests, ~89 s (GPU)
-.venv/Scripts/python.exe -m pytest test_between_run.py -q    # 24 tests, ~2 s (no GPU)
+.venv/Scripts/python.exe -m pytest test_between_run.py -q    # 32 tests, ~3 s (no GPU)
 .venv/Scripts/python.exe benchmark.py --quick                # ~75 s smoke run
 .venv/Scripts/python.exe benchmark.py --samples 50           # full suite, ~13 min
 .venv/Scripts/python.exe audit_claims.py                     # reads results/benchmark.json
@@ -727,11 +792,12 @@ committed.
 | `kernels/fused_decode_attn.py` | the fused kernel. |
 | `kernels/fp16_decode_attn.py` | the control: identical shape, unquantized. Isolates the flash-decoding effect. |
 | `test_correctness.py` | 106 tests on the kernel, explicit asserted thresholds. |
-| `test_between_run.py` | 24 CPU-only tests on the between-run and excursion machinery, against synthetic runs with known answers. |
+| `test_between_run.py` | 32 CPU-only tests on the between-run, excursion and protocol machinery, against synthetic runs with known answers. |
 | `benchmark.py` | timing + memory. Rotating working set for the cold regime, CUDA-graph replay for the hot one. |
 | `audit_claims.py` | adversarial self-audit: bootstrap CIs over raw timings, attribution against the fp16 control, per-optimization claims with their own controls, and a clock-verification gate. |
 | `between_run.py` | what a bootstrap CI does not cover: compares N independent full runs, reports the run-to-run interval, the inflation over the single-run CI, and whether any verdict moved. |
 | `clock_excursions.py` | the rate at which a row drops a memory P-state, split by run protocol and regime, with the gate's verdict on each. |
+| `compare_protocols.py` | whether two measurement protocols produce the same numbers at all, and the bandwidth law that says which rows they will disagree on. |
 | `analyze_dispersion.py` | decomposes every rejected measurement into trend, tail and floor, so the gate is argued with rather than tuned. |
 | `sweep_group_size.py`, `probe_gs128.py` | the metadata-load sweep and the static PTX probe behind the gs=128 cliff. |
 | `make_plots.py` | the figures in `docs/plots/`, regenerated from `results/benchmark.json`. |

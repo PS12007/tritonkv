@@ -135,15 +135,29 @@ re-run it after any benchmark run without thinking about it:
    memory clocks. `triton_fp16_control@8192` runs 3.9% faster on 3.1% more
    power with the memory clock identical at 11001 MHz.
 
-   That is about a third of the variance, not all of it — `fused_triton_4b@16k`
-   runs 2.0% faster on +0.2% power and stays unexplained — and it is probably
-   the same gap as the half of between-run variance that `between_run.py`'s
-   **r = +0.71** memory-clock correlation leaves over. What is left to test:
-   whether power draw is *caused* by the protocol (fewer resident allocations,
-   less preceding compilation) or is itself downstream of something else.
-   `--preload` is the first probe: if integrated load is what matters, a
-   preloaded subset run should move toward the full run's power *and* its
-   timings together.
+   **And the protocol effect is now characterised, 2026-09-02 (late).**
+   `--preload 300` was the probe: if integrated load explained the gap, a
+   preloaded subset run should converge on the full run. It did the opposite —
+   moved further in the same direction — so integrated load is **refuted** as
+   the explanation. What predicts the shift instead is **achieved bandwidth**:
+   `compare_protocols.py` finds **r = +0.84** between a row's DRAM bandwidth and
+   the size of its protocol shift, over 12 rows. `fp16_sdpa` at 11 GB/s moves
+   ±0.3%; `triton_fp16_control` at 257 GB/s moves 7.3%. That is predictive, and
+   it explains why the quantization ratio is the most exposed number here — it
+   divides the highest-bandwidth row by a much lower one.
+
+   **The cost, stated plainly: the shipped protocol reports the most favourable
+   `quant_cold@8192` of the three** (1.475 full, 1.422 subset, 1.397 preloaded)
+   against a 0.6% between-run spread. The honest range for that cell across
+   everything measured is **1.28–1.48**. No verdict changes and the conditional
+   survives, but the interval this repo quotes for that cell is too narrow and
+   the README now says so.
+
+   Still open: `fused_triton_4b@16k` runs 2.0% faster on +0.2% power and fits
+   neither the power story nor cleanly into the bandwidth one, and the r=+0.84
+   leaves ~30% of the variance unaccounted. A fourth protocol (e.g. 12 methods
+   with the preload) would separate "number of methods" from "recent saturation"
+   — the two are confounded in what has been run so far.
 
 4. **2-bit still deserves a decision, not a table row.** Numerically unusable
    (rel L2 ≈ 0.7) under per-token grouping along `head_dim`. KIVI's result is

@@ -994,3 +994,96 @@ implausible, not by a test. There is now a test named for it.
 
 `clock_excursions.py`, `--methods`, and eight new tests (24 total in
 `test_between_run.py`). 106 kernel tests pass.
+
+---
+
+## 2026-09-02 (late) — the protocol is a variable, and bandwidth says which rows care
+
+The previous entry left the protocol gap named but not explained, and then a
+correction had to be made to it: the claim that no telemetry accounted for the
+gap was wrong, because the power figure being compared was a *whole-run* average.
+On an 80 W part pinned at its limit most of the time that average is flat by
+construction. Per row, `compare_protocols.py` found **r = −0.57** between a row's
+power shift and its time shift. Better, but only a third of the variance.
+
+### The experiment
+
+`--preload SECONDS` tests one prediction. If the gap is *total* sustained load,
+a short run given 300 s of saturating work beforehand should converge on the long
+run. Position within a run was already ruled out for free: the interleaved run in
+the tree moves a row's mean memory clock by a median of **+0.00%** between its two
+passes, direction split 15/48 up.
+
+Three runs per protocol. **The prediction was wrong.** Preloading did not move the
+short runs toward the full runs — it moved them further in the same direction.
+
+| protocol | fp16 control @8k | power | `quant_cold` @8k |
+|---|---|---|---|
+| full (12 methods/ctx) | 32.61–32.78 µs | 74.2–74.6 W | 1.469–1.478 |
+| subset (3 methods/ctx) | 31.42–32.14 µs | 75.4–76.8 W | 1.277–1.445 |
+| subset + 300 s preload | 30.27–31.13 µs | 74.6–76.9 W | 1.395–1.402 |
+
+SM clock 2761–2772 MHz in all three; memory clock 11001 MHz in all three. The
+control still moves 7.3%.
+
+### What does predict it
+
+Achieved bandwidth — each row's own DRAM-resident bytes over its own
+DRAM-resident time:
+
+| row | achieved GB/s | shift under preload |
+|---|---|---|
+| `triton_fp16_control` @8k | 257 | −7.3% |
+| `fused_triton_4b` @8k | 118 | −2.2% |
+| `fused_triton_4b` @512 | 32 | +0.0% |
+| `fp16_sdpa` (all contexts) | 11–12 | +0.0 to −0.3% |
+
+**r = +0.84** over 12 rows. A row that barely touches DRAM cannot care what state
+the memory subsystem is in; a row that saturates it is entirely at its mercy.
+That is the predictive form — which rows a protocol change will move can now be
+said in advance rather than discovered.
+
+And it names the exposed *ratios*. The quantization ratio divides the
+highest-bandwidth row in the benchmark (the control, 257 GB/s) by a much lower one
+(the fused kernel, 118 GB/s), so it inherits the whole difference.
+`speedup_vs_sdpa` divides an 11 GB/s row by a 118 GB/s row and moves ±1.6%. The
+fp16 control exists to make the comparison fair, and the property that makes it a
+good control — same algorithm, 4× the bytes — is exactly what makes it the most
+protocol-sensitive row in the file.
+
+### What it costs
+
+**The shipped protocol reports the most favourable number of the three.**
+`quant_cold@8192` is 1.475 full, 1.422 subset, 1.397 preloaded, against a 0.6%
+between-run spread within the full protocol. The honest range for that cell across
+everything measured is **1.28–1.48**, not 1.469–1.478. That is a flattering bias
+larger than the interval this repo has been quoting, and the README now says so in
+those words.
+
+**No verdict changes.** `quant_cold@8k` is ≥1.39 under every protocol,
+`quant_hot` ≤0.82 under every protocol, and the L2-resident half is nearly
+protocol-immune (+2.3%) for exactly the reason the bandwidth law predicts:
+neither of its rows pulls much DRAM bandwidth. The conditional survives; its
+magnitude is softer than the CI suggested.
+
+So "hold everything fixed and vary only the kernel" now has a third thing that
+will not hold still. The clock was the first, the power state the second, the
+measurement schedule the third — and unlike the other two the schedule is fully
+under the experimenter's control, which makes it the one worth reporting rather
+than lamenting.
+
+### Code
+
+`compare_protocols.py` is new: labelled run groups, each ratio's range within its
+group, a flag when a group's range misses the reference's entirely, a per-row
+telemetry comparison, and the bandwidth-versus-sensitivity table with its
+correlation. Deliberately blunt — with three runs per group the honest statement
+is "these ranges do not touch", not a test pretending to more resolution than
+three points support. It reproduced the earlier ad-hoc subset-vs-full result
+exactly before being used for anything new.
+
+`benchmark.py --preload SECONDS`, recorded in the JSON; `between_run.py` refuses
+to pool runs that differ in it, because it is the variable under test.
+
+`test_between_run.py`: 25 → 32 tests. 106 kernel tests pass. Audit unchanged at
+69 claims.

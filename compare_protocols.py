@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import statistics
 from pathlib import Path
 
@@ -147,7 +148,60 @@ def telemetry_agreement(groups, contexts, methods):
     return out
 
 
-def render(ratios, telem, groups) -> str:
+def bandwidth_sensitivity(groups, contexts, methods):
+    """Does a row's protocol sensitivity track the bandwidth it actually pulls?
+
+    The predictive form of the finding. A row that pulls little DRAM bandwidth
+    cannot be much affected by what state the memory subsystem is in; a row that
+    saturates it is entirely at its mercy. If that is the mechanism, |shift|
+    should rise with achieved GB/s -- and which rows are protocol-sensitive
+    becomes something you can say in advance rather than discover.
+    """
+    names = list(groups)
+    base, other = names[0], names[-1]
+    rows = []
+    for method in methods:
+        for ctx in contexts:
+            per = {}
+            ok = True
+            for gname in (base, other):
+                vals = []
+                for _, b in groups[gname]:
+                    r = b.get(method, ctx) or {}
+                    st = r.get("cold")
+                    if not isinstance(st, dict) or "median_ms" not in st:
+                        ok = False
+                        break
+                    vals.append((st["median_ms"], r.get("cache_bytes_1layer") or 0))
+                if not ok:
+                    break
+                per[gname] = vals
+            if not ok:
+                continue
+            f = statistics.median([t for t, _ in per[base]])
+            p = statistics.median([t for t, _ in per[other]])
+            nbytes = per[base][0][1]
+            if not (f > 0 and nbytes):
+                continue
+            rows.append({
+                "method": method, "ctx": ctx,
+                "base_ms": f, "other_ms": p,
+                "gb_s": nbytes / (f * 1e-3) / 1e9,
+                "shift": p / f - 1.0,
+            })
+    xs = [r["gb_s"] for r in rows]
+    ys = [abs(r["shift"]) for r in rows]
+    corr = None
+    if len(rows) >= 3:
+        mx, my = statistics.fmean(xs), statistics.fmean(ys)
+        num = sum((a - mx) * (b - my) for a, b in zip(xs, ys))
+        dx = math.sqrt(sum((a - mx) ** 2 for a in xs))
+        dy = math.sqrt(sum((b - my) ** 2 for b in ys))
+        corr = num / (dx * dy) if dx > 0 and dy > 0 else None
+    return rows, corr, (base, other)
+
+
+def render(ratios, telem, groups, bw=None, bw_corr=None, bw_pair=None) -> str:
     names = list(groups)
     base = names[0]
     L = []
@@ -212,6 +266,31 @@ def render(ratios, telem, groups) -> str:
              "timings and invisible in the telemetry is not noise — it is a "
              "channel the instrumentation does not cover, and it should be "
              "named as one.\n")
+
+    if bw:
+        a, b = bw_pair
+        L.append("## Sensitivity tracks achieved bandwidth\n")
+        L.append(f"Each row's DRAM-resident time under `{a}` gives the bandwidth "
+                 f"it actually pulls; the shift is `{b}` against `{a}`. A row "
+                 "that barely touches DRAM cannot care what state the memory "
+                 "subsystem is in; a row that saturates it is entirely at its "
+                 "mercy.\n")
+        L.append(f"| method | ctx | {a} (µs) | achieved GB/s | shift |")
+        L.append("|---|---|---|---|---|")
+        for r in sorted(bw, key=lambda r: -r["gb_s"]):
+            L.append(f"| `{r['method']}` | {r['ctx']} | {r['base_ms'] * 1e3:.2f} | "
+                     f"{r['gb_s']:.0f} | {r['shift']:+.1%} |")
+        L.append("")
+        if bw_corr is not None:
+            L.append(f"**Correlation between achieved bandwidth and |shift|: "
+                     f"r = {bw_corr:+.2f}** over {len(bw)} rows.\n")
+            if bw_corr > 0.6:
+                L.append("That makes the finding predictive rather than "
+                         "descriptive: the rows a change of protocol will move "
+                         "are the rows pulling the most bandwidth, and they can "
+                         "be named in advance. It also says which *ratios* are "
+                         "exposed — any ratio dividing a high-bandwidth row by a "
+                         "low-bandwidth one inherits the difference.\n")
     return "\n".join(L)
 
 
@@ -240,12 +319,15 @@ def main():
 
     ratios = ratio_ranges(groups, contexts)
     telem = telemetry_agreement(groups, contexts, methods)
-    md = render(ratios, telem, groups)
+    bw, bw_corr, bw_pair = bandwidth_sensitivity(groups, contexts, methods)
+    md = render(ratios, telem, groups, bw, bw_corr, bw_pair)
     Path(args.out_md).write_text(md, encoding="utf-8")
     Path(args.out_json).write_text(json.dumps({
         "groups": {k: [n for n, _ in v] for k, v in groups.items()},
         "contexts": contexts, "methods": methods,
         "ratios": ratios, "telemetry": telem,
+        "bandwidth_sensitivity": {"rows": bw, "corr": bw_corr,
+                                  "pair": list(bw_pair) if bw_pair else None},
     }, indent=1), encoding="utf-8")
 
     disj = [r for r in ratios if any((r.get("disjoint_from_base") or {}).values())]
@@ -256,6 +338,8 @@ def main():
         base = r["groups"][list(groups)[0]]
         print(f"  {r['name']} ctx={r['ctx']}: {base['min']:.3f}-{base['max']:.3f} "
               f"vs {gs}")
+    if bw_corr is not None:
+        print(f"bandwidth vs |protocol shift|: r = {bw_corr:+.2f} over {len(bw)} rows")
     print(f"wrote {args.out_md} and {args.out_json}")
 
 
