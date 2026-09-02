@@ -792,3 +792,106 @@ one of the three rows whose memory clock did shift between them (9934 → 11001
 MHz). The bootstrap CI on either number is ±0.01. The CI is describing sampling
 noise inside one run and says nothing about which P-state that run happened to
 land in, and the long-context numbers should be read with that gap in mind.
+
+---
+
+## 2026-09-02 — the interval that was never measured
+
+The last entry ended on a number that did not have an interval: the DRAM-resident
+quantization ratio at ctx=8192 had read **1.27×** in one run and **1.47×** in the
+next, on bootstrap CIs of ±0.01 each. That gap is not a statistical subtlety, it
+is a category error — every CI in `audit_claims.py` resamples the timings of a
+*single run*, so it answers "how much would this move on another 50 samples from
+this window" and cannot answer "how much does it move if the process exits and
+the card lands in a different memory P-state". Every verdict in this repo turns
+on whether an interval clears a bar, and the interval being used was the wrong
+one.
+
+The fix is not clever, it is expensive: run the whole benchmark again, more than
+once, and look. Three back-to-back runs at `--samples 50 --passes 1`, 807 s /
+773 s / 775 s, nothing changed between them.
+
+### What came out
+
+`between_run.py` compares N complete runs on 60 tracked ratios, reporting for
+each: every run's point estimate and CI, the union of those CIs, the **inflation
+factor** (union width ÷ median single-run CI width), and whether the *verdict*
+moved.
+
+| | n | median inflation | median between-run spread | worst spread |
+|---|---|---|---|---|
+| passed the gate in every run | 22 | **2.4×** | 0.7% | 2.0% |
+| failed it in at least one | 38 | **5.0×** | 2.9% | 44.0% |
+
+**No verdict changed, on any of the 60 ratios.** The honest interval is about
+2.4× the printed one — the CI was too narrow, but by a factor, not by the order
+of magnitude the 1.27×/1.47× pair implied. The conditional finding survives
+intact: quantization costs 0.717–0.813× L2-resident at every context, and pays
+1.188–1.197× at 2k, 1.469–1.478× at 8k, 1.416–1.469× at 16k.
+
+### Three things that were not the question
+
+**The gate scores well out of sample.** It is applied inside a run and knows
+nothing about the other two, yet the rows it rejects are exactly the rows that
+move when the benchmark is re-run: 5.0× against 2.4× inflation, 2.9% against 0.7%
+spread. Every previous argument for the gate was internal to a run. This one is
+not, and it is the third time the rule "fix the measurement rather than widen the
+gate" has paid.
+
+**The P-state story is now measured.** Across the 48 DRAM-resident rows, the
+correlation between a row's between-run movement in time and its between-run
+movement in mean memory clock is **r = +0.71**. That had been asserted from a
+mechanism argument and two anecdotes; it is now a number. It also leaves about
+half the variance unexplained, and nothing here identifies what that is.
+
+**The 1.27× was a tail event, not the typical spread — which is worse news.**
+`fused_triton_4b@8192` sat at 11001 MHz in all four runs since; the 9934 MHz
+window has not recurred, and the three new runs agree to 0.6% at that cell. So
+the run-to-run distribution has a body of about ±1% and a tail that moves a
+headline ratio by 15%. **Three runs measure the body and say nothing about the
+tail**, and the report says so in those words rather than presenting the union of
+three runs as a bound.
+
+A fourth, smaller finding: **quotability is itself a random variable.** The
+per-run counts were 42, 41 and 39 of 48; 35 rows pass in all three and 46 in at
+least one. So 11 rows are starred or not depending on the run. A star has been
+read in this repo as a property of the kernel, and it is a property of the run.
+
+### What changed in the code
+
+- `between_run.py`, new. Refuses to pool runs whose configurations differ, since
+  averaging a 50-sample run with a 10-sample one would put a number in the report
+  that no run produced.
+- `audit_claims.py` loads `results/between_run.json` when it exists. Every
+  per-context claim prints its run-to-run interval next to its CI; a ratio whose
+  verdict moved between runs is downgraded automatically (`TRUE` →
+  `TRUE BUT CONDITIONAL`, `FALSE` → `MISLEADING`); and a new claim,
+  `method.between_run_spread`, audits the audit's own intervals. With no
+  between-run data present it reads **MISLEADING**, which is the state every
+  previous version of this repo was in.
+- `test_between_run.py`, new: 16 CPU-only tests against synthetic runs with known
+  answers — identical runs must not manufacture spread, a 20% shift must read as
+  20%, a shift across the bar must register as a verdict change, and the pooling
+  guard must be an error rather than a warning. One of them caught a formatting
+  bug immediately: at two decimals a real 0.005× spread on a 0.73× ratio printed
+  as "0.73x-0.73x".
+- `make_session_plots.py` grows `between_run_spread`, two panels split by gate
+  status. The x scales differ by an order of magnitude, and that gap *is* the
+  gate's out-of-sample score.
+
+### Housekeeping
+
+`results/benchmark.json` is now **run 3 of the 3**, by the rule "the last one" —
+the only selection rule that cannot be gamed after the fact, and here also the
+least flattering (39/48 quotable against 42 and 41). The interleaved run it
+replaced is kept as `results/benchmark_interleaved.json`.
+
+Two claims in the README were stale against the new run and have been corrected
+rather than left: the sign flip is fully clock-verified at **ctx=8192 in all
+three runs**, not at ctx=2048 (which clears the gate in one run of three); and
+"the 8k and 16k SDPA baselines are not clock-verified" is no longer true — the
+bandwidth-aware ramp fixed it, and those rows now pass with a timing IQR of
+0.1–0.4%.
+
+Audit: **69 claims — 26 TRUE / 20 TRUE BUT CONDITIONAL / 11 MISLEADING /
+12 FALSE.** 106 kernel tests and 16 between-run tests pass.

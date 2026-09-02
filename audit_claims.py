@@ -407,7 +407,10 @@ def audit_speed(b: Bench, nbits: int = 4) -> list[Claim]:
         else:
             v = "MISLEADING"
         caveat = clock_caveat(b, ctx, fused, "fp16_sdpa")
-        v = downgrade(v, caveat)
+        v = between_run_downgrade(downgrade(v, caveat), "speedup_vs_sdpa", ctx, nbits)
+        # Appended after the verdict is decided: the run-to-run interval is
+        # reported on every claim, but only an unstable *verdict* downgrades one.
+        caveat += between_run_note("speedup_vs_sdpa", ctx, nbits)
         claims.append(
             Claim(
                 id=f"speed.vs_fp16.{nbits}b.ctx{ctx}",
@@ -681,6 +684,78 @@ def clock_caveat(b: Bench, ctx: int, *methods: str) -> str:
 
 def downgrade(verdict: str, caveat: str) -> str:
     return "TRUE BUT CONDITIONAL" if (caveat and verdict == "TRUE") else verdict
+
+
+# ---------------------------------------------------------------------------
+# The interval a bootstrap cannot give you
+# ---------------------------------------------------------------------------
+#
+# Every CI in this file is computed from the samples of a single run, so it
+# answers "how much would this ratio move on another draw from this measurement
+# window". It does not answer "how much does it move if the process exits and
+# the card lands in a different memory P-state next time" -- and on this part
+# the second number has been the larger one: the DRAM-resident quantization
+# ratio at ctx=8192 moved 1.27x -> 1.47x between two runs while the CI on either
+# was +-0.01.
+#
+# `between_run.py` measures that directly from N independent runs. When its
+# output is present, every per-context claim it covers carries the run-to-run
+# interval next to its own, and a claim whose *verdict* changed between runs is
+# not allowed to be stated flatly.
+BETWEEN: dict[tuple[str, int, int], dict] = {}
+
+
+def load_between_run(path: Path) -> dict[tuple[str, int, int], dict]:
+    """Index between_run.py's output by (ratio name, ctx, nbits). Absent is fine."""
+    if not path.exists():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return {(r["name"], r["ctx"], r["nbits"]): r for r in payload.get("ratios", [])}
+
+
+def between_run_note(name: str, ctx: int, nbits: int) -> str:
+    """Say, in the evidence, how far this ratio moved between whole runs."""
+    r = BETWEEN.get((name, ctx, nbits))
+    if not r:
+        return ""
+    n = len(r["runs"])
+    # Two decimals is the house style for a ratio, but it renders a genuine
+    # between-run spread as "0.73x-0.73x". Ratios below 10x get a third.
+    def q(v: float) -> str:
+        return f"{v:.3f}x" if v < 10 else f"{v:.2f}x"
+
+    note = (
+        f" RUN-TO-RUN: over {n} independent runs of the whole benchmark this ratio "
+        f"ranged {q(r['point_min'])}-{q(r['point_max'])}, and the union of their "
+        f"intervals is [{q(r['run_to_run_lo'])}, {q(r['run_to_run_hi'])}] -- "
+        f"{r['inflation']:.1f}x the width of the interval above, which covers "
+        "sampling noise inside one run and nothing else."
+    )
+    if not r["verdict_stable"]:
+        note += (" The verdict itself changed between runs ("
+                 + " / ".join(r["verdicts"])
+                 + "), so it is not settled by this measurement.")
+    if not r["quotable_all_runs"]:
+        note += (" At least one of the runs failed the gate on one of these rows, so "
+                 "the star is a property of the run and not of the kernel.")
+    return note
+
+
+def between_run_downgrade(verdict: str, name: str, ctx: int, nbits: int) -> str:
+    """A verdict that flips between runs has not been established by either.
+
+    Both directions collapse to the project's existing "do not state this
+    flatly" verdicts rather than to a new label, so the counts at the top of
+    `audit.md` keep meaning what they meant.
+    """
+    r = BETWEEN.get((name, ctx, nbits))
+    if not r or r["verdict_stable"]:
+        return verdict
+    if verdict == "TRUE":
+        return "TRUE BUT CONDITIONAL"
+    if verdict == "FALSE":
+        return "MISLEADING"
+    return verdict
 
 
 # How close a deciding CI endpoint may sit to its bar before the verdict is
@@ -965,8 +1040,9 @@ def audit_attribution(b: Bench, nbits: int = 4) -> list[Claim]:
     # --- Claim 2: quantization in the L2-resident (hot) regime --------------
     for ctx, (r, lo, hi) in sorted(quant_hot.items()):
         caveat = clock_caveat(b, ctx, fused, CONTROL)
-        v = downgrade(_verdict(lo, hi), caveat)
-        caveat = caveat + borderline_note(lo, hi)
+        v = between_run_downgrade(downgrade(_verdict(lo, hi), caveat),
+                                  "quant_hot", ctx, nbits)
+        caveat = caveat + borderline_note(lo, hi) + between_run_note("quant_hot", ctx, nbits)
         claims.append(
             Claim(
                 id=f"attribution.quant_effect.hot.{nbits}b.ctx{ctx}",
@@ -999,8 +1075,9 @@ def audit_attribution(b: Bench, nbits: int = 4) -> list[Claim]:
     for ctx, (r, lo, hi) in sorted(quant_cold.items()):
         caveat = (clock_caveat(b, ctx, fused, CONTROL)
                   + mem_clock_caveat(b, ctx, "cold", fused, CONTROL))
-        v = downgrade(_verdict(lo, hi), caveat)
-        caveat = caveat + borderline_note(lo, hi)
+        v = between_run_downgrade(downgrade(_verdict(lo, hi), caveat),
+                                  "quant_cold", ctx, nbits)
+        caveat = caveat + borderline_note(lo, hi) + between_run_note("quant_cold", ctx, nbits)
         row = b.get(fused, ctx) or {}
         over = row.get("footprint_over_l2")
         claims.append(
@@ -1070,6 +1147,89 @@ def audit_attribution(b: Bench, nbits: int = 4) -> list[Claim]:
         )
 
     return claims
+
+
+def audit_between_run() -> list[Claim]:
+    """Audit this file's own intervals against what repeating the run does.
+
+    Every other claim here is decided by a bootstrap CI. This one asks whether
+    that CI is the right width, by the only test that can answer it: run the
+    whole benchmark again and see where the number lands.
+    """
+    if not BETWEEN:
+        return [
+            Claim(
+                id="method.between_run_spread",
+                claim=(
+                    "The bootstrap CI on each ratio below describes the uncertainty in "
+                    "that ratio."
+                ),
+                verdict="MISLEADING",
+                evidence=(
+                    "It describes sampling noise within a single run, which is only one "
+                    "of the two components. Nothing here measures the other: no "
+                    "between-run comparison is present (`results/between_run.json` is "
+                    "absent). On this card the run-to-run component has been the larger "
+                    "one at least once -- the DRAM-resident quantization ratio at "
+                    "ctx=8192 moved 1.27x to 1.47x between two runs while the CI on "
+                    "either was +-0.01. Run `benchmark.py` two or three times into "
+                    "separate files and run `between_run.py` over them."
+                ),
+                falsification_attempted=(
+                    "Checked for the between-run file rather than treating a narrow "
+                    "interval as evidence that the number is stable."
+                ),
+            )
+        ]
+
+    recs = list(BETWEEN.values())
+    n_runs = len(next(iter(recs))["runs"])
+    quot = [r for r in recs if r["quotable_all_runs"]]
+    unstable = [r for r in recs if not r["verdict_stable"]]
+    infl = sorted(r["inflation"] for r in quot) or [float("nan")]
+    med_infl = statistics.median(infl)
+    worst = max(quot, key=lambda r: r["inflation"]) if quot else None
+
+    # The CI is honest exactly when repeating the run lands inside it.
+    fine = med_infl < 1.5 and not unstable
+    return [
+        Claim(
+            id="method.between_run_spread",
+            claim=(
+                "The bootstrap CI on each ratio below describes the uncertainty in "
+                "that ratio."
+            ),
+            verdict="TRUE BUT CONDITIONAL" if fine else "MISLEADING",
+            evidence=(
+                f"Measured against {n_runs} independent full runs "
+                f"(`between_run.py`, {len(recs)} tracked ratios, {len(quot)} quotable "
+                f"in every run). The union of the runs' intervals is a median "
+                f"{med_infl:.1f}x wider than any one run's interval"
+                + (f", worst {worst['inflation']:.1f}x on `{worst['name']}` at "
+                   f"ctx={worst['ctx']} {worst['nbits']}-bit, whose point estimate "
+                   f"spanned {worst['point_min']:.2f}x-{worst['point_max']:.2f}x"
+                   if worst else "")
+                + ". "
+                + (
+                    f"{len(unstable)} ratio(s) changed verdict between runs: "
+                    + ", ".join(f"{r['name']} ctx={r['ctx']} {r['nbits']}b ("
+                                + "/".join(r["verdicts"]) + ")" for r in unstable)
+                    + ". Those are reported as conditional wherever they appear."
+                    if unstable
+                    else "No ratio changed verdict between runs."
+                )
+                + " The single-run CI is still the right interval for 'is this "
+                "difference real within this run'; for a number quoted outside this "
+                "repo, the run-to-run interval is the one to use."
+            ),
+            falsification_attempted=(
+                "The cheap move was to keep quoting the narrow interval, since it is "
+                "the one this file already computed and it flatters every claim. "
+                "Repeating the entire benchmark is the only measurement that can "
+                "contradict it, so it was repeated."
+            ),
+        )
+    ]
 
 
 def audit_measurement(b: Bench) -> list[Claim]:
@@ -1484,6 +1644,10 @@ def main():
     ap.add_argument("--no-gpu-checks", action="store_true")
     ap.add_argument("--out-md", default=str(RESULTS_DIR / "audit.md"))
     ap.add_argument("--out-json", default=str(RESULTS_DIR / "audit.json"))
+    ap.add_argument("--between-run", default=str(RESULTS_DIR / "between_run.json"),
+                    help="output of between_run.py; used to report the run-to-run "
+                         "interval next to each single-run CI. Absent is fine, and "
+                         "is itself audited (method.between_run_spread).")
     ap.add_argument("--check-bootstrap", action="store_true",
                     help="compare the vectorized bootstrap against the stdlib "
                          "reference on real rows, then exit")
@@ -1493,6 +1657,13 @@ def main():
     if not path.exists():
         raise SystemExit(f"no benchmark results at {path} -- run `python benchmark.py` first")
     b = Bench(json.loads(path.read_text()))
+
+    global BETWEEN
+    BETWEEN = load_between_run(Path(args.between_run))
+    if BETWEEN:
+        n_runs = len(next(iter(BETWEEN.values()))["runs"])
+        print(f"between-run data: {len(BETWEEN)} ratios over {n_runs} runs "
+              f"({args.between_run})")
 
     if args.check_bootstrap:
         pairs = []
@@ -1517,6 +1688,7 @@ def main():
     claims += audit_correctness(b)
     claims += audit_scope(b)
     claims += audit_measurement(b)
+    claims += audit_between_run()
     claims += audit_dispersion(b)
     if not args.no_gpu_checks:
         claims += gpu_checks(b)

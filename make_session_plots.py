@@ -19,6 +19,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.ticker import FuncFormatter
 
 from make_plots import (
     GRID, INK, INK2, MUTED, PLOTS, ROOT, S1, S2, S3, SURFACE, save, style,
@@ -136,6 +137,107 @@ def plot_broadcast_speedup(payload: dict):
         "Hatched bars had an input that failed the clock/dispersion gate.",
     )
     save(fig, "meta_broadcast_speedup")
+
+
+RATIO_LABEL = {
+    "speedup_vs_sdpa": "fused / SDPA",
+    "split_only": "fp16 control / SDPA",
+    "quant_cold": "quantization, DRAM-resident",
+    "quant_hot": "quantization, L2-resident",
+    "meta_broadcast_cold": "metadata broadcast, DRAM",
+    "meta_broadcast_hot": "metadata broadcast, L2",
+    "fold_zp_cold": "zero-point fold, DRAM",
+    "fold_zp_hot": "zero-point fold, L2",
+}
+
+
+def _between_panel(ax, recs, n_runs, title):
+    """One panel of the between-run figure: N ratios, each drawn as its runs'
+    intervals against their union, normalised to that ratio's own mean."""
+    offsets = np.linspace(-0.22, 0.22, n_runs)
+    run_colours = ([S1, S2, S3] + [MUTED] * n_runs)[:n_runs]
+
+    for y, r in enumerate(recs):
+        centre = float(np.mean([x["ratio"] for x in r["runs"]]))
+
+        def pct(v, c=centre):
+            return (v / c - 1.0) * 100.0
+
+        ax.barh(y, pct(r["run_to_run_hi"]) - pct(r["run_to_run_lo"]),
+                left=pct(r["run_to_run_lo"]), height=0.62,
+                color=GRID, edgecolor="none", zorder=1)
+        for off, run, colour in zip(offsets, r["runs"], run_colours):
+            ax.plot([pct(run["ci_lo"]), pct(run["ci_hi"])], [y + off] * 2,
+                    color=colour, lw=2.4, solid_capstyle="butt", zorder=3)
+            ax.plot([pct(run["ratio"])], [y + off], "o", ms=3.6, color=colour,
+                    zorder=4)
+
+    ax.axvline(0.0, color=INK2, lw=1.0, ls="--", zorder=2)
+    ax.set_yticks(range(len(recs)))
+    ax.set_yticklabels(
+        [f"{RATIO_LABEL.get(r['name'], r['name'])} · {r['nbits']}b "
+         f"{CTX_LABEL.get(r['ctx'], r['ctx'])}" for r in recs], fontsize=8.5)
+    ax.set_ylim(-0.7, len(recs) - 0.3)
+
+    # The inflation factor is the point of the figure, so it gets its own
+    # column rather than a caption the reader has to hold in their head.
+    lo, hi = ax.get_xlim()
+    pad = (hi - lo) * 0.16
+    ax.set_xlim(lo, hi + pad)
+    for y, r in enumerate(recs):
+        ax.text(hi + pad * 0.1, y, f"{r['inflation']:.0f}×", va="center",
+                ha="left", fontsize=8.5, color=INK, fontweight="bold")
+    ax.text(hi + pad * 0.1, len(recs) - 0.45, "wider", va="bottom", ha="left",
+            fontsize=8, color=MUTED)
+
+    style(ax, title, xlabel="deviation from the ratio's mean over the runs (%)")
+    # One decimal throughout: the two panels differ by an order of magnitude in
+    # range, and rounding the left one to whole percent prints two ticks "+2%".
+    ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:+.1f}%"))
+
+
+def plot_between_run(between: dict, per_panel: int = 9):
+    """The width of a bootstrap CI against the width of running it again.
+
+    Two panels, because the interesting comparison is not "how much do numbers
+    move" but "does the gate separate the ones that move". Left: ratios whose
+    every input passed the clock/dispersion gate in all runs -- the numbers this
+    project actually quotes. Right: ratios where at least one input failed it.
+    Note the x scales: they differ by an order of magnitude, and that gap is the
+    gate's out-of-sample score.
+
+    Ratios span 1.0x to 68x, so an absolute axis would show one row and squash
+    the rest. Everything is drawn as a deviation from that ratio's own mean
+    across the runs.
+    """
+    recs = between["ratios"]
+    n_runs = between["meta"]["n_runs"]
+    passed = sorted([r for r in recs if r["quotable_all_runs"]],
+                    key=lambda r: r["inflation"], reverse=True)[:per_panel][::-1]
+    failed = sorted([r for r in recs if not r["quotable_all_runs"]],
+                    key=lambda r: r["inflation"], reverse=True)[:per_panel][::-1]
+    if not passed or not failed:
+        print("  (skipped between_run: need ratios on both sides of the gate)")
+        return
+
+    fig, axes = plt.subplots(1, 2, figsize=(13.2, 0.46 * per_panel + 2.6))
+    _between_panel(axes[0], passed, n_runs, "passed the gate in every run")
+    _between_panel(axes[1], failed, n_runs, "failed it in at least one run")
+    # The header is drawn above y=1.0 and the panel titles just below the axes
+    # top, so the axes have to stop short of the figure top or the two collide.
+    fig.subplots_adjust(top=0.90, wspace=0.62)
+
+    figure_header(
+        fig,
+        "A bootstrap CI is not the uncertainty on the number",
+        f"Each row is one ratio measured in {n_runs} independent full runs. Coloured bars are each run's own\n"
+        "95% bootstrap CI; the grey band is their union; the number on the right is how many times\n"
+        "wider the union is. The CI describes sampling noise inside one run — not which memory\n"
+        "P-state the card lands in when the benchmark is started again. Note the two x scales:\n"
+        "the gate is applied inside a run and knows nothing about the others, yet the rows it\n"
+        "rejects are the rows that move when the benchmark is run again.",
+    )
+    save(fig, "between_run_spread")
 
 
 def plot_inner_loop_cost(regs: dict):
@@ -653,6 +755,12 @@ def main():
     plot_broadcast_speedup(payload)
     plot_clock_samples(payload)
     plot_mem_clock_gate(payload)
+    btw = _sweep(ROOT / "results" / "between_run.json")
+    if btw:
+        plot_between_run(btw)
+    else:
+        print("  (skipped between_run_spread: no results/between_run.json --"
+              " run benchmark.py a few times into results/runs/ then between_run.py)")
     disp = _sweep(ROOT / "results" / "dispersion.json")
     if disp:
         plot_dispersion(disp)

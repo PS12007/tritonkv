@@ -56,7 +56,7 @@ one attention layer, `group_size=32`.
 
 ### The honest headline
 
-The fused kernel beats PyTorch's fp16 SDPA by 7–36×. **That number is
+The fused kernel beats PyTorch's fp16 SDPA by 9.5–38×. **That number is
 misleading and should not be used.** It changes two things at once: the cache is
 4-bit *and* the work is split across the history. PyTorch's SDPA does no split
 for `q_len == 1`, so a fused-vs-SDPA comparison silently credits the
@@ -68,46 +68,51 @@ reading plain fp16. The only difference is the dequantization.
 
 ![Where the speedup comes from](docs/plots/speedup_attribution_4b.png)
 
-**Splitting the history is worth 10–26×. The quantization is worth 0.74–1.47×.**
+**Splitting the history is worth 10.5–26×. The quantization is worth 0.73–1.48×**,
+and which side of 1.0 it lands on depends on whether the cache fits in L2.
 
 **Hot regime (cache fits in L2), µs per decode step, CUDA-graph replay:**
 
 | ctx | SDPA fp16 | Triton fp16 (control) | fused 4-bit | fused 2-bit | flash-decode effect | quantization effect |
 |---|---|---|---|---|---|---|
-| 512 | 46.7 | 3.5 | 4.7 | 4.8* | 13.3× | 0.74× |
-| 2048 | 178.8 | 6.8 | 7.6 | 7.7 | 26.2× | **0.90×** |
-| 8192 | 747.3 | 13.7* | 16.8 | 16.9* | 54.4× | 0.82× |
-| 16384 | 1493.7* | 21.2* | 28.9* | 29.2* | 70.4× | 0.74× |
+| 512 | 46.4 | 3.3 | 4.6* | 5.9* | 14.0× | 0.73× |
+| 2048 | 174.9 | 6.7* | 8.2* | 7.9* | 26.2× | 0.81× |
+| 8192 | 734.7 | 13.5 | 17.1 | 16.8 | 54.3× | **0.79×** |
+| 16384 | 1456.9 | 21.3 | 29.2 | 29.3 | 68.4× | **0.73×** |
 
-**Quantization makes the kernel ~1.1–1.35× slower here, not faster.** Nearly the
+**Quantization makes the kernel 1.23–1.37× slower here, not faster.** Nearly the
 whole apparent win is the split.
 
 **Cold regime (rotating working set, 3× L2 = 101 MB), µs per decode step:**
 
 | ctx | SDPA fp16 | Triton fp16 (control) | fused 4-bit | fused 2-bit | flash-decode effect | quantization effect |
 |---|---|---|---|---|---|---|
-| 512 | 50.1 | 5.0 | 5.2 | 5.2* | 10.0× | 0.97× |
-| 2048 | 184.1 | 12.7 | 10.4 | 9.9 | 14.5× | **1.22×** |
-| 8192 | 756.4 | 31.9* | 25.3 | 21.8* | 23.7× | 1.26× |
-| 16384 | 1501.6* | 58.8* | 40.1* | 36.2* | 25.5× | 1.47× |
+| 512 | 49.0 | 4.6 | 5.1* | 6.4* | 10.5× | 0.90× |
+| 2048 | 179.6 | 11.8* | 9.7* | 9.3* | 15.3× | 1.21× |
+| 8192 | 735.6 | 32.8 | 22.2 | 20.7 | 22.4× | **1.48×** |
+| 16384 | 1464.1 | 55.6 | 38.6 | 35.8 | 26.3× | **1.44×** |
 
 `*` = did not pass the clock-verification gate (see below) and is not quoted as
 evidence anywhere; every conclusion here rests on unstarred rows.
 
 The sign flips: once the cache genuinely comes from DRAM, 4-bit leads — but by
-**1.22–1.47×, not by an order of magnitude**.
+**1.21–1.48×, not by an order of magnitude**.
 
-**At ctx = 2048 the sign flip is now fully clock-verified**, with SDPA, the fp16
-control and the fused kernel all passing the gate at the same context: **0.90×
-L2-resident, 1.22× DRAM-resident**. Earlier versions of this claim rested on
-rows where the control had failed the gate.
+**At ctx = 8192 the sign flip is fully clock-verified in all three runs**, with
+SDPA, the fp16 control and the fused kernel passing the gate at the same context
+every time: **0.79–0.81× L2-resident, 1.469–1.478× DRAM-resident** (the ranges
+are across the three runs, not a within-run CI — see below). It is the only
+context where that is true of all three runs; 512 and 2048 clear it in one run
+and not the others, which is a fact about the card's mood and not about the
+kernel. Earlier versions of this claim rested on rows where the control had
+failed the gate.
 
 ![What the quantization itself buys](docs/plots/quantization_effect_4b.png)
 
 **So the real claim is conditional: the fused kernel pays for itself only when
-the KV cache does not fit in L2, and costs ~1.1–1.35× when it does.** At 512
-tokens it roughly breaks even in the cold regime — there is not enough history
-to amortize anything.
+the KV cache does not fit in L2, and costs 1.23–1.37× when it does.** At 512
+tokens quantization loses in *both* regimes — there is not enough history to
+amortize anything.
 
 ### The inner loop was mostly loading the same 4 numbers over and over
 
@@ -323,9 +328,11 @@ broadcast, versus the same kernel with the gather) and
 `optimization.zero_point_fold` (which it marks `FALSE` on speed, since it clears
 the 1.05× bar at no context in either regime).
 
-Current run against `results/benchmark.json` (2026-09-02 00:10, two interleaved
-passes): **68 claims — 29 TRUE / 17 TRUE BUT CONDITIONAL / 10 MISLEADING /
-12 FALSE.** Eight claims moved from conditional to established when the clock
+Current run against `results/benchmark.json` (2026-09-02 12:21, the third of
+three back-to-back full runs — "the last one" rather than "the best one", which
+is the only selection rule that cannot be gamed after the fact; it is also the
+run with the fewest quotable rows of the three): **69 claims — 26 TRUE / 20 TRUE
+BUT CONDITIONAL / 11 MISLEADING / 12 FALSE.** Eight claims moved from conditional to established when the clock
 ramp was fixed, and none of them because a threshold was relaxed.
 Regenerate with `./.venv/Scripts/python.exe audit_claims.py` (~20 s) and read
 `results/audit.md`. Two of those verdicts moved this session for reasons that
@@ -444,6 +451,67 @@ flagged claims lean that way.
 
 `--passes` defaults to 1. The flag stays so the negative result can be re-run.
 
+### One run's CI is not the uncertainty on the number
+
+Every interval in `audit.md` is a bootstrap over the samples of a single run, so
+it answers *how much would this ratio move on another 50 samples from this
+window*. It cannot answer *how much does it move if the process exits and the
+card lands in a different memory P-state next time* — and this repo had one
+observation saying the second number was the larger one: the DRAM-resident
+quantization ratio at ctx=8192 once read **1.27×** where another run read
+**1.47×**, on CIs of ±0.01 each.
+
+So the benchmark was run three more times end to end, nothing changed between
+them, and `between_run.py` compared them (`results/between_run.md`).
+
+| | n | median inflation | median between-run spread | worst spread |
+|---|---|---|---|---|
+| passed the gate in every run | 22 | **2.4×** | 0.7% | 2.0% |
+| failed it in at least one | 38 | **5.0×** | 2.9% | 44.0% |
+
+"Inflation" is how many times wider the union of the three runs' intervals is
+than any one of them. So the honest interval on a quoted number is about **2.4×
+the one the audit prints** — the CI is too narrow, but by a factor, not by an
+order of magnitude.
+
+**No verdict changed between runs**, on any of the 60 tracked ratios. The
+headline conditional holds in all three: quantization costs 0.71–0.91× when the
+KV cache is L2-resident at every context, and pays 1.18–1.20× at 2k, 1.46–1.48×
+at 8k and 1.41–1.47× at 16k when the working set exceeds L2.
+
+![between-run spread](docs/plots/between_run_spread.png)
+
+Three things fell out of this that were not the question being asked.
+
+**The gate scores well out of sample.** It is applied *inside* a run and knows
+nothing about the other two, yet the rows it rejects are the rows that move when
+the benchmark is run again — 5.0× against 2.4× inflation, 2.9% against 0.7%
+spread. That is independent evidence for leaving it where it is, on top of the
+existing reason not to widen it.
+
+**The P-state story is now measured rather than asserted.** Across the 48
+DRAM-resident rows, the correlation between a row's between-run movement in time
+and its between-run movement in mean memory clock is **r = +0.71**. The rows that
+moved are the rows whose clock moved.
+
+**The 1.27× was a one-off, not the typical spread.** `fused_triton_4b@8192` sat
+at 11001 MHz in all four subsequent runs; the 9934 MHz window that produced the
+1.27× has not recurred, and the three runs here agree to 0.6% at that cell. This
+is worse news than it sounds, not better: the run-to-run distribution has a body
+of about ±1% and a tail that moves a headline ratio by 15%, and **three runs
+characterise the body and say nothing about the tail.** The intervals above are a
+floor on the uncertainty, not a bound on it.
+
+**Quotability is itself a random variable.** 35 of 48 rows pass the gate in every
+run, 46 in at least one — so 11 rows are starred or not depending on the run. A
+star means *this run was clean here*, not *this kernel is stable here*.
+
+The audit now carries all of this against itself. Every per-context claim prints
+its run-to-run interval next to its CI, a claim whose verdict moved between runs
+is downgraded automatically, and `method.between_run_spread` audits the audit's
+own intervals — it reads `MISLEADING` when no between-run data exists at all,
+which is the state every previous version of this repo was in.
+
 ### What the dispersion gate actually measures
 
 After the ramp fix, 9 of 48 rows fail the `IQR ≤ 5% of median` half of the gate — it was 23 before, and the analysis below is what the 23 looked like.
@@ -497,9 +565,12 @@ Be specific about what is *not* solved:
    attribution shifts on a desktop part with a bigger L2 or a fixed power
    budget. The conditional is stated in terms of L2 residency precisely because
    that is the axis expected to move.
-8. **The 8k and 16k SDPA baselines are not clock-verified.** Their timings
-   scatter by 6–7% run to run, above the 5% gate, so the "36× vs PyTorch"
-   figure at long context is reported but not leaned on.
+8. ~~**The 8k and 16k SDPA baselines are not clock-verified.**~~ Fixed by the
+   bandwidth-aware ramp: `fp16_sdpa` at 8k and 16k now passes the gate in all
+   three runs with a timing IQR of 0.1–0.4%. What replaces it as the honest
+   caveat is narrower — only **ctx=8192** has every input of the attribution
+   chain passing the gate in *all three* runs; 512 and 2048 pass in one run and
+   not the others.
 
 ---
 
@@ -521,11 +592,25 @@ python -m venv .venv
 .venv/Scripts/python.exe -m pip install torch==2.12.0 --index-url https://download.pytorch.org/whl/cu130
 .venv/Scripts/python.exe -m pip install -r requirements.txt
 
-.venv/Scripts/python.exe -m pytest test_correctness.py -q   # ~26 s
+.venv/Scripts/python.exe -m pytest test_correctness.py -q   # 106 tests, ~89 s (GPU)
+.venv/Scripts/python.exe -m pytest test_between_run.py -q    # 16 tests, ~2 s (no GPU)
 .venv/Scripts/python.exe benchmark.py --quick                # ~75 s smoke run
-.venv/Scripts/python.exe benchmark.py --samples 50           # full suite, ~4.5 min
+.venv/Scripts/python.exe benchmark.py --samples 50           # full suite, ~13 min
 .venv/Scripts/python.exe audit_claims.py                     # reads results/benchmark.json
 .venv/Scripts/python.exe make_plots.py                       # regenerates docs/plots/
+.venv/Scripts/python.exe make_session_plots.py               # the process figures
+```
+
+To get an interval that covers more than one run's sampling noise, run the
+benchmark two or three times into separate files and compare them. The audit
+picks the result up automatically and reports it next to every CI:
+
+```bash
+for i in 1 2 3; do
+  .venv/Scripts/python.exe -u benchmark.py --samples 50 --out results/runs/run$i.json
+done
+.venv/Scripts/python.exe between_run.py results/runs/run*.json   # ~40 min total
+.venv/Scripts/python.exe audit_claims.py
 ```
 
 On Windows, Triton needs an MSVC toolchain (Visual Studio 2022, MSVC 14.4x).
@@ -544,10 +629,15 @@ committed.
 | `reference.py` | fp32 ground truth + the baselines. Probes six fp16 attention strategies per shape and caches the fastest, so the baseline is not a strawman. |
 | `kernels/fused_decode_attn.py` | the fused kernel. |
 | `kernels/fp16_decode_attn.py` | the control: identical shape, unquantized. Isolates the flash-decoding effect. |
-| `test_correctness.py` | 66 tests, explicit asserted thresholds. |
+| `test_correctness.py` | 106 tests on the kernel, explicit asserted thresholds. |
+| `test_between_run.py` | 16 CPU-only tests on the between-run machinery, against synthetic runs with known answers. |
 | `benchmark.py` | timing + memory. Rotating working set for the cold regime, CUDA-graph replay for the hot one. |
 | `audit_claims.py` | adversarial self-audit: bootstrap CIs over raw timings, attribution against the fp16 control, per-optimization claims with their own controls, and a clock-verification gate. |
+| `between_run.py` | what a bootstrap CI does not cover: compares N independent full runs, reports the run-to-run interval, the inflation over the single-run CI, and whether any verdict moved. |
+| `analyze_dispersion.py` | decomposes every rejected measurement into trend, tail and floor, so the gate is argued with rather than tuned. |
+| `sweep_group_size.py`, `probe_gs128.py` | the metadata-load sweep and the static PTX probe behind the gs=128 cliff. |
 | `make_plots.py` | the figures in `docs/plots/`, regenerated from `results/benchmark.json`. |
+| `make_session_plots.py` | the argument figures about the project's own measurement process. |
 | `docs/progress_log.md` | what was tried and what broke, written as it happened. |
 | `docs/next_steps.md` | ordered list of what is left. |
 

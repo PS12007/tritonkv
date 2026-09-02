@@ -11,9 +11,11 @@ venv/
 env/
 
 # Benchmark artifacts (regenerate with `python benchmark.py`)
-results/*.json
-results/*.csv
-results/*.md
+# The whole directory, not just its top level: `benchmark.py --out` writes into
+# results/runs/ for the between-run comparison, and the glob patterns this used
+# to list matched one level only, so those runs and their logs were untracked
+# but not ignored.
+results/
 
 # OS / editor
 .DS_Store

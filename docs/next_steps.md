@@ -1,6 +1,6 @@
 # Where to pick this up
 
-Rewritten 2026-09-01 (late) after the group-size sweep and the audit repairs.
+Rewritten 2026-09-02 after the three-run between-run measurement.
 Read `progress_log.md` first for *why* things are the way they are; this file is
 only *what is left*.
 
@@ -13,10 +13,19 @@ Everything below is verified on this machine, not assumed.
   **RTX 5060 Laptop, sm_120, 26 SMs, 8 GB, 33.6 MB L2, 80 W**.
   Run things as `./.venv/Scripts/python.exe ...` — no activation needed.
 - `python -m pytest test_correctness.py -q` → **106 passed in ~89 s**.
-- `python benchmark.py --samples 50` → ~14 min, clock-monitored, writes
-  `results/benchmark.json`. Last run: **39/48 rows quotable** (was 25/48
-  before the ramp fix), and every rejection is dispersion — there are no
-  clock rejections left. Run it with `python -u` or the log stays buffered.
+- `python benchmark.py --samples 50` → ~13 min, clock-monitored, writes
+  `results/benchmark.json`. Three back-to-back runs on 2026-09-02 gave
+  **42 / 41 / 39 of 48 rows quotable** (was 25/48 before the ramp fix), and
+  every rejection is dispersion — there are no clock rejections left. Run it
+  with `python -u` or the log stays buffered.
+- `python between_run.py results/runs/run*.json` → seconds, writes
+  `results/between_run.{md,json}`. `audit_claims.py` picks that file up
+  automatically and reports the run-to-run interval next to every CI.
+  `python -m pytest test_between_run.py -q` → 16 CPU-only tests, ~2 s.
+- The canonical `results/benchmark.json` is **run 3 of 3** — "the last one", a
+  selection rule that cannot be gamed after the fact, and incidentally the least
+  flattering of the three. The other two are in `results/runs/`, and the older
+  interleaved (`--passes 2`) run is kept as `results/benchmark_interleaved.json`.
 - `python make_plots.py` → 8 figures in `docs/plots/`;
   `python make_session_plots.py` → 6 more (2 need `results/gs_sweep.json`).
 - `python sweep_group_size.py --contexts 512 2048 8192` → ~3.5 min, 24 cells,
@@ -25,20 +34,26 @@ Everything below is verified on this machine, not assumed.
 - README, `docs/key_numbers.md`, `docs/thread_outline.md`.
 
 **The headline finding, in its current form:** the fused kernel's win over
-PyTorch SDPA is almost entirely the flash-decoding split (10–68× on quotable
-rows), not the quantization. Quantization *costs* 1.11–1.58× when the KV cache
-is L2-resident and pays 1.17–1.48× when the working set exceeds L2 and the
-context is 2k or more. Two contexts now have every input passing the gate
-simultaneously: **ctx=512 → 0.72× L2 / 0.91× DRAM** (quantization loses in
-*both* regimes at short context) and **ctx=2048 → 0.90× L2 / 1.17× DRAM**
-(the sign flip itself).
+PyTorch SDPA is almost entirely the flash-decoding split (10.5–68× on quotable
+rows), not the quantization. Quantization *costs* 1.23–1.37× when the KV cache
+is L2-resident and pays 1.18–1.48× when the working set exceeds L2 and the
+context is 2k or more. Ranges below are **across three independent runs**, not
+within-run CIs.
+
+**ctx=8192 is the only context where every input of the attribution chain passes
+the gate in all three runs**: 0.800–0.813× L2-resident, 1.469–1.478×
+DRAM-resident. ctx=512 (0.717–0.796× L2 / 0.905–0.928× DRAM — quantization loses
+in *both* regimes at short context) and ctx=2048 (0.856–0.910× / 1.188–1.197×,
+the sign flip itself) clear the gate in one run and not the others, so they are
+reported with that qualifier rather than starred as though the star were a
+property of the kernel.
 
 ## Do this first
 
 Nothing is blocking. `results/audit.{md,json}` are current (regenerated
-2026-09-01 23:35 against the post-ramp-fix benchmark, **68 claims: 28 TRUE /
-18 CONDITIONAL / 10 MISLEADING / 12 FALSE**), and the audit now takes ~20 s rather than ~13 min, so re-run it
-after any benchmark run without thinking about it:
+2026-09-02 against run 3 with the between-run data loaded, **69 claims: 26 TRUE /
+20 CONDITIONAL / 11 MISLEADING / 12 FALSE**), and the audit takes ~20 s, so
+re-run it after any benchmark run without thinking about it:
 
 ```
 ./.venv/Scripts/python.exe audit_claims.py
@@ -81,32 +96,28 @@ after any benchmark run without thinking about it:
    the current claim ("the win crossed the knee") does not depend on where
    exactly it is.
 
-3. **Re-check the long-context attribution against the new run.** The 8192 and
-   16384 rows used to lose `triton_fp16_control` to dispersion, and the cause is
-   now known and fixed: the ramp never touched the memory system, so the memory
-   P-state stepped up *during* those bandwidth-bound measurements (−19.3% and
-   −22.6% across their own windows). With the ramp warming DRAM too, those rows
-   should hold. Confirm it against the run that produced the current
-   `results/benchmark.json`, and re-check whether the long-context sign flip is
-   now quotable with every input passing simultaneously — it previously leaned on
-   rows that did not.
+3. **Characterise the tail of the run-to-run distribution, not just its body.**
+   Three runs settled the question this file used to lead with, and the answer
+   was reassuring: no verdict moved, and the honest interval is ~2.4× the
+   printed CI rather than an order of magnitude. But the 1.27× that motivated
+   the whole exercise did **not** reappear — `fused_triton_4b@8192` sat at
+   11001 MHz in all four subsequent runs, and the three new runs agree to 0.6%
+   at that cell. So the run-to-run distribution has a body of about ±1% and a
+   tail that moves a headline ratio by 15%, and three runs measure the body
+   while saying nothing about the tail.
 
-   The **between-row** memory-clock mismatch is now understood and is not
-   fixable on this machine: each kernel induces its own memory P-state on a
-   power-shared part (reproducible to 86 MHz across independent runs), and
-   interleaving was measured and changed nothing. What is left is to decide how
-   loudly to say it. The systematic direction is favourable — the fp16 control
-   has the highest mean memory clock of any method, which *understates* the
-   quantization benefit — so the honest move is to state the bound rather than
-   to keep flagging each instance.
+   What would actually settle it: five to ten runs, unattended, recording only
+   the per-row mean memory clock and the four headline ratios (a `--clocks-only`
+   fast path, since the full run costs 13 min and most of it is not needed).
+   The question is not "what is the mean" — it is "how often does a row drop a
+   P-state", and that is a rate, so it needs a denominator. Worth doing before
+   any number here is quoted with a hard interval; not worth doing to move any
+   verdict, since none moved.
 
-   Note also that the DRAM-resident quantization ratio at ctx=8192 moved
-   1.27× → 1.47× between two runs, because one row's memory P-state differed
-   between them, while the bootstrap CI on either is ±0.01. **The CI describes
-   sampling noise within a run and nothing about which P-state that run landed
-   in.** Reporting a run-to-run interval alongside it, from two or three full
-   runs, would be the honest fix and is the single most valuable remaining
-   measurement in this file.
+   Also unresolved and now measurable: `between_run.py` reports the correlation
+   between a row's between-run movement in time and in mean memory clock as
+   **r = +0.71** over 48 DRAM-resident rows. That confirms the P-state story
+   but leaves ~half the variance elsewhere. Nothing identifies what.
 
 4. **2-bit still deserves a decision, not a table row.** Numerically unusable
    (rel L2 ≈ 0.7) under per-token grouping along `head_dim`. KIVI's result is
