@@ -55,12 +55,13 @@ class Claim:
 # ---------------------------------------------------------------------------
 
 
-def bootstrap_ratio_ci(num: list[float], den: list[float], n=BOOTSTRAP_N, ci=CI, seed=0):
-    """Bootstrap CI for mean(num)/mean(den).
+def _bootstrap_ratio_ci_py(num, den, n=BOOTSTRAP_N, ci=CI, seed=0):
+    """Reference implementation: stdlib only, one resample at a time.
 
-    ``num`` is the slower method's timings and ``den`` the faster one's, so the
-    ratio is the speedup. Resampling both independently is right here: the
-    samples are separate timed runs, not paired measurements.
+    Kept because it is obviously correct and because the fast path below is
+    checked against it (``--check-bootstrap``). It is also unusably slow -- at
+    ``BOOTSTRAP_N=10000`` with ~600-sample rows it is ~12M Python-level draws per
+    call, and the audit makes dozens of calls.
     """
     rng = random.Random(seed)
     ratios = []
@@ -73,6 +74,63 @@ def bootstrap_ratio_ci(num: list[float], den: list[float], n=BOOTSTRAP_N, ci=CI,
     lo = ratios[int((1 - ci) / 2 * n)]
     hi = ratios[min(n - 1, int((1 + ci) / 2 * n))]
     return statistics.fmean(num) / statistics.fmean(den), lo, hi
+
+
+def _bootstrap_ratio_ci_np(num, den, n=BOOTSTRAP_N, ci=CI, seed=0):
+    """Same estimator, resampled as two (n, len) integer index matrices."""
+    import numpy as np
+
+    a = np.asarray(num, dtype=np.float64)
+    b = np.asarray(den, dtype=np.float64)
+    rng = np.random.default_rng(seed)
+    ra = a[rng.integers(0, a.size, size=(n, a.size))].mean(axis=1)
+    rb = b[rng.integers(0, b.size, size=(n, b.size))].mean(axis=1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratios = np.where(rb > 0, ra / rb, np.inf)
+    ratios.sort()
+    lo = float(ratios[int((1 - ci) / 2 * n)])
+    hi = float(ratios[min(n - 1, int((1 + ci) / 2 * n))])
+    return float(a.mean() / b.mean()), lo, hi
+
+
+def bootstrap_ratio_ci(num: list[float], den: list[float], n=BOOTSTRAP_N, ci=CI, seed=0):
+    """Bootstrap CI for mean(num)/mean(den).
+
+    ``num`` is the slower method's timings and ``den`` the faster one's, so the
+    ratio is the speedup. Resampling both independently is right here: the
+    samples are separate timed runs, not paired measurements.
+
+    Two implementations, because this is a measuring instrument and this project
+    has already been bitten twice by an instrument rather than by the kernel.
+    The vectorized path is what runs; the stdlib path above is the definition,
+    and ``--check-bootstrap`` measures how far apart they land on the real rows.
+    They draw from different generators, so they are not expected to agree to the
+    last digit -- only to agree far more tightly than the intervals are wide.
+    """
+    try:
+        return _bootstrap_ratio_ci_np(num, den, n, ci, seed)
+    except ImportError:
+        return _bootstrap_ratio_ci_py(num, den, n, ci, seed)
+
+
+def check_bootstrap(b, pairs, n=BOOTSTRAP_N) -> str:
+    """Report the largest disagreement between the two bootstrap paths."""
+    worst = (0.0, None)
+    lines = []
+    for label, num, den in pairs:
+        r1 = _bootstrap_ratio_ci_np(num, den, n=n)
+        r2 = _bootstrap_ratio_ci_py(num, den, n=n)
+        width = r1[2] - r1[1]
+        d_lo, d_hi = abs(r1[1] - r2[1]), abs(r1[2] - r2[2])
+        frac = max(d_lo, d_hi) / width if width > 0 else float("inf")
+        lines.append(
+            f"  {label:<34} np [{r1[1]:.4f},{r1[2]:.4f}]  py [{r2[1]:.4f},{r2[2]:.4f}]  "
+            f"max endpoint delta = {max(d_lo, d_hi):.5f} = {frac * 100:.1f}% of CI width"
+        )
+        if frac > worst[0]:
+            worst = (frac, label)
+    lines.append(f"  worst: {worst[1]} at {worst[0] * 100:.1f}% of its CI width")
+    return "\n".join(lines)
 
 
 def cv(xs: list[float]) -> float:
@@ -549,7 +607,7 @@ def audit_optimizations(b: Bench, nbits: int = 4) -> list[Claim]:
 
     if ratios_cold:
         quotable = [c for c in ratios_cold if b.quotable(gather, c) and b.quotable(fused, c)]
-        lows = [ratios_cold[c][1][0] for c in quotable]
+        lows = [ratios_cold[c][1] for c in quotable]
         wins = bool(lows) and all(x > PRACTICAL_THRESHOLD for x in lows)
         caveat = "" if quotable else (
             " NOT CLOCK-VERIFIED: no context had both the broadcast and gather rows pass "
@@ -568,7 +626,7 @@ def audit_optimizations(b: Bench, nbits: int = 4) -> list[Claim]:
                     "gather / broadcast, DRAM-resident: "
                     + ", ".join(
                         f"{c}:{ratios_cold[c][0]:.2f}x "
-                        f"[{ratios_cold[c][1][0]:.2f},{ratios_cold[c][1][1]:.2f}]"
+                        f"[{ratios_cold[c][1]:.2f},{ratios_cold[c][2]:.2f}]"
                         + ("" if c in quotable else "*")
                         for c in sorted(ratios_cold)
                     )
@@ -605,7 +663,16 @@ def audit_optimizations(b: Bench, nbits: int = 4) -> list[Claim]:
             fold_hot[ctx] = bootstrap_ratio_ci(h0, h1)
 
     if fold_cold:
-        helps = [c for c in fold_cold if fold_cold[c][1][0] > PRACTICAL_THRESHOLD]
+        # Same gate as the broadcast claim above. Without it this claim was
+        # reading a starred row -- ctx=8192 4-bit shows a CI whose low end clears
+        # the bar, but neither the baseline nor the folded row passed the
+        # boost-clock/dispersion gate there, so it is exactly the kind of number
+        # this project exists to not quote.
+        fold_quotable = [c for c in fold_cold
+                         if b.quotable(fused, c) and b.quotable(fold, c)]
+        helps = [c for c in fold_quotable if fold_cold[c][1] > PRACTICAL_THRESHOLD]
+        ungated = [c for c in fold_cold
+                   if c not in fold_quotable and fold_cold[c][1] > PRACTICAL_THRESHOLD]
         claims.append(
             Claim(
                 id=f"optimization.zero_point_fold.{nbits}b",
@@ -618,19 +685,32 @@ def audit_optimizations(b: Bench, nbits: int = 4) -> list[Claim]:
                 evidence=(
                     "baseline / folded, DRAM-resident: "
                     + ", ".join(
-                        f"{c}:{fold_cold[c][0]:.2f}x" for c in sorted(fold_cold)
+                        f"{c}:{fold_cold[c][0]:.2f}x"
+                        + ("" if c in fold_quotable else "*")
+                        for c in sorted(fold_cold)
                     )
                     + "; L2-resident: "
-                    + ", ".join(f"{c}:{fold_hot[c][0]:.2f}x" for c in sorted(fold_hot))
-                    + ". A ratio below 1.0 means the fold is slower. "
+                    + ", ".join(f"{c}:{fold_hot[c][0]:.2f}x"
+                                + ("" if c in fold_quotable else "*")
+                                for c in sorted(fold_hot))
+                    + ". A ratio below 1.0 means the fold is slower. Rows marked * did "
+                      "not pass the clock/dispersion gate and are not relied on. "
                     + (
-                        f"It clears the {PRACTICAL_THRESHOLD:.2f}x bar only at ctx="
-                        + ",".join(str(c) for c in helps) + "."
+                        f"It clears the {PRACTICAL_THRESHOLD:.2f}x bar on a gated row "
+                        "only at ctx=" + ",".join(str(c) for c in helps) + "."
                         if helps
-                        else "It clears the practical-significance bar at no context, in "
-                             "either regime, at either bit width. The arithmetic saving is "
-                             "real but it is spent on extra work on the score tile and on "
-                             "registers (128 -> 164)."
+                        else "On the rows that passed the gate it clears the "
+                             "practical-significance bar at no context, in either regime, "
+                             "at either bit width. The arithmetic saving is real but it is "
+                             "spent on extra work on the score tile and on registers "
+                             "(128 -> 164)."
+                    )
+                    + (
+                        " It does clear the bar at ctx="
+                        + ",".join(str(c) for c in ungated)
+                        + ", but only on rows that failed the gate -- which is what the "
+                          "gate is for."
+                        if ungated else ""
                     )
                 ),
                 falsification_attempted=(
@@ -1148,12 +1228,29 @@ def main():
     ap.add_argument("--no-gpu-checks", action="store_true")
     ap.add_argument("--out-md", default=str(RESULTS_DIR / "audit.md"))
     ap.add_argument("--out-json", default=str(RESULTS_DIR / "audit.json"))
+    ap.add_argument("--check-bootstrap", action="store_true",
+                    help="compare the vectorized bootstrap against the stdlib "
+                         "reference on real rows, then exit")
     args = ap.parse_args()
 
     path = Path(args.input)
     if not path.exists():
         raise SystemExit(f"no benchmark results at {path} -- run `python benchmark.py` first")
     b = Bench(json.loads(path.read_text()))
+
+    if args.check_bootstrap:
+        pairs = []
+        for ctx in b.contexts:
+            for nb in b.p["bit_widths"]:
+                fused = f"fused_triton_{nb}b"
+                for other in (CONTROL, GATHER.format(nbits=nb), "fp16_sdpa"):
+                    x, y = b.cold(other, ctx), b.cold(fused, ctx)
+                    if x and y:
+                        pairs.append((f"{other}/{fused} ctx={ctx}", x, y))
+        pairs = pairs[:8]
+        print(f"bootstrap cross-check on {len(pairs)} real ratios, n={BOOTSTRAP_N}:")
+        print(check_bootstrap(b, pairs))
+        return
 
     claims: list[Claim] = []
     for nbits in b.p["bit_widths"]:

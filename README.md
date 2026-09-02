@@ -139,11 +139,59 @@ instructions are issued. The experiment varied metadata **bytes** and concluded
 about metadata **instructions**, and a flat sweep is exactly what the expensive
 version predicts.
 
+### …and then the same experiment, run properly, refuted half of *that*
+
+`sweep_group_size.py` re-runs the sweep on **both** paths at once, with the
+prediction written down first: broadcast should now be sloped, because there
+`group_size` really does set the load count; gather should stay flat. Gather was
+flat. Broadcast was **also nearly flat** — 1.07–1.17× across an 8× range of
+metadata loads. The prediction was wrong, and the right shape is *saturation*
+(L2-resident, ctx = 8192, all rows clock-verified):
+
+| path | metadata loads per tile | median |
+|---|---|---|
+| gather, gs=32 | 4096 | 22.0 µs |
+| broadcast, gs=16 | 256 | 17.0 µs — 16× fewer loads buys **1.29×** |
+| broadcast, gs=128 | 32 | 15.9 µs — a further 8× buys **1.07×** |
+
+So metadata loads are a real cost and they stop being the *binding* cost about
+an order of magnitude below where the gather path sat. The broadcast change was
+worth 1.29× because it crossed that point, not because load count and time are
+proportional. A version of this project that had only run the second half of
+that table would have concluded metadata loads were free — which is exactly the
+mistake the first sweep made, from the other side.
+
+### The gs=128 outlier was a shared-memory layout conversion
+
+The old sweep had a loose end nobody chased: 93 µs at `gs=128`, against ~26 µs
+everywhere else. It reproduces, and it is now explained.
+
+On the gather path at `gs=128` the kernel is **1.95× / 2.88× / 3.52×** slower
+than at `gs=64` (ctx = 512 / 2048 / 8192, L2-resident, IQR ≈ 1%). It issues
+*fewer* PTX instructions than `gs=64` (2415 vs 2989) and exactly the same number
+of global loads, so it is not a load-count effect. What moves is shared memory:
+at the swept config (`block_n=32`, 2 warps) `st.shared` goes **30 → 142**. The
+same jump appears in all nine (`block_n`, `num_warps`) combinations checked by
+`probe_gs128.py` — 16 → 72 at 4 warps, 40 → 264 at `block_n=128` — so it is a
+property of the index, not of one tuning.
+
+The cause is the degenerate index. When `group_size == head_dim`,
+`tl.arange(0, D) // group_size` folds to all-zeros, and Triton gives the loaded
+tile a layout that must be converted through shared memory before it can feed
+the dequantize path. The redundant-load form is slow; the redundant-load form
+with a *constant* index is much slower, and it gets worse with context because
+the conversion is inside the loop. The shipped broadcast path is unaffected — at
+`gs=128` it is the *fastest* cell in the table — so this is a fact about the
+control, not about the kernel.
+
 Two variants were measured and **rejected**, which is what bounds the claim:
 
 - **Folding the zero-point out of the inner loop** (`scale·(q·code) + zero·Σq`,
   a per-group dot against the raw codes). Not faster at any context in either
-  regime: 0.74–1.10× at 4-bit, 0.66–0.94× at 2-bit. Kept as an option
+  regime: 0.72–1.08× at 4-bit, 0.67–0.94× at 2-bit. The only cell above the
+  1.05× bar (4-bit, DRAM-resident, ctx=8192) sits on a row that failed the
+  clock/dispersion gate, and the audit now says so instead of quoting it. Kept
+  as an option
   (`fold_zp=True`) only because it is *more accurate* — it never rounds a
   dequantized K value to fp16, so kernel error stays flat at 1.5e-4 instead of
   drifting 2.3e-4 → 7.7e-4 as context grows.
@@ -275,12 +323,18 @@ broadcast, versus the same kernel with the gather) and
 `optimization.zero_point_fold` (which it marks `FALSE` on speed, since it clears
 the 1.05× bar at no context in either regime).
 
-> **Stale:** the verdict counts previously quoted here (24 TRUE / 20 CONDITIONAL
-> / 9 MISLEADING / 10 FALSE) came from a run against an older
-> `results/benchmark.json`, before the `fused_gather_meta_*` and
-> `fused_fold_zp_*` rows and before the per-optimization claims existed. They
-> are deliberately not restated. Regenerate with
-> `./.venv/Scripts/python.exe audit_claims.py` and read `results/audit.md`.
+Current run against `results/benchmark.json` (2026-09-01 19:00):
+**67 claims — 21 TRUE / 25 TRUE BUT CONDITIONAL / 9 MISLEADING / 12 FALSE.**
+Regenerate with `./.venv/Scripts/python.exe audit_claims.py` (~20 s) and read
+`results/audit.md`. Two of those verdicts moved this session for reasons that
+were in the auditor rather than in the kernel:
+
+- `optimization.*` crashed on a tuple-indexing bug, so the per-optimization
+  claims had never actually been generated.
+- `optimization.zero_point_fold.4b` came out `TRUE BUT CONDITIONAL` on a
+  DRAM-resident 1.08× at ctx=8192 — on a row that had failed the clock and
+  dispersion gate. That claim now applies the same gate as its neighbour and
+  reads `FALSE`, like the 2-bit one always did.
 
 Historically the `FALSE` verdicts have been this project's own claims about the
 L2-resident regime, and the audit is what puts them there.

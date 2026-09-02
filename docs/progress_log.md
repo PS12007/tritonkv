@@ -378,3 +378,106 @@ apparatus had a second failure mode underneath the one already fixed. Adding the
 clock monitor caught throttling; it did not catch *not having looked long enough
 to tell*, and a gate that answers "yes" from one sample reads identically to one
 that answers from twenty.
+
+---
+
+## 2026-09-01 21:20 — The audit's own new section had never run
+
+**Attempted:** `next_steps.md` item 0 — regenerate the stale
+`results/audit.{md,json}`.
+
+**What happened.** It crashed. `audit_optimizations()` — the section added
+earlier the same evening to adjudicate this session's two kernel changes against
+their own controls — indexed `bootstrap_ratio_ci`'s return value as
+`ratios_cold[c][1][0]`, but that function returns a *flat* `(mean, lo, hi)`
+triple, not `(mean, (lo, hi))`. Every other caller in the file unpacks it
+correctly. So the section had been written, committed, and described in the
+README, and had **never once executed**.
+
+Worth saying plainly: the reason it went unnoticed is that the audit takes
+~13 minutes, so it does not get run casually. A tool that is expensive to run is
+a tool whose failures are discovered late.
+
+**Which is why the second fix was to make it cheap.** `bootstrap_ratio_ci` was
+10,000 resamples of two ~600-sample rows in a Python loop — about 12M
+interpreter-level draws per call, dozens of calls per audit. Vectorized into two
+numpy index matrices: **13 min → 20 s.** The stdlib version is kept as
+`_bootstrap_ratio_ci_py` and `--check-bootstrap` runs both on the real rows and
+reports the disagreement, because swapping an estimator's RNG is a change to the
+measuring apparatus and this project has already been bitten twice by those.
+Worst endpoint disagreement over 8 real ratios: **2.3% of the CI width.**
+
+**And the third fix was a verdict the section got wrong.**
+`optimization.zero_point_fold.4b` came out `TRUE BUT CONDITIONAL` on a
+DRAM-resident 1.08× at ctx=8192 whose bootstrap CI cleared the 1.05× bar. But
+neither the baseline nor the folded row passed the clock/dispersion gate at that
+context — the neighbouring `meta_broadcast` claim applies that gate and this one
+did not. Gated, it reads **FALSE**, which is what the 2-bit claim already said
+and what the progress log has said since the fold was measured.
+
+Current counts: **67 claims — 21 TRUE / 25 CONDITIONAL / 9 MISLEADING /
+12 FALSE.**
+
+---
+
+## 2026-09-01 21:45 — The group-size sweep, run properly, refuted the prediction
+
+**Attempted:** `next_steps.md` item 2. The old sweep (25.4 / 25.6 / 26.6 µs at
+gs = 16/32/64) ran on the gather path, where group size cannot affect the load
+count, so it was evidence for nothing. On the broadcast path `GS` genuinely sets
+the count (`BLOCK_N * D/GS`), so `sweep_group_size.py` runs **both** paths in one
+session with the prediction written down first:
+
+> broadcast: sloped, monotone in `D // GS`. gather: flat.
+
+**What happened.** Gather was flat. Broadcast was flat too — 1.07–1.17× across
+an 8× range of metadata loads. The prediction was wrong.
+
+The right shape is **saturation**, and it only shows up when the broadcast
+change's own step is put in the same table (L2-resident, ctx=8192, every row
+clock-verified):
+
+| path | metadata loads / tile | median |
+|---|---|---|
+| gather, gs=32 | 4096 | 22.0 µs |
+| broadcast, gs=16 | 256 | 17.0 µs (16× fewer loads → **1.29×**) |
+| broadcast, gs=128 | 32 | 15.9 µs (a further 8× → **1.07×**) |
+
+So metadata loads are a real cost that stops binding about an order of magnitude
+below where the gather path sat. The broadcast change was worth 1.29× because it
+crossed that point — not because time is proportional to load count. Note how
+close this came to being the *same* mistake in reverse: a project that had run
+only the bottom two rows would have concluded metadata loads were free, on a
+flat sweep, exactly as the first version did from the other side.
+
+**The gs=128 outlier turned out to be the interesting result.** The old sweep
+recorded 93 µs at gs=128 against ~26 µs elsewhere and left it alone. It
+reproduces: on the gather path gs=128 is **1.95× / 2.88× / 3.52×** slower than
+gs=64 at ctx = 512 / 2048 / 8192 (L2-resident, IQR ≈ 1%, clock-verified at 2048
+and 8192).
+
+It is not a load-count effect. That cell issues *fewer* PTX instructions than
+gs=64 (2415 vs 2989) and the same number of global loads. `probe_gs128.py`
+compiles every cell and counts what the PTX actually contains:
+
+| cell | ld.global | st.shared | ld.shared | regs | spills |
+|---|---|---|---|---|---|
+| gather, gs=64 | 130 | 16 | 38 | 124 | 0 |
+| gather, gs=128 | 130 | **72** | **98** | 121 | 0 |
+| broadcast, gs=128 | 10 | 16 | 38 | 108 | 0 |
+
+(block_n=32, 4 warps; the same jump appears in all nine (block_n, num_warps)
+combinations checked, e.g. 40 → 264 at block_n=128.)
+
+**Cause.** When `group_size == head_dim`, `tl.arange(0, D) // GS` folds to
+all-zeros. Triton then gives the loaded tile a layout that has to be converted
+through shared memory before it can feed the dequantize path, and the conversion
+is inside the loop — which is why the penalty *grows* with context rather than
+amortizing. The redundant-load form is slow; the redundant-load form with a
+constant index is much slower.
+
+The shipped broadcast path is unaffected: at gs=128 it is the fastest cell in the
+whole table. So this is a fact about the control row, not about the kernel — but
+it closes a number that had been sitting in this repo unexplained since the first
+week, and it is a second example of the session's theme, that **fewer
+instructions is not the same thing as less work.**

@@ -257,6 +257,184 @@ def plot_fold_accuracy():
     save(fig, "fold_accuracy")
 
 
+# ---------------------------------------------------------------------------
+# Group-size sweep (results/gs_sweep.json, written by sweep_group_size.py)
+# ---------------------------------------------------------------------------
+
+
+def _sweep(path: Path) -> dict | None:
+    return json.loads(path.read_text()) if path.exists() else None
+
+
+def _cell(rows, ctx, gs, path_name, regime="hot"):
+    for r in rows:
+        if r["ctx"] == ctx and r["group_size"] == gs and r["path"] == path_name:
+            st = r.get(regime)
+            return r, (st["median_ms"] * 1e3 if st else None)
+    return None, None
+
+
+def plot_gs_saturation(sweep: dict):
+    """Time against metadata loads per tile: the cost saturates, it is not linear.
+
+    The prediction going in was that the broadcast path's sweep would be sloped,
+    because there ``GS`` really does set the load count. It is nearly flat. What
+    that flatness means only becomes visible with the gather point on the same
+    axis: the expensive step is the first order of magnitude, and there is very
+    little left below it.
+    """
+    rows = sweep["rows"]
+    contexts = [c for c in (2048, 8192) if any(r["ctx"] == c for r in rows)]
+    fig, axes = plt.subplots(1, len(contexts), figsize=(5.6 * len(contexts), 4.2))
+    axes = np.atleast_1d(axes)
+
+    for ax, ctx in zip(axes, contexts):
+        xs, ys, labels, oks = [], [], [], []
+        for gs in sweep["group_sizes"]:
+            r, us = _cell(rows, ctx, gs, "broadcast")
+            if us:
+                xs.append(r["meta_loads_per_tile"])
+                ys.append(us)
+                labels.append("gs=%d" % gs)
+                oks.append(r["quotable"])
+        order = np.argsort(xs)
+        xs = np.array(xs)[order]
+        ys = np.array(ys)[order]
+        labels = [labels[i] for i in order]
+        oks = [oks[i] for i in order]
+        ax.plot(xs, ys, "-", color=S1, lw=1.6, zorder=2)
+        for x, y, lab, ok in zip(xs, ys, labels, oks):
+            ax.plot([x], [y], "o", ms=7, color=S1 if ok else "none",
+                    markeredgecolor=S1, markeredgewidth=1.4, zorder=3)
+            ax.annotate(lab, (x, y), textcoords="offset points", xytext=(0, 9),
+                        ha="center", va="bottom", fontsize=8.5, color=INK2)
+
+        # The gather path sits at a single x -- BLOCK_N * D loads whatever GS is,
+        # which is the whole point of the original mistake -- so it is drawn as
+        # the one point it really is. gs=128 is excluded: that cell is a
+        # different effect (see plot_gs128_cliff) and would read as part of a
+        # trend it has nothing to do with.
+        gvals = []
+        for gs in (16, 32, 64):
+            _, us = _cell(rows, ctx, gs, "gather")
+            if us:
+                gvals.append(us)
+        gref = _cell(rows, ctx, 32, "gather")[0]
+        if gvals and gref:
+            gx = gref["meta_loads_per_tile"]
+            gy = float(np.median(gvals))
+            ax.plot([gx], [gy], "s", ms=8, color=MUTED, markeredgecolor=MUTED,
+                    zorder=3)
+            ax.annotate("gather (gs=16/32/64)", (gx, gy),
+                        textcoords="offset points", xytext=(-10, -3), ha="right",
+                        va="center", fontsize=8.5, color=INK2)
+            lo, hi = min(float(ys.min()), gy), max(float(ys.max()), gy)
+            pad = (hi - lo) * 0.16
+            ax.set_ylim(lo - pad, hi + pad)
+            # The step the broadcast change actually made, drawn so the eye reads
+            # it as one move rather than as two unrelated clusters.
+            ax.plot([gx, xs[-1]], [gy, ys[-1]], ls=":", lw=1.3, color=MUTED,
+                    zorder=1)
+            ax.text(0.30, 0.70,
+                    "%dx fewer loads: %.2fx faster\na further %dx: %.2fx"
+                    % (gx // xs[-1], gy / ys[-1], xs[-1] // xs[0], ys[-1] / ys[0]),
+                    transform=ax.transAxes, fontsize=9, color=INK, va="center",
+                    bbox=dict(boxstyle="round,pad=0.4", fc=SURFACE, ec=GRID))
+
+        ax.set_xscale("log", base=2)
+        style(ax, "ctx = %s" % CTX_LABEL.get(ctx, ctx),
+              subtitle="L2-resident, CUDA-graph replay",
+              xlabel="per-group scale/zero loads per tile",
+              ylabel="median latency (us)")
+
+    figure_header(
+        fig,
+        "Metadata loads are a real cost that stops binding",
+        "Same kernel, same config; only the metadata load count changes.\n"
+        "Hollow markers failed the clock/dispersion gate.",
+    )
+    save(fig, "gs_saturation")
+
+
+def plot_gs128_cliff(sweep: dict):
+    """The unexplained gs=128 outlier, and the shared-memory traffic behind it."""
+    rows = sweep["rows"]
+    contexts = [c for c in (512, 2048, 8192) if any(r["ctx"] == c for r in rows)]
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.2))
+
+    ax = axes[0]
+    x = np.arange(len(contexts))
+    w = 0.27
+    series = (("gather, gs=64", 64, "gather", MUTED),
+              ("gather, gs=128", 128, "gather", S2),
+              ("broadcast, gs=128", 128, "broadcast", S1))
+    top = 0.0
+    for i, (label, gs, pname, colour) in enumerate(series):
+        vals, oks = [], []
+        for ctx in contexts:
+            r, us = _cell(rows, ctx, gs, pname)
+            vals.append(us if us else np.nan)
+            oks.append(bool(r and r["quotable"]))
+        top = max(top, np.nanmax(vals))
+        bars = ax.bar(x + (i - 1) * w, vals, w, color=colour, edgecolor=colour,
+                      label=label)
+        for bar, ok in zip(bars, oks):
+            if not ok:
+                bar.set_facecolor("none")
+                bar.set_hatch("///")
+                bar.set_linewidth(1.1)
+        for xi_, v in zip(x + (i - 1) * w, vals):
+            if not np.isnan(v):
+                ax.text(xi_, v + top * 0.015, "%.0f" % v, ha="center",
+                        va="bottom", fontsize=8.5, color=INK)
+    ax.set_xticks(x)
+    ax.set_xticklabels([CTX_LABEL.get(c, str(c)) for c in contexts])
+    ax.set_ylim(0, top * 1.18)
+    ax.legend(loc="upper left", fontsize=9)
+    style(ax, "The cliff is only on the gather path",
+          subtitle="L2-resident; hatched bars failed the gate",
+          xlabel="context length (tokens)", ylabel="median latency (us)")
+
+    ax = axes[1]
+    ctx = contexts[-1]
+    cells = (("gather\ngs=64", 64, "gather", MUTED),
+             ("gather\ngs=128", 128, "gather", S2),
+             ("broadcast\ngs=128", 128, "broadcast", S1))
+    names, st_vals, ld_vals, colours = [], [], [], []
+    for label, gs, pname, colour in cells:
+        r, _ = _cell(rows, ctx, gs, pname)
+        ops = (r or {}).get("ptx_ops") or {}
+        names.append(label)
+        st_vals.append(ops.get("st.shared", 0))
+        ld_vals.append(ops.get("ld.shared", 0))
+        colours.append(colour)
+    xi = np.arange(len(names))
+    ax.bar(xi - 0.19, st_vals, 0.36, color=colours, label="st.shared")
+    ax.bar(xi + 0.19, ld_vals, 0.36, color=colours, alpha=0.45, label="ld.shared")
+    hi = max(st_vals + ld_vals) or 1
+    for a, v in zip(xi - 0.19, st_vals):
+        ax.text(a, v + hi * 0.02, str(v), ha="center", fontsize=9,
+                fontweight="bold", color=INK)
+    for a, v in zip(xi + 0.19, ld_vals):
+        ax.text(a, v + hi * 0.02, str(v), ha="center", fontsize=9, color=INK2)
+    ax.set_xticks(xi)
+    ax.set_xticklabels(names)
+    ax.set_ylim(0, hi * 1.25)
+    ax.legend(loc="upper left", fontsize=9)
+    style(ax, "...and it is shared memory, not loads",
+          subtitle="PTX counts; the three cells issue identical global loads",
+          ylabel="instructions")
+
+    figure_header(
+        fig,
+        "When group_size == head_dim, the index folds to a constant",
+        "Triton then gives the loaded tile a layout it has to convert through shared\n"
+        "memory. The slow cell issues FEWER instructions than gs=64 and the same number\n"
+        "of global loads; what it adds is a round trip, inside the loop.",
+    )
+    save(fig, "gs128_cliff")
+
+
 def measure_registers() -> dict:
     """Compile both shipped paths and read the register count back."""
     import torch
@@ -290,6 +468,12 @@ def main():
     print(f"figures -> {PLOTS}")
     plot_broadcast_speedup(payload)
     plot_clock_samples(payload)
+    sweep = _sweep(ROOT / "results" / "gs_sweep.json")
+    if sweep:
+        plot_gs_saturation(sweep)
+        plot_gs128_cliff(sweep)
+    else:
+        print("  (skipped gs_saturation and gs128_cliff: no results/gs_sweep.json)")
     if args.no_gpu:
         print("  (skipped inner_loop_cost and fold_accuracy: --no-gpu)")
         return
