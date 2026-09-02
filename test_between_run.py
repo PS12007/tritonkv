@@ -18,6 +18,7 @@ import pytest
 
 import audit_claims
 import between_run
+import clock_excursions
 from audit_claims import Bench
 
 CTX = 2048
@@ -192,6 +193,22 @@ def test_runs_with_different_configs_are_refused(tmp_path, monkeypatch, capsys):
     assert "refusing to pool" in str(e.value)
 
 
+def test_a_subset_run_is_not_pooled_with_a_full_one(tmp_path, monkeypatch):
+    """`benchmark.py --methods` makes a run cheap enough to repeat often. Pooling
+    one with a full run would compare rows measured after different amounts of
+    preceding GPU work, which is exactly the variable under study."""
+    full = _payload(1.0)
+    subset = _payload(1.0)
+    subset["args"]["methods"] = "attribution"
+    a, b = tmp_path / "full.json", tmp_path / "subset.json"
+    a.write_text(json.dumps(full), encoding="utf-8")
+    b.write_text(json.dumps(subset), encoding="utf-8")
+    monkeypatch.setattr("sys.argv", ["between_run.py", str(a), str(b)])
+    with pytest.raises(SystemExit) as e:
+        between_run.main()
+    assert "refusing to pool" in str(e.value)
+
+
 def test_a_single_run_is_refused(tmp_path, monkeypatch):
     a = tmp_path / "a.json"
     a.write_text(json.dumps(_payload(1.0)), encoding="utf-8")
@@ -317,3 +334,114 @@ def test_audit_flags_a_star_that_is_a_property_of_the_run(clean_between):
 
 def test_loader_tolerates_a_missing_file(tmp_path):
     assert audit_claims.load_between_run(tmp_path / "nope.json") == {}
+
+
+# ---------------------------------------------------------------------------
+# clock_excursions: the P-state rate, and the statistic that measures it
+# ---------------------------------------------------------------------------
+
+
+def _clocked(mem_by_method: dict, *, quotable=True, ctx=CTX) -> dict:
+    """A payload where each method's memory clock is dictated per regime."""
+    d = _payload(1.0, quotable=quotable)
+    for row in d["results"]:
+        mhz = mem_by_method.get(row["method"])
+        if mhz is None:
+            continue
+        for regime in ("cold", "graph"):
+            row["clocks"][regime]["clocks"]["mem_mhz_mean"] = float(mhz)
+    return d
+
+
+def _groups(**spec):
+    """name -> [(run label, Bench)] from {name: [clock, clock, ...]}."""
+    return {
+        name: [(f"{name}{i}", Bench(_clocked({"fused_triton_4b": mhz})))
+               for i, mhz in enumerate(mhzs)]
+        for name, mhzs in spec.items()
+    }
+
+
+def test_a_steady_clock_is_never_an_excursion():
+    g = _groups(a=[11000, 11000, 11000])
+    exc, cells = clock_excursions.find_excursions(g)
+    assert exc == []
+    assert all(c["n_states"] == 1 for c in cells.values())
+
+
+def test_one_dropped_p_state_is_found_once():
+    g = _groups(a=[11000, 11000, 10000])
+    exc, _ = clock_excursions.find_excursions(g)
+    fused = [e for e in exc if e["method"] == "fused_triton_4b"]
+    assert len(fused) == len(("cold", "graph")), fused
+    assert all(e["run"] == "a2" for e in fused)
+    assert all(0.08 < e["drop_frac"] < 0.10 for e in fused)
+
+
+def test_all_distinct_observations_do_not_all_become_excursions():
+    """The bug this test exists for.
+
+    An earlier version used the mode as the baseline. When every observation is
+    distinct every count ties at one, and breaking the tie toward the highest
+    clock reported four of six observations as excursions against a baseline one
+    run reached once. The median has no tie to break.
+    """
+    g = _groups(a=[11500, 11000, 10500], b=[10300, 10000, 9800])
+    exc, cells = clock_excursions.find_excursions(g)
+    fused_cells = [c for k, c in cells.items() if k[0] == "fused_triton_4b"]
+    assert all(c["n_states"] == 6 for c in fused_cells), "test setup: all distinct"
+    per_regime = len([e for e in exc if e["method"] == "fused_triton_4b"]) / 2
+    assert per_regime <= 2, f"{per_regime} of 6 flagged -- baseline is too high"
+
+
+def test_an_evenly_split_cell_flags_at_most_half():
+    """Half the runs in each of two P-states, 10% apart.
+
+    The median baseline lands between them, so the low half is flagged and the
+    high half is not. That is the intended reading -- a cell that sits 10% lower
+    in half its runs is bimodal and the table should say so -- but the majority
+    can never be flagged, which is what stops the statistic from calling a
+    cell's normal state an anomaly.
+    """
+    g = _groups(a=[11000, 11000, 11000], b=[10000, 10000, 10000])
+    exc, cells_ = clock_excursions.find_excursions(g)
+    fused = [e for e in exc if e["method"] == "fused_triton_4b"]
+    per_regime = len(fused) / 2
+    assert per_regime == 3, per_regime
+    assert {e["group"] for e in fused} == {"b"}
+    assert all(c["n_states"] == 2 for k, c in cells_.items()
+               if k[0] == "fused_triton_4b")
+
+
+def test_gate_status_is_carried_through():
+    """The point of the report is which excursions were *quoted*, so the row's
+    gate status has to survive into the record."""
+    g = {
+        "a": [("a0", Bench(_clocked({"fused_triton_4b": 11000}))),
+              ("a1", Bench(_clocked({"fused_triton_4b": 11000}))),
+              ("a2", Bench(_clocked({"fused_triton_4b": 9500}, quotable=False)))],
+    }
+    exc, _ = clock_excursions.find_excursions(g)
+    fused = [e for e in exc if e["method"] == "fused_triton_4b"]
+    assert fused and all(e["row_quotable"] is False for e in fused)
+
+
+def test_cells_are_intersected_across_groups():
+    """A subset run times fewer methods. Cells only one group measured cannot be
+    compared, and must not silently enter the denominator."""
+    full = Bench(_payload(1.0))
+    subset_payload = _payload(1.0)
+    subset_payload["results"] = [r for r in subset_payload["results"]
+                                 if r["method"] in ("fp16_sdpa", "fused_triton_4b")]
+    g = {"full": [("f", full)], "subset": [("s", Bench(subset_payload))]}
+    got = {m for m, _, _ in clock_excursions.cells(g)}
+    assert got == {"fp16_sdpa", "fused_triton_4b"}
+
+
+def test_render_reports_the_rate_and_the_gate():
+    g = _groups(a=[11000, 11000, 10000])
+    exc, cells_ = clock_excursions.find_excursions(g)
+    md = clock_excursions.render(exc, cells_, g, clock_excursions.EXCURSION_FRAC)
+    assert "Rate, by run group" in md
+    assert "median MHz" in md
+    assert "excursion" in md.lower()

@@ -895,3 +895,102 @@ bandwidth-aware ramp fixed it, and those rows now pass with a timing IQR of
 
 Audit: **69 claims — 26 TRUE / 20 TRUE BUT CONDITIONAL / 11 MISLEADING /
 12 FALSE.** 106 kernel tests and 16 between-run tests pass.
+
+---
+
+## 2026-09-02 (later) — the cheap denominator, and why there isn't one
+
+The between-run study left one thing open, and it was the honest kind of open: three
+runs bound the *body* of the run-to-run distribution and say nothing about its
+tail. The 1.27x that started the whole exercise never reappeared in four
+subsequent runs. A tail rate needs a denominator, and a denominator needs many
+runs, and a full run is 13 minutes.
+
+So the plan was a fast path: `benchmark.py --methods attribution` times only the
+three rows the conditional is built from (`fp16_sdpa`, `triton_fp16_control`,
+`fused_triton_4b`) and skips the other nine. Filtering happens *after*
+`build_cases`, so every replica is still allocated and the GPU sits in the same
+memory state — the intent was a faster run of the same experiment. 210 s against
+775 s.
+
+**It is not the same experiment, and the validation said so before it was used
+for anything.** Three subset runs against the three full ones:
+
+| ratio | ctx | full runs | subset runs |
+|---|---|---|---|
+| `quant_cold` | 8192 | 1.469–1.478 | **1.277–1.445** |
+| `split_only` | 8192 | 22.585–23.046 | **23.299–23.710** |
+
+Two of twelve ratios have ranges that miss the full-run range entirely, and the
+subset spread at the headline cell is 13% against 0.6%. Not a small effect on a
+number whose whole interval is 0.6% wide.
+
+**Nothing in the telemetry explains it.** SM clocks agree to 0.4%, mean power to
+0.3 W, mean temperature to 1 °C, sample counts per window are identical, and at
+ctx=8192 cold the memory clock is 11001 MHz in both. The rows still differ:
+`triton_fp16_control@8192` reads 31.4–32.1 µs against 32.6–32.8. Whatever the
+mechanism is, the clock monitor cannot see it, which is worth stating plainly
+rather than filing under "noise".
+
+### The excursion the study was looking for, on demand
+
+`sub3` produced **1.277x** at ctx=8192 — the historical number, to three
+decimals — with `fused_triton_4b@8192` sitting at **10334 MHz** instead of 11001.
+That is the same mechanism recorded when the 1.27x first appeared (9934 MHz
+then). The excursion is real, reproducible, and evidently made *more likely* by
+shortening the run.
+
+`clock_excursions.py` puts a rate on it. Across six runs it takes each
+(method, ctx, regime) cell's median memory clock and flags every observation
+sitting ≥3% below it:
+
+| group | runs | observations | excursions | rate | DRAM-resident ones |
+|---|---|---|---|---|---|
+| full | 3 | 72 | 2 | **2.8%** | **0** |
+| subset | 3 | 72 | 8 | **11.1%** | 1 |
+
+The last column is the one that matters. A memory P-state drop only costs time
+where the measurement is bandwidth-bound, and **in three full runs there were no
+DRAM-resident excursions at all**. That is why the three full runs agree to 0.6%
+at the cell that once read 1.27x: sustained work holds the clock up, and the
+shipped protocol supplies sustained work. Take three quarters of it away and the
+excursions come back.
+
+**The gate is not a P-state filter, and should not be described as one.** It
+rejected 4 of 10 excursions — including, usefully, the one that produced the
+1.277x. But it tests the SM clock and the timing's own dispersion and never
+looks at the memory clock, so it catches an excursion only through the
+dispersion the excursion happens to cause. A row that sits steadily in a lower
+P-state all window has a tight IQR and passes. (Gating on memory-clock stability
+was measured and rejected months of work ago, because it discards every
+DRAM-resident row.)
+
+### What this changes
+
+`--methods` stays. It is honest about itself — the JSON records it and
+`between_run.py` refuses to pool a filtered run with a full one — and it has
+turned out to be a good *excursion generator*, which is a more useful thing than
+the fast path it was written to be. What it cannot do is stand in for a full run,
+and the docstring now says so.
+
+The open item it was meant to serve is closed differently than expected. The
+tail rate under the shipped protocol is not "unknown pending ten more runs"; it
+is 0 of 72 DRAM-resident observations over three runs, with a mechanism that
+explains both the zero and the historical exception. Ten more runs would tighten
+that bound. They would not change what may be said today.
+
+### One near-miss worth recording
+
+The first version of `clock_excursions.py` used the *mode* as each cell's
+baseline, since P-states are discrete and the mode names the state a cell
+normally sits in. On several cells all six observations are distinct, so every
+count ties at one, and the tie-break toward the highest clock reported **4 of 6
+observations as excursions** against a baseline one run reached once — an
+"excursion rate" of 67% on a cell that was merely drifting. Switching to the
+median fixed it and dropped the totals from 15 excursions to 10.
+
+Caught by reading the output table and finding a 15.0% "drop" that looked
+implausible, not by a test. There is now a test named for it.
+
+`clock_excursions.py`, `--methods`, and eight new tests (24 total in
+`test_between_run.py`). 106 kernel tests pass.

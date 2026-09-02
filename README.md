@@ -512,6 +512,75 @@ is downgraded automatically, and `method.between_run_spread` audits the audit's
 own intervals — it reads `MISLEADING` when no between-run data exists at all,
 which is the state every previous version of this repo was in.
 
+### The tail, and the shortcut that didn't survive contact with it
+
+The section above ends on an admission: three runs bound the body of the
+run-to-run distribution and say nothing about its tail. The 1.27× that started
+the whole exercise never came back.
+
+Putting a rate on a tail needs many runs, and a full run is 13 minutes — so
+`benchmark.py --methods attribution` times only the three rows the conditional is
+built from and skips the other nine. Filtering happens after the cases are built,
+so every replica is still allocated and the GPU sits in the same memory state.
+210 s against 775 s. The intent was a faster run of the same experiment.
+
+**It is a different experiment, and validating it before using it is the only
+reason that is known.** Three subset runs against the three full ones:
+
+| ratio | ctx | full runs | subset runs |
+|---|---|---|---|
+| `quant_cold` | 8192 | 1.469–1.478 | **1.277–1.445** |
+| `split_only` | 8192 | 22.585–23.046 | **23.299–23.710** |
+
+Two of twelve ratios miss the full-run range entirely, and the spread at the
+headline cell is 13% against 0.6%. And nothing in the telemetry accounts for it:
+SM clocks agree to 0.4%, mean power to 0.3 W, temperature to 1 °C, sample counts
+are identical, and at ctx=8192 cold the memory clock is 11001 MHz in both — yet
+`triton_fp16_control@8192` reads 31.4–32.1 µs against 32.6–32.8. **How much work
+precedes a row changes its timing by ~2%, and the clock monitor cannot see it.**
+
+**The excursion came back on demand.** `sub3` produced 1.277× at ctx=8192 — the
+historical number to three decimals — with the fused row at **10334 MHz** instead
+of 11001, the same mechanism logged when it first appeared. So the tail is real,
+reproducible, and made more likely by removing work from the run.
+
+`clock_excursions.py` puts a rate on it. Across six runs it takes each
+(method, ctx, regime) cell's median memory clock and flags every observation
+sitting ≥3% below:
+
+| group | runs | observations | excursions | rate | DRAM-resident |
+|---|---|---|---|---|---|
+| full | 3 | 72 | 2 | **2.8%** | **0** |
+| subset | 3 | 72 | 8 | **11.1%** | 1 |
+
+The last column is the one that matters, because a memory P-state drop only costs
+time where the measurement is bandwidth-bound. **Under the shipped protocol there
+were no DRAM-resident excursions at all.** That is why three full runs agree to
+0.6% at the cell that once read 1.27×: sustained load holds the memory clock up,
+and a full run supplies sustained load.
+
+**The gate is not a P-state filter and should not be described as one.** It
+rejected 4 of the 10 excursions — including the one that produced the 1.277× —
+but it tests the SM clock and the timing's own dispersion, never the memory
+clock, so it catches an excursion only through the dispersion that excursion
+happens to cause. A row sitting steadily in a lower P-state all window has a
+tight IQR and passes. (Gating on memory-clock stability was tried and rejected
+earlier: it discards every DRAM-resident row.)
+
+`--methods` stays in the tree. It is honest about itself — the JSON records it,
+and `between_run.py` refuses to pool a filtered run with a full one — and it
+turned out to be a good excursion *generator*, which is more useful than the fast
+path it was written to be.
+
+One near-miss worth recording, since this repo's whole argument is that the
+apparatus is where the errors live: the first version of `clock_excursions.py`
+used each cell's *modal* clock as the baseline. On cells where all six
+observations are distinct every count ties at one, and a tie-break toward the
+highest clock reported **4 of 6 observations as excursions** against a baseline
+one run reached once. The median needs no tie-break. That was caught by reading
+the output and disbelieving a 15% "drop", not by a test — there is a test for it
+now.
+
 ### What the dispersion gate actually measures
 
 After the ramp fix, 9 of 48 rows fail the `IQR ≤ 5% of median` half of the gate — it was 23 before, and the analysis below is what the 23 looked like.
@@ -593,7 +662,7 @@ python -m venv .venv
 .venv/Scripts/python.exe -m pip install -r requirements.txt
 
 .venv/Scripts/python.exe -m pytest test_correctness.py -q   # 106 tests, ~89 s (GPU)
-.venv/Scripts/python.exe -m pytest test_between_run.py -q    # 16 tests, ~2 s (no GPU)
+.venv/Scripts/python.exe -m pytest test_between_run.py -q    # 24 tests, ~2 s (no GPU)
 .venv/Scripts/python.exe benchmark.py --quick                # ~75 s smoke run
 .venv/Scripts/python.exe benchmark.py --samples 50           # full suite, ~13 min
 .venv/Scripts/python.exe audit_claims.py                     # reads results/benchmark.json
@@ -613,6 +682,16 @@ done
 .venv/Scripts/python.exe audit_claims.py
 ```
 
+`--methods attribution` cuts a run to 210 s by timing only the three rows the
+conditional is built from. It is **not** a substitute for a full run — it is
+measurably shifted and four times more excursion-prone — but it is a good way to
+provoke the P-state excursion deliberately:
+
+```bash
+.venv/Scripts/python.exe benchmark.py --samples 50 --methods attribution --out results/tail/sub1.json
+.venv/Scripts/python.exe clock_excursions.py     --label full=results/runs/run1.json,results/runs/run2.json,results/runs/run3.json     --label subset=results/tail/sub1.json,results/tail/sub2.json,results/tail/sub3.json
+```
+
 On Windows, Triton needs an MSVC toolchain (Visual Studio 2022, MSVC 14.4x).
 On Linux, swap `triton-windows` for `triton==3.8.0`.
 
@@ -630,10 +709,11 @@ committed.
 | `kernels/fused_decode_attn.py` | the fused kernel. |
 | `kernels/fp16_decode_attn.py` | the control: identical shape, unquantized. Isolates the flash-decoding effect. |
 | `test_correctness.py` | 106 tests on the kernel, explicit asserted thresholds. |
-| `test_between_run.py` | 16 CPU-only tests on the between-run machinery, against synthetic runs with known answers. |
+| `test_between_run.py` | 24 CPU-only tests on the between-run and excursion machinery, against synthetic runs with known answers. |
 | `benchmark.py` | timing + memory. Rotating working set for the cold regime, CUDA-graph replay for the hot one. |
 | `audit_claims.py` | adversarial self-audit: bootstrap CIs over raw timings, attribution against the fp16 control, per-optimization claims with their own controls, and a clock-verification gate. |
 | `between_run.py` | what a bootstrap CI does not cover: compares N independent full runs, reports the run-to-run interval, the inflation over the single-run CI, and whether any verdict moved. |
+| `clock_excursions.py` | the rate at which a row drops a memory P-state, split by run protocol and regime, with the gate's verdict on each. |
 | `analyze_dispersion.py` | decomposes every rejected measurement into trend, tail and floor, so the gate is argued with rather than tuned. |
 | `sweep_group_size.py`, `probe_gs128.py` | the metadata-load sweep and the static PTX probe behind the gs=128 cliff. |
 | `make_plots.py` | the figures in `docs/plots/`, regenerated from `results/benchmark.json`. |

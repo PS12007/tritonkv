@@ -700,6 +700,39 @@ def merge_clock_records(records: list[dict]) -> dict:
 # ---------------------------------------------------------------------------
 
 
+# The three rows the L2-residency conditional is actually built from: the
+# PyTorch baseline, the fp16 control that isolates the flash-decoding split, and
+# the fused 4-bit kernel. Timing only these is a quarter of the work, which is
+# what makes it affordable to ask a question that needs many repetitions rather
+# than many samples -- "how often does a row land in a different memory P-state"
+# is a rate, and a rate needs a denominator.
+ATTRIBUTION_SET_NAME = "attribution"
+ATTRIBUTION_SET = ("fp16_sdpa", "triton_fp16_control", "fused_triton_4b")
+
+
+def select_methods(cases: list, spec: str | None) -> list:
+    """Filter built cases down to `spec`, or return them unchanged.
+
+    Filtering happens *after* `build_cases`, so every replica is still allocated
+    and the GPU sits in the same memory state as in a full run. Only the timing
+    loops are skipped. That costs a few seconds of allocation per context and
+    buys the thing that matters here: a filtered run is comparable to a full one
+    row for row.
+    """
+    if not spec:
+        return cases
+    wanted = ATTRIBUTION_SET if spec == ATTRIBUTION_SET_NAME else tuple(
+        m.strip() for m in spec.split(",") if m.strip())
+    have = {c.method for c in cases}
+    missing = [m for m in wanted if m not in have]
+    if missing:
+        raise SystemExit(
+            f"--methods names {missing} which this build produces no case for. "
+            f"Available: {', '.join(sorted(have))}"
+        )
+    return [c for c in cases if c.method in wanted]
+
+
 @dataclass
 class Case:
     method: str
@@ -1049,6 +1082,17 @@ def main():
                     help="interleaved measurement passes over the method list. "
                          "Defaults to 1 because 2 was measured and bought "
                          "nothing -- see the comment on the timing loop")
+    ap.add_argument("--methods", default=None,
+                    help="comma-separated method names to measure, or the "
+                         f"shorthand '{ATTRIBUTION_SET_NAME}' for the three rows "
+                         "the headline conditional is built from "
+                         f"({', '.join(ATTRIBUTION_SET)}). Every other method is "
+                         "built and allocated exactly as usual and then not "
+                         "timed, so a filtered run sits in the same memory and "
+                         "the same order as a full one -- it is a faster run of "
+                         "the same experiment, not a different experiment. "
+                         "Recorded in the JSON, and between_run.py refuses to "
+                         "pool runs whose method sets differ.")
     ap.add_argument("--quick", action="store_true")
     ap.add_argument("--no-tune", action="store_true")
     ap.add_argument("--no-clock-monitor", action="store_true",
@@ -1116,7 +1160,10 @@ def main():
           f"{'es' if passes != 1 else ''}, "
           f"L2 flush buffer = {flusher.nbytes / 1e6:.0f} MB):")
     for ctx in contexts:
-        cases = build_cases(shape, ctx, args.batch, args.group_size, tuned, l2_bytes)
+        cases = select_methods(
+            build_cases(shape, ctx, args.batch, args.group_size, tuned, l2_bytes),
+            args.methods,
+        )
         print(f"\n  --- context {ctx} ---")
         # `passes` measures the methods round-robin rather than one method to
         # completion. It defaults to 1, and the reason is worth keeping.

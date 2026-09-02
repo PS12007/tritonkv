@@ -21,7 +21,14 @@ Everything below is verified on this machine, not assumed.
 - `python between_run.py results/runs/run*.json` → seconds, writes
   `results/between_run.{md,json}`. `audit_claims.py` picks that file up
   automatically and reports the run-to-run interval next to every CI.
-  `python -m pytest test_between_run.py -q` → 16 CPU-only tests, ~2 s.
+- `python clock_excursions.py --label full=... --label subset=...` → seconds,
+  writes `results/clock_excursions.{md,json}`: the per-run-group rate of memory
+  P-state excursions and whether the gate rejected each one.
+- `python -m pytest test_between_run.py -q` → **24** CPU-only tests, ~2 s,
+  covering both of the above.
+- `python benchmark.py --methods attribution` → 210 s instead of 775 s, times
+  only the three rows the conditional is built from. **Not a substitute for a
+  full run** — see open item 3; it is measurably noisier and shifted.
 - The canonical `results/benchmark.json` is **run 3 of 3** — "the last one", a
   selection rule that cannot be gamed after the fact, and incidentally the least
   flattering of the three. The other two are in `results/runs/`, and the older
@@ -96,28 +103,40 @@ re-run it after any benchmark run without thinking about it:
    the current claim ("the win crossed the knee") does not depend on where
    exactly it is.
 
-3. **Characterise the tail of the run-to-run distribution, not just its body.**
-   Three runs settled the question this file used to lead with, and the answer
-   was reassuring: no verdict moved, and the honest interval is ~2.4× the
-   printed CI rather than an order of magnitude. But the 1.27× that motivated
-   the whole exercise did **not** reappear — `fused_triton_4b@8192` sat at
-   11001 MHz in all four subsequent runs, and the three new runs agree to 0.6%
-   at that cell. So the run-to-run distribution has a body of about ±1% and a
-   tail that moves a headline ratio by 15%, and three runs measure the body
-   while saying nothing about the tail.
+3. **The tail rate: answered, but only for the shipped protocol.**
+   `clock_excursions.py` puts a rate on P-state excursions across six runs. Under
+   the full protocol: **2 of 72 observations, and 0 of them DRAM-resident** —
+   which is the only regime where a memory P-state drop costs meaningful time.
+   That is why three full runs agree to 0.6% at the cell that once read 1.27×:
+   sustained work holds the memory clock up.
 
-   What would actually settle it: five to ten runs, unattended, recording only
-   the per-row mean memory clock and the four headline ratios (a `--clocks-only`
-   fast path, since the full run costs 13 min and most of it is not needed).
-   The question is not "what is the mean" — it is "how often does a row drop a
-   P-state", and that is a rate, so it needs a denominator. Worth doing before
-   any number here is quoted with a hard interval; not worth doing to move any
-   verdict, since none moved.
+   The cheap denominator this file used to ask for **does not exist**, and the
+   reason is a result rather than an obstacle. `benchmark.py --methods
+   attribution` is 3.7× faster (210 s vs 775 s) but is a *different and noisier
+   experiment*: 2 of 12 ratios land outside the full-run range entirely
+   (`quant_cold@8192` reads 1.277–1.445 against 1.469–1.478), and its excursion
+   rate is 11.1% against 2.8%. Take three quarters of the preceding work away
+   and the excursions come back — `sub3` reproduced the historical 1.277× exactly,
+   at 10334 MHz. The flag stays because it is a good excursion *generator* and
+   because `between_run.py` refuses to pool a filtered run with a full one.
 
-   Also unresolved and now measurable: `between_run.py` reports the correlation
-   between a row's between-run movement in time and in mean memory clock as
-   **r = +0.71** over 48 DRAM-resident rows. That confirms the P-state story
-   but leaves ~half the variance elsewhere. Nothing identifies what.
+   What is left here is genuinely optional: five to ten more **full** runs would
+   tighten "0 of 72" to a smaller upper bound on the DRAM-resident excursion
+   rate. That is 2 hours of wall clock to narrow a bound that already supports
+   everything this repo says. Do it before quoting a hard interval externally,
+   not before drawing any conclusion here.
+
+   **Still unexplained, and the most interesting loose end:** the subset runs
+   differ from the full runs on rows where *every monitored variable matches* —
+   SM clock to 0.4%, memory clock identical at 11001 MHz, power to 0.3 W,
+   temperature to 1 °C, same sample counts — and yet
+   `triton_fp16_control@8192` reads 31.4–32.1 µs against 32.6–32.8. Something
+   about how much work precedes a row changes its timing by ~2% and the clock
+   monitor cannot see it. Relatedly, `between_run.py` reports **r = +0.71**
+   between a row's between-run time movement and its memory-clock movement,
+   leaving about half the variance elsewhere. These are probably the same gap.
+   Candidates not yet tested: DVFS residency below the sampler's 109 ms period,
+   L2/TLB state left by preceding methods, and driver-side power budgeting.
 
 4. **2-bit still deserves a decision, not a table row.** Numerically unusable
    (rel L2 ≈ 0.7) under per-token grouping along `head_dim`. KIVI's result is

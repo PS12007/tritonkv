@@ -413,9 +413,12 @@ def main():
     payloads = [json.loads(Path(p).read_text(encoding="utf-8")) for p in args.runs]
     benches = [Bench(p) for p in payloads]
 
-    # Refuse to pool runs that were not the same experiment.
+    # Refuse to pool runs that were not the same experiment. `methods` is in
+    # here because `benchmark.py --methods` makes a run cheap enough to repeat
+    # many times, and a subset run pooled with a full one would compare rows
+    # measured under different amounts of preceding GPU work.
     sig = {(p["args"]["samples"], p["args"]["passes"], p["args"]["group_size"],
-            tuple(p["contexts"])) for p in payloads}
+            p["args"].get("methods"), tuple(p["contexts"])) for p in payloads}
     if len(sig) > 1:
         raise SystemExit(f"runs differ in configuration, refusing to pool: {sig}")
 
