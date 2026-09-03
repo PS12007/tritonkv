@@ -331,8 +331,8 @@ the 1.05× bar at no context in either regime).
 Current run against `results/benchmark.json` (2026-09-02 12:21, the third of
 three back-to-back full runs — "the last one" rather than "the best one", which
 is the only selection rule that cannot be gamed after the fact; it is also the
-run with the fewest quotable rows of the three): **69 claims — 26 TRUE / 20 TRUE
-BUT CONDITIONAL / 11 MISLEADING / 12 FALSE.** Eight claims moved from conditional to established when the clock
+run with the fewest quotable rows of the three): **70 claims — 26 TRUE / 20 TRUE
+BUT CONDITIONAL / 12 MISLEADING / 12 FALSE.** Eight claims moved from conditional to established when the clock
 ramp was fixed, and none of them because a threshold was relaxed.
 Regenerate with `./.venv/Scripts/python.exe audit_claims.py` (~20 s) and read
 `results/audit.md`. Two of those verdicts moved this session for reasons that
@@ -568,17 +568,26 @@ sitting ≥3% below:
 
 | group | runs | observations | excursions | rate | DRAM-resident |
 |---|---|---|---|---|---|
-| full | 3 | 72 | 2 | **2.8%** | **0** |
-| subset | 3 | 72 | 8 | **11.1%** | 1 |
+| `full` | 3 | 72 | 2 | **2.8%** | **0** |
+| `subset` | 3 | 72 | 9 | **12.5%** | 2 |
+| `preloaded` | 3 | 72 | 2 | **2.8%** | **0** |
+| `fullpre` | 3 | 72 | 5 | **6.9%** | 1 |
 
 The last column is the one that matters, because a memory P-state drop only costs
 time where the measurement is bandwidth-bound. **Under the shipped protocol there
-were no DRAM-resident excursions at all.** That is why three full runs agree to
-0.6% at the cell that once read 1.27×: sustained load holds the memory clock up,
-and a full run supplies sustained load.
+were no DRAM-resident excursions at all**, which is why three full runs agree to
+0.6% at the cell that once read 1.27×.
+
+The obvious reading of those first two rows — "sustained load holds the memory
+clock up, and a full run supplies it" — is what this repo said until the fourth
+protocol was run, and it is **too simple**. `fullpre` supplies more sustained load
+than any other protocol here (1080 s, 300 s of it pure saturation) and is the
+second-worst row in the table. The steady protocols are the two in the middle;
+the unsteady ones are the shortest and the longest. See *The measurement protocol
+is one of the variables* below.
 
 **The gate is not a P-state filter and should not be described as one.** It
-rejected 4 of the 10 excursions — including the one that produced the 1.277× —
+rejected 6 of the 18 excursions — including the one that produced the 1.277× —
 but it tests the SM clock and the timing's own dispersion, never the memory
 clock, so it catches an excursion only through the dispersion that excursion
 happens to cause. A row sitting steadily in a lower P-state all window has a
@@ -609,16 +618,65 @@ a row's mean memory clock by a median of +0.00% between its two passes.)
 
 **The prediction was wrong, and informatively so.** Preloading did not move the
 short runs toward the full runs; it moved them further in the same direction.
-Three runs per protocol, DRAM-resident, ctx=8192:
+That left two explanations confounded — every protocol timing more methods is
+also a longer run — so a fourth was added to separate them: the full method set
+*with* the preload. Three runs each, DRAM-resident, ctx=8192:
 
-| protocol | fp16 control | power | `quant_cold` |
-|---|---|---|---|
-| full (12 methods/ctx) | 32.61–32.78 µs | 74.2–74.6 W | **1.469–1.478** |
-| subset (3 methods/ctx) | 31.42–32.14 µs | 75.4–76.8 W | **1.277–1.445** |
-| subset + 300 s preload | 30.27–31.13 µs | 74.6–76.9 W | **1.395–1.402** |
+| protocol | methods | preload | fp16 control | power | `quant_cold` |
+|---|---|---|---|---|---|
+| `full` | 12 | — | 32.61–32.78 µs | 74.2–74.6 W | **1.469–1.478** |
+| `subset` | 3 | — | 31.42–32.14 µs | 75.4–76.8 W | **1.277–1.445** |
+| `preloaded` | 3 | 300 s | 30.27–31.13 µs | 74.6–76.9 W | **1.395–1.402** |
+| `fullpre` | 12 | 300 s | 30.29–32.03 µs | 75.1–76.8 W | **1.290–1.398** |
 
-The SM clock is 2761–2772 MHz in all three and the memory clock is 11001 MHz in
-all three. The control still moves 7.3%.
+The SM clock is 2761–2772 MHz across all four. The control still moves 7.3%.
+
+![The 2x2: run length or recent saturation](docs/plots/protocol_factorial.png)
+
+**The fourth cell settles it: what matters is recent saturation, not run
+length.** Cell medians and the effects that fall out of them:
+
+|             | no preload | 300 s preload |
+|-------------|-----------|---------------|
+| 3 methods   | 1.4217    | 1.3968 |
+| 12 methods  | **1.4755** | **1.3944** |
+
+Method count is worth **+3.8%** with no preload and **−0.2%** after one. Going
+from 3 methods to 12 is the whole of the original gap — until the memory system
+has been saturated, after which it does nothing at all. 300 s of saturating work
+does everything that 800 s of preceding measurement was doing. Run length was
+never the channel; it was a proxy for how much bandwidth had recently been
+pulled.
+
+This was **pre-registered**: the three candidate outcomes and their predicted
+values were committed before the runs (`a00d747`, and `docs/progress_log.md`).
+The prediction that landed was "recent saturation dominates", 1.3968 predicted
+against 1.3944 observed. Reported with it, because it is equally true: no effect
+is *resolved* against this repo's own conservative yardstick — the largest range
+any one cell shows across its own runs is 13.2%, set by `subset` — and that
+yardstick was fixed in advance and has not been moved since.
+
+**Where the memory clock does differ — and it is not where load predicts.**
+The earlier three-protocol comparison could say the memory clock was 11001 MHz
+throughout; with the fourth it cannot. Spread at this cell, and the rate at which
+a row drops a memory P-state:
+
+| protocol | wall | spread | excursions | DRAM-resident |
+|---|---|---|---|---|
+| `full` | 785 s | 0.6% | 2.8% | 0 |
+| `subset` | 205 s | 13.2% | 12.5% | 2 |
+| `preloaded` | 502 s | 0.6% | 2.8% | 0 |
+| `fullpre` | 1080 s | 8.4% | 6.9% | 1 |
+
+The two steady protocols are the 785 s one and the 502 s one; the two unsteady
+ones are the **shortest** and the **longest**. That is not monotone in load, and
+not in temperature either — 69.3 / 69.5 / 70.8 / 72.1 C on these rows, so the
+coolest protocol and the hottest are the two that misbehave. A two-mechanism
+reading fits (too little preceding work and the clock never comes up; too much
+and thermal pressure pulls it back down), but four protocols on one card with two
+free parameters is a description, not a test. It is on the open list, and it is
+the reason "sustained load holds the memory clock up" is no longer stated here
+without qualification.
 
 **What predicts the movement is achieved bandwidth.** Time each row's own
 DRAM-resident bytes against its own DRAM-resident time and the pattern is flat:
@@ -646,17 +704,19 @@ algorithm reading 4× the bytes — makes it the most protocol-sensitive row her
 
 Three things follow, and the second is the one that costs something.
 
-**The conditional survives.** No verdict changes. `quant_cold` at 8k is ≥1.39
+**The conditional survives.** No verdict changes. `quant_cold` at 8k has a median ≥1.39
 under every protocol, `quant_hot` is ≤0.82 under every protocol, and the
 L2-resident half is nearly protocol-immune (+2.3%) precisely because neither of
 its rows pulls much DRAM bandwidth.
 
-**The shipped protocol reports the most favourable number of the three.**
-`quant_cold@8192` is 1.475 under the full protocol and 1.397 under the preloaded
-one — 5.3% lower — against a between-run spread of 0.6% within the full protocol.
-That is a bias in the flattering direction and it is larger than the interval this
-repo has been quoting. The honest range for that cell across everything measured
-is **1.28–1.48**, not 1.469–1.478.
+**The shipped protocol reports the most favourable number of the four.**
+`quant_cold@8192` is 1.475 under the full protocol; the other three put it at
+1.394–1.422. That is a bias in the flattering direction, it is larger than the
+interval this repo has been quoting, and the 2x2 says why: `full` is the only one
+of the four that reaches this row without the memory system having recently been
+saturated. The honest range for that cell across everything measured is
+**1.28–1.48**, not 1.469–1.478, and three of the four protocols put its centre
+near 1.40.
 
 **"Hold everything fixed and vary only the kernel" now has a third thing that
 will not hold still.** The clock was the first, the power state the second, and
@@ -765,6 +825,23 @@ done
 .venv/Scripts/python.exe audit_claims.py
 ```
 
+The protocol itself is a variable, so the interval that matters spans protocols
+rather than repetitions. Three runs of each of the four (~2.5 h of wall clock),
+then the comparison:
+
+```bash
+.venv/Scripts/python.exe -u benchmark.py --samples 50 --preload 300 \
+    --out results/tail/fullpre1.json    # --methods attribution for the short ones
+.venv/Scripts/python.exe compare_protocols.py \
+    --label full=results/runs/run{1,2,3}.json \
+    --label subset=results/tail/{validate,sub2,sub3}.json \
+    --label preloaded=results/tail/pre{1,2,3}.json \
+    --label fullpre=results/tail/fullpre{3,4,5}.json
+```
+
+Nothing CPU-heavy should run while a benchmark is timing — see the session
+hygiene note in `docs/next_steps.md`.
+
 `--methods attribution` cuts a run to 210 s by timing only the three rows the
 conditional is built from. It is **not** a substitute for a full run — it is
 measurably shifted and four times more excursion-prone — but it is a good way to
@@ -772,7 +849,9 @@ provoke the P-state excursion deliberately:
 
 ```bash
 .venv/Scripts/python.exe benchmark.py --samples 50 --methods attribution --out results/tail/sub1.json
-.venv/Scripts/python.exe clock_excursions.py     --label full=results/runs/run1.json,results/runs/run2.json,results/runs/run3.json     --label subset=results/tail/sub1.json,results/tail/sub2.json,results/tail/sub3.json
+.venv/Scripts/python.exe clock_excursions.py \
+    --label full=results/runs/run1.json,results/runs/run2.json,results/runs/run3.json \
+    --label subset=results/tail/sub1.json,results/tail/sub2.json,results/tail/sub3.json
 ```
 
 On Windows, Triton needs an MSVC toolchain (Visual Studio 2022, MSVC 14.4x).
@@ -792,12 +871,12 @@ committed.
 | `kernels/fused_decode_attn.py` | the fused kernel. |
 | `kernels/fp16_decode_attn.py` | the control: identical shape, unquantized. Isolates the flash-decoding effect. |
 | `test_correctness.py` | 106 tests on the kernel, explicit asserted thresholds. |
-| `test_between_run.py` | 32 CPU-only tests on the between-run, excursion and protocol machinery, against synthetic runs with known answers. |
+| `test_between_run.py` | 47 CPU-only tests on the between-run, excursion and protocol machinery — including the 2x2 arithmetic and the design reader — against synthetic runs with known answers. |
 | `benchmark.py` | timing + memory. Rotating working set for the cold regime, CUDA-graph replay for the hot one. |
 | `audit_claims.py` | adversarial self-audit: bootstrap CIs over raw timings, attribution against the fp16 control, per-optimization claims with their own controls, and a clock-verification gate. |
 | `between_run.py` | what a bootstrap CI does not cover: compares N independent full runs, reports the run-to-run interval, the inflation over the single-run CI, and whether any verdict moved. |
 | `clock_excursions.py` | the rate at which a row drops a memory P-state, split by run protocol and regime, with the gate's verdict on each. |
-| `compare_protocols.py` | whether two measurement protocols produce the same numbers at all, and the bandwidth law that says which rows they will disagree on. |
+| `compare_protocols.py` | whether two measurement protocols produce the same numbers at all, the bandwidth law that says which rows they will disagree on, and the 2x2 that separates run length from recent saturation. |
 | `analyze_dispersion.py` | decomposes every rejected measurement into trend, tail and floor, so the gate is argued with rather than tuned. |
 | `sweep_group_size.py`, `probe_gs128.py` | the metadata-load sweep and the static PTX probe behind the gs=128 cliff. |
 | `make_plots.py` | the figures in `docs/plots/`, regenerated from `results/benchmark.json`. |

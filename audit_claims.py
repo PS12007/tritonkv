@@ -703,6 +703,7 @@ def downgrade(verdict: str, caveat: str) -> str:
 # interval next to its own, and a claim whose *verdict* changed between runs is
 # not allowed to be stated flatly.
 BETWEEN: dict[tuple[str, int, int], dict] = {}
+PROTOCOLS: dict = {}
 
 
 def load_between_run(path: Path) -> dict[tuple[str, int, int], dict]:
@@ -1232,6 +1233,152 @@ def audit_between_run() -> list[Claim]:
     ]
 
 
+# The protocol itself, as a source of uncertainty.
+#
+# `between_run.py` measures how much a ratio moves when the same protocol is
+# repeated. That is the second component of the uncertainty, after within-run
+# sampling noise. There is a third: the protocol is a choice, and this repo has
+# measured that changing it moves the headline ratio further than repeating it
+# does. A claim that stops at the run-to-run interval is therefore still quoting
+# an interval narrower than the number deserves, and this audits exactly that.
+
+
+def load_protocols(path: Path) -> dict:
+    """compare_protocols.py's output, if it has been produced. Absent is fine."""
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _worst_protocol_shift(payload: dict):
+    """The ratio whose point estimate the choice of protocol moves furthest."""
+    best = None
+    for r in payload.get("ratios") or []:
+        shifts = [abs(v) for v in (r.get("shift_from_base") or {}).values()
+                  if v is not None]
+        if not shifts:
+            continue
+        if best is None or max(shifts) > best[1]:
+            best = (r, max(shifts))
+    return best
+
+
+def audit_protocol() -> list[Claim]:
+    """Audit the run-to-run interval against what changing the protocol does.
+
+    The between-run measurement repeats one protocol. This asks the question one
+    level up -- whether the protocol that was repeated is itself a free variable
+    -- and it is a fair question precisely because the answer here was yes.
+    """
+    claim = ("The run-to-run interval on a ratio describes the uncertainty in "
+             "that ratio as a number quoted outside this repo.")
+    if not PROTOCOLS:
+        return [
+            Claim(
+                id="method.protocol_choice",
+                claim=claim,
+                verdict="MISLEADING",
+                evidence=(
+                    "It describes repeating one protocol, and the protocol is a choice "
+                    "nothing here has tested: `results/compare_protocols.json` is "
+                    "absent. On this card the choice has mattered more than the "
+                    "repetition -- timing 3 methods instead of 12 moved the "
+                    "DRAM-resident quantization ratio at ctx=8192 by 3.6% against a "
+                    "0.6% between-run spread. Run `benchmark.py` under at least two "
+                    "protocols and pass them to `compare_protocols.py`."
+                ),
+                falsification_attempted=(
+                    "Checked for the protocol comparison rather than assuming that a "
+                    "measurement repeated three times was a measurement whose "
+                    "conditions had been varied."
+                ),
+            )
+        ]
+
+    groups = PROTOCOLS.get("groups") or {}
+    base = next(iter(groups), "?")
+    ratios = PROTOCOLS.get("ratios") or []
+    disj = [r for r in ratios if any((r.get("disjoint_from_base") or {}).values())]
+    worst = _worst_protocol_shift(PROTOCOLS)
+
+    # The comparison that decides the verdict: how far the protocol moves the
+    # worst ratio, against how far repeating one protocol moves it.
+    within = None
+    if worst:
+        g = (worst[0].get("groups") or {}).get(base) or {}
+        if g.get("min") and g.get("max"):
+            within = g["max"] / g["min"] - 1.0
+
+    design = PROTOCOLS.get("design") or {}
+    fac = PROTOCOLS.get("factorial_ratios") or []
+    head = next((r for r in fac
+                 if r["name"] == "quant_cold" and r["ctx"] == 8192), None)
+
+    parts = [
+        f"{len(groups)} protocols compared over the same ratios "
+        f"(`compare_protocols.py`, reference `{base}`: "
+        + "; ".join(f"`{g}` = {len(v)} runs" for g, v in groups.items()) + "). "
+    ]
+    if disj:
+        parts.append(
+            f"{len(disj)} of {len(ratios)} ratios have a protocol whose range over "
+            f"its own runs misses `{base}`'s entirely, so the protocols are not "
+            "measuring the same thing. ")
+    else:
+        parts.append(
+            f"No ratio has a protocol whose range misses `{base}`'s, which is "
+            "consistent with the protocols agreeing but does not establish it. ")
+    if worst and within is not None:
+        r, sh = worst
+        parts.append(
+            f"The largest protocol shift is {sh:.1%} on `{r['name']}` at "
+            f"ctx={r['ctx']}, against a {within:.1%} spread across `{base}`'s own "
+            f"runs -- a factor of {sh / within:.1f} more than repeating the "
+            "protocol produces. " if within > 0 else "")
+
+    if design.get("cells") and head:
+        res = [k.replace("main_", "") for k, v in (head.get("resolved") or {}).items()
+               if v]
+        parts.append(
+            "The design is a complete 2x2, so the two confounded factors separate: "
+            f"at `quant_cold` ctx=8192 the preload is worth "
+            f"{head['main_preload']:+.1%}, the method count "
+            f"{head['main_methods']:+.1%}, and their interaction "
+            f"{head['interaction']:+.1%}, against a within-cell spread of "
+            f"{(head.get('noise') or 0):.1%}"
+            + (f" (resolved: {', '.join(res)}). " if res
+               else " (nothing resolved). "))
+    elif design.get("note"):
+        parts.append(
+            "The two candidate explanations for the shift -- run length and recent "
+            "saturation -- are still confounded here: " + design["note"] + ". ")
+
+    parts.append(
+        "The interval to quote outside this repo is the span across protocols, not "
+        "the span across repetitions of one.")
+
+    bad = bool(disj) or (worst and within and worst[1] > within)
+    return [
+        Claim(
+            id="method.protocol_choice",
+            claim=claim,
+            verdict="MISLEADING" if bad else "TRUE BUT CONDITIONAL",
+            evidence="".join(parts),
+            falsification_attempted=(
+                "The cheap move was to treat the shipped protocol as the definition "
+                "of the measurement, which makes the question unaskable and happens "
+                "to report this repo's most favourable value for the headline cell. "
+                "Running the benchmark under deliberately different protocols is the "
+                "only thing that can contradict it, so it was run under "
+                f"{len(groups)}."
+            ),
+        )
+    ]
+
+
 def audit_measurement(b: Bench) -> list[Claim]:
     """Were the timings taken on a GPU that was actually at boost clocks?"""
     cm = b.p.get("clock_monitoring")
@@ -1648,6 +1795,10 @@ def main():
                     help="output of between_run.py; used to report the run-to-run "
                          "interval next to each single-run CI. Absent is fine, and "
                          "is itself audited (method.between_run_spread).")
+    ap.add_argument("--protocols", default=str(RESULTS_DIR / "compare_protocols.json"),
+                    help="output of compare_protocols.py; used to report how far "
+                         "changing the measurement protocol moves a ratio. Absent "
+                         "is fine, and is itself audited (method.protocol_choice).")
     ap.add_argument("--check-bootstrap", action="store_true",
                     help="compare the vectorized bootstrap against the stdlib "
                          "reference on real rows, then exit")
@@ -1658,8 +1809,12 @@ def main():
         raise SystemExit(f"no benchmark results at {path} -- run `python benchmark.py` first")
     b = Bench(json.loads(path.read_text()))
 
-    global BETWEEN
+    global BETWEEN, PROTOCOLS
     BETWEEN = load_between_run(Path(args.between_run))
+    PROTOCOLS = load_protocols(Path(args.protocols))
+    if PROTOCOLS:
+        print(f"protocol comparison: {len(PROTOCOLS.get('groups') or {})} "
+              f"protocols ({args.protocols})")
     if BETWEEN:
         n_runs = len(next(iter(BETWEEN.values()))["runs"])
         print(f"between-run data: {len(BETWEEN)} ratios over {n_runs} runs "
@@ -1689,6 +1844,7 @@ def main():
     claims += audit_scope(b)
     claims += audit_measurement(b)
     claims += audit_between_run()
+    claims += audit_protocol()
     claims += audit_dispersion(b)
     if not args.no_gpu_checks:
         claims += gpu_checks(b)

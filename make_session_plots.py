@@ -632,6 +632,114 @@ def plot_dispersion(rows: list[dict]):
 # ---------------------------------------------------------------------------
 # Memory-clock gate (results/benchmark.json)
 # ---------------------------------------------------------------------------
+# The 2x2 (results/compare_protocols.json, written by compare_protocols.py)
+# ---------------------------------------------------------------------------
+
+
+# Written into docs/progress_log.md and committed as a00d747, before the runs
+# started. Kept here so the figure can draw the prediction against the result
+# rather than only the result.
+PREREG = {
+    "cell": ("quant_cold", 8192),
+    "full_median": 1.475,
+    "hypotheses": (
+        ("H1 run length", 1.475, "preload inert once the run is long"),
+        ("H2 additive", 1.449, "both factors, separable"),
+        ("H3 saturation", 1.397, "recent bandwidth is what matters"),
+    ),
+}
+
+CELL_LABEL = {"attribution": "3 methods", "all": "12 methods"}
+
+
+def _fac_cell(rec, methods, preload):
+    return rec["medians"][f"{methods}|{preload:g}"]
+
+
+def _fac_range(rec, methods, preload):
+    return rec["ranges"][f"{methods}|{preload:g}"]
+
+
+def plot_factorial(cmp_payload: dict):
+    """Which of the two confounded factors moves the headline ratio.
+
+    The left panel is an interaction plot: two lines that stay parallel mean the
+    preload does the same thing whatever else the run is doing, and the factors
+    can be reported separately. The pre-registered predictions sit on the same
+    axis, so the figure shows what was expected next to what happened.
+    """
+    fac = cmp_payload.get("factorial_ratios") or []
+    if not fac:
+        return False
+    name, ctx = PREREG["cell"]
+    head = next((r for r in fac if r["name"] == name and r["ctx"] == ctx), None)
+    if head is None:
+        return False
+
+    fig, axes = plt.subplots(1, 2, figsize=(13.4, 5.2),
+                            gridspec_kw={"width_ratios": [1, 1.25], "wspace": 0.30})
+    fig.subplots_adjust(top=0.80, bottom=0.16)
+
+    # --- left: the interaction plot at the headline cell --------------------
+    ax = axes[0]
+    xs = [0, 1]
+    for methods, colour, marker in (("attribution", S3, "o"), ("all", S1, "s")):
+        ys = [_fac_cell(head, methods, p) for p in (0.0, 300.0)]
+        rng = [_fac_range(head, methods, p) for p in (0.0, 300.0)]
+        err = [[y - lo for y, (lo, _) in zip(ys, rng)],
+               [hi - y for y, (_, hi) in zip(ys, rng)]]
+        ax.errorbar(xs, ys, yerr=err, color=colour, marker=marker, ms=7, lw=2.0,
+                    capsize=4, label=CELL_LABEL[methods], zorder=3)
+    # The predictions, as ticks just right of the preloaded column.
+    for label, val, _why in PREREG["hypotheses"]:
+        ax.plot([1.13], [val], marker="_", ms=16, color=INK2, lw=1.4, zorder=2)
+        ax.text(1.17, val, label, fontsize=8.0, color=INK2, va="center")
+    ax.set_xticks(xs)
+    ax.set_xticklabels(["no preload", "300 s preload"])
+    ax.set_xlim(-0.22, 1.62)
+    ax.legend(loc="lower right", fontsize=9, frameon=True, framealpha=0.95)
+    style(ax, f"{name} at ctx={ctx}",
+          subtitle="error bars span the three runs in each cell; ticks are the\n"
+                   "predictions committed before the runs",
+          ylabel="control / fused (x)")
+
+    # --- right: main effects against the noise they have to clear -----------
+    ax = axes[1]
+    order = sorted(fac, key=lambda r: (r["name"], r["ctx"]))
+    y = np.arange(len(order))
+    h = 0.36
+    ax.barh(y + h / 2, [r["main_preload"] * 100 for r in order], h,
+            color=S2, label="preload (300 s of ramp)")
+    ax.barh(y - h / 2, [r["main_methods"] * 100 for r in order], h,
+            color=S1, label="method count (3 -> 12)")
+    # The band an effect has to leave to be called resolved: the widest range any
+    # one cell shows across its own three runs.
+    for yi, r in zip(y, order):
+        n = (r["noise"] or 0.0) * 100
+        ax.add_patch(plt.Rectangle((-n, yi - 0.5), 2 * n, 1.0, color=MUTED,
+                                   alpha=0.22, lw=0, zorder=0))
+    ax.axvline(0, color=INK2, lw=1.0)
+    ax.set_yticks(y)
+    ax.set_yticklabels([f"{r['name']} {CTX_LABEL.get(r['ctx'], r['ctx'])}"
+                        for r in order], fontsize=8.0)
+    ax.invert_yaxis()
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.11), ncol=2,
+              fontsize=8.5, frameon=False)
+    style(ax, "Main effects, against each cell's own spread",
+          subtitle="grey band = widest within-cell range; an effect inside it is not resolved",
+          xlabel="effect on the ratio (%)")
+
+    figure_header(
+        fig,
+        "Separating run length from recent saturation",
+        "Three protocols varied both at once. The fourth cell -- the full method set\n"
+        "with the preload -- is what makes the two factors separable.",
+    )
+    save(fig, "protocol_factorial")
+    return True
+
+
+# ---------------------------------------------------------------------------
 
 
 def _window_rows(payload: dict) -> list[dict]:
@@ -767,6 +875,12 @@ def main():
     else:
         print("  (skipped dispersion_gate: no results/dispersion.json --"
               " run analyze_dispersion.py)")
+    cmp_ = _sweep(ROOT / "results" / "compare_protocols.json")
+    if not (cmp_ and plot_factorial(cmp_)):
+        print("  (skipped protocol_factorial: results/compare_protocols.json"
+              " has no complete 2x2 -- run benchmark.py --preload 300 with"
+              " the full method set, then compare_protocols.py with all"
+              " four --labels)")
     sweep = _sweep(ROOT / "results" / "gs_sweep.json")
     if sweep:
         plot_gs_saturation(sweep)

@@ -1184,3 +1184,116 @@ against an effect smaller than its own cell noise. One of them caught a real
 shadowing bug: `render` already used `cells` as a local for table rows, so the
 new parameter of that name was clobbered before it reached the section that
 needed it.
+
+## The fourth protocol: the answer is H3 (2026-09-02, night)
+
+The runs are in. The pre-registration above was committed as `a00d747`, before
+any of this existed, and the prediction it named is the one that happened.
+
+### The 2x2, at `quant_cold` ctx=8192
+
+|             | no preload        | 300 s preload     |
+|-------------|-------------------|-------------------|
+| 3 methods   | `subset` **1.4217** | `preloaded` **1.3968** |
+| 12 methods  | `full` **1.4755**   | `fullpre` **1.3944**   |
+
+Predicted: H1 1.4755, H2 1.4496, **H3 1.3968**. Observed: **1.3944** — 0.2% from
+H3, 3.8% from H2, 5.5% from H1.
+
+**Recent saturation dominates; run length does not.** The simple effects say it
+more precisely than the headline does:
+
+| effect | value |
+|---|---|
+| preload, at 3 methods | −1.8% |
+| preload, at 12 methods | **−5.5%** |
+| method count, with no preload | **+3.8%** |
+| method count, after the preload | **−0.2%** |
+
+Read the last two together. Without the preload, going from 3 methods to 12 is
+worth +3.8% — which is the whole of the original `full`-vs-`subset` gap and the
+reason "longer runs read higher" looked like the explanation. **After the
+preload, method count is worth −0.2%: it stops mattering entirely.** Saturating
+the memory system for 300 s does everything that 800 s of preceding measurement
+was doing, and then some. Run length was never the channel; it was a proxy for
+how much bandwidth had recently been pulled.
+
+So `full`'s 1.4755 is not what a long run reads. It is what a run reads when the
+memory subsystem has *not* recently been saturated — and the shipped protocol is
+the only one of the four in that state by the time it reaches this row.
+
+### What this does not establish
+
+The effects are **not resolved** against this file's own yardstick, and that has
+to be said plainly rather than buried. `factorial_effects` calls an effect
+resolved only when it exceeds the largest range any single cell shows across its
+own three runs, and at this cell that yardstick is **13.2%** — set by `subset`,
+whose three runs span 1.2770–1.4451. Every effect in the table is smaller than
+that. By the conservative test, nothing here is resolved.
+
+Both statements are true at once: the pre-registered point prediction was hit to
+0.2%, and the conservative interval test does not clear it. The yardstick was
+chosen before the data and is not being changed after it — that is the entire
+value of having fixed it in advance. What *does* separate the protocols is the
+test this file has used all along: **`fullpre`'s range misses `full`'s
+entirely** at this cell, as do `subset`'s and `preloaded`'s.
+
+The pre-registered secondary prediction also held: the bandwidth law survives
+being repointed at the new pair, **r = +0.70** for `fullpre` vs `full`, against
++0.84 for `preloaded` and +0.85 for `subset`.
+
+### The surprise: which protocols are noisy
+
+The within-cell spreads at this cell are not what "more sustained load is
+steadier" predicts:
+
+| protocol | methods | preload | wall | spread | excursion rate | DRAM-resident |
+|---|---|---|---|---|---|---|
+| `full`      | 12 | 0 s   | 785 s  | 0.6%  | 2.8%  | 0 |
+| `subset`    | 3  | 0 s   | 205 s  | 13.2% | 12.5% | 2 |
+| `preloaded` | 3  | 300 s | 502 s  | 0.6%  | 2.8%  | 0 |
+| `fullpre`   | 12 | 300 s | 1080 s | 8.4%  | 6.9%  | 1 |
+
+The two tight protocols are the 785 s one and the 502 s one. The two noisy ones
+are the *shortest* (205 s) and the *longest* (1080 s). That is not monotone in
+load, and it is not monotone in temperature either — mean temperature on the
+attribution rows runs 69.3 C (`subset`), 69.5 C (`full`), 70.8 C (`preloaded`),
+72.1 C (`fullpre`), so the coolest protocol and the hottest are the two that
+misbehave.
+
+A two-mechanism reading fits — too little preceding work and the memory clock
+never comes up, too much and thermal pressure pulls it back down — and it is
+worth writing down as a hypothesis. It is **not** established here: four
+protocols, one card, and a story with two free parameters is a description, not
+a test. It is on the open list, not in the README.
+
+### A methodological correction, and what it cost
+
+Two `fullpre` runs were discarded and re-measured because CPU-heavy analysis
+(numpy bootstraps, `pytest`) had been run *concurrently with the timing loop*.
+The suspicion was that descheduling the submitting thread let the GPU idle into
+a lower memory P-state, which would have forged exactly the signal under test.
+
+The re-measurement settled it, and **the suspicion was wrong**: the discarded
+`fullpre1` read 1.2783 at 10144 MHz, and the clean `fullpre3` reads 1.2901 at
+10232 MHz. The contaminated pair sits inside the clean distribution. The
+excursions are a property of the `fullpre` protocol, not of the contention. The
+runs are kept in `results/tail/contaminated/` rather than deleted, because a
+discarded measurement that turns out to agree is evidence about the discarding
+rule. Re-running was still right: at the time the two could not be told apart,
+and an hour of wall clock is cheap against publishing a number whose cause is
+unknown.
+
+### Code and record
+
+`compare_protocols.py` renders the 2x2, the simple effects and a per-protocol
+bandwidth correlation. `clock_excursions.py` now has four groups.
+`audit_claims.py` gained `method.protocol_choice` — the counterpart to
+`method.between_run_spread`, reading MISLEADING when the protocol comparison is
+absent, and MISLEADING now because it is present and says the protocols
+disagree. **70 claims: 26 TRUE / 20 CONDITIONAL / 12 MISLEADING / 12 FALSE.**
+New figure `docs/plots/protocol_factorial.png`. `test_between_run.py`: 47 tests.
+
+**What the repo should quote for `quant_cold@8192`: 1.28–1.48**, unchanged as a
+range — but the centre of it has moved. Three of the four protocols put the cell
+at 1.39–1.42. Only `full`, the shipped one, says 1.475.

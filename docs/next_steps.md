@@ -21,11 +21,17 @@ Everything below is verified on this machine, not assumed.
 - `python between_run.py results/runs/run*.json` → seconds, writes
   `results/between_run.{md,json}`. `audit_claims.py` picks that file up
   automatically and reports the run-to-run interval next to every CI.
+- `python compare_protocols.py --label full=... --label subset=... --label
+  preloaded=... --label fullpre=...` → ~4 min (bootstrap over 4 groups),
+  writes `results/compare_protocols.{md,json}`: per-protocol ranges, the
+  disjointness flag, the bandwidth correlation per protocol, and the 2x2
+  decomposition. Reads each run's protocol from its own recorded `args`.
 - `python clock_excursions.py --label full=... --label subset=...` → seconds,
   writes `results/clock_excursions.{md,json}`: the per-run-group rate of memory
   P-state excursions and whether the gate rejected each one.
-- `python -m pytest test_between_run.py -q` → **24** CPU-only tests, ~2 s,
-  covering both of the above.
+- `python -m pytest test_between_run.py -q` → **47** CPU-only tests, ~7 s,
+  covering `between_run.py`, `clock_excursions.py` and `compare_protocols.py`
+  (including the 2x2 arithmetic and the design reader).
 - `python benchmark.py --methods attribution` → 210 s instead of 775 s, times
   only the three rows the conditional is built from. **Not a substitute for a
   full run** — see open item 3; it is measurably noisier and shifted.
@@ -34,7 +40,9 @@ Everything below is verified on this machine, not assumed.
   flattering of the three. The other two are in `results/runs/`, and the older
   interleaved (`--passes 2`) run is kept as `results/benchmark_interleaved.json`.
 - `python make_plots.py` → 8 figures in `docs/plots/`;
-  `python make_session_plots.py` → 6 more (2 need `results/gs_sweep.json`).
+  `python make_session_plots.py` → 7 more (2 need `results/gs_sweep.json`,
+  and `protocol_factorial` needs a complete 2x2 in
+  `results/compare_protocols.json`).
 - `python sweep_group_size.py --contexts 512 2048 8192` → ~3.5 min, 24 cells,
   writes `results/gs_sweep.json`. `python probe_gs128.py` → static PTX counts,
   no timing, seconds.
@@ -58,8 +66,9 @@ property of the kernel.
 ## Do this first
 
 Nothing is blocking. `results/audit.{md,json}` are current (regenerated
-2026-09-02 against run 3 with the between-run data loaded, **69 claims: 26 TRUE /
-20 CONDITIONAL / 11 MISLEADING / 12 FALSE**), and the audit takes ~20 s, so
+2026-09-02 against run 3 with the between-run and protocol data loaded,
+**70 claims: 26 TRUE / 20 CONDITIONAL / 12 MISLEADING / 12 FALSE**), and the
+audit takes ~20 s, so
 re-run it after any benchmark run without thinking about it:
 
 ```
@@ -153,11 +162,42 @@ re-run it after any benchmark run without thinking about it:
    survives, but the interval this repo quotes for that cell is too narrow and
    the README now says so.
 
-   Still open: `fused_triton_4b@16k` runs 2.0% faster on +0.2% power and fits
-   neither the power story nor cleanly into the bandwidth one, and the r=+0.84
-   leaves ~30% of the variance unaccounted. A fourth protocol (e.g. 12 methods
-   with the preload) would separate "number of methods" from "recent saturation"
-   — the two are confounded in what has been run so far.
+   **The fourth protocol has been run, and the answer is "recent saturation"
+   (2026-09-02, night).** `benchmark.py --samples 50 --preload 300` with the full
+   method set, three clean runs, completes the 2x2. At `quant_cold@8192` the
+   cells read `subset` 1.4217 / `preloaded` 1.3968 / `full` 1.4755 / `fullpre`
+   **1.3944** — 0.2% from the pre-registered H3, 5.5% from H1.
+
+   The simple effects are the finding: method count is worth **+3.8%** with no
+   preload and **−0.2%** after one. Saturating the memory system for 300 s does
+   everything 800 s of preceding measurement was doing, so run length was never
+   the channel — only a proxy for recently-pulled bandwidth. The shipped `full`
+   protocol's 1.4755 is what a run reads when the memory subsystem has *not*
+   recently been saturated, and it is the only one of the four in that state.
+
+   Reported honestly: **no effect is "resolved"** against this file's own
+   yardstick (the largest within-cell range, 13.2%, set by `subset`). The
+   pre-registered point prediction was hit to 0.2% and the conservative interval
+   test does not clear it; both are true, and the yardstick was fixed before the
+   data and has not been moved since. What does separate them is the usual test —
+   `fullpre`'s range misses `full`'s entirely. Bandwidth law survives repointing:
+   r = +0.70 for `fullpre` vs `full`.
+
+   Still open, and now sharper:
+
+   - **Why the shortest and the longest protocols are the noisy ones.** Spreads
+     at `quant_cold@8192` are `full` 0.6%, `subset` 13.2%, `preloaded` 0.6%,
+     `fullpre` 8.4%; excursion rates 2.8% / 12.5% / 2.8% / 6.9%. That is not
+     monotone in load or in temperature (69.3 / 69.5 / 70.8 / 72.1 C — the
+     coolest protocol and the hottest are the two that misbehave). A
+     two-mechanism story fits (too little preceding work and the clock never
+     comes up; too much and thermal pressure pulls it down) but four protocols
+     and two free parameters is a description, not a test. A temperature sweep
+     at fixed protocol would be the actual experiment.
+   - `fused_triton_4b@16k` still fits neither story.
+   - The r values leave ~30-50% of the variance unaccounted.
+
+   Do **not** re-run the confounded comparison: the 2x2 supersedes it.
 
 4. **2-bit still deserves a decision, not a table row.** Numerically unusable
    (rel L2 ≈ 0.7) under per-token grouping along `head_dim`. KIVI's result is
@@ -229,6 +269,36 @@ re-run it after any benchmark run without thinking about it:
   measurement, which is what the ramp work did.
 
 ## Session hygiene note
+
+**Do not run analysis on the CPU while `benchmark.py` is timing.** Learned the
+expensive way on 2026-09-02, during the fourth-protocol runs. Numpy bootstraps
+(`audit_claims.py`, `compare_protocols.py`), `pytest` and `analyze_dispersion.py`
+were run alongside a benchmark; the run came back with a memory P-state
+excursion on `fused_triton_4b@8192` (10144 MHz against a cell median of 11001)
+that pulled `quant_cold@8192` down to 1.278 -- below every hypothesis the
+experiment had pre-registered.
+
+The mechanism is the one this repo already knows about, arriving from a new
+direction: the timing loop has to keep the GPU saturated, and a multi-core
+bootstrap that deschedules the submitting thread lets the GPU idle long enough
+to drop a P-state. The DRAM-resident rows are exactly the ones that care. What
+makes it worse than noise is that it is *indistinguishable from the effect under
+test* -- the whole question was whether the protocol changes the memory
+subsystem's state.
+
+Two runs were discarded and re-measured; they are kept in
+`results/tail/contaminated/` because they are a clean demonstration of the
+effect. While a run is in flight, restrict yourself to file reads, greps and
+markdown edits.
+
+Two Windows process facts from the same incident: stopping a background *task*
+kills the tracked shell and not its descendants -- the `sh.exe` driver loop and
+its `benchmark.py` child kept running and launched the next run -- and
+`Stop-Process` is refused by the auto-mode classifier, so there may be no way to
+end a run early. Check with `Get-CimInstance Win32_Process -Filter
+"Name='python.exe' or Name='sh.exe'"` before assuming a kill took, and prefer
+letting a run finish over starting anything that would overlap it.
+
 
 A Claude Code session in this directory once survived its terminal being closed
 and kept writing files while a second session worked in the same tree. If files

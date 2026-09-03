@@ -211,7 +211,20 @@ unrealistically easy input for a quantizer.
    `between_run.py` now measures this and `audit_claims.py` reports it on every
    per-context claim.
 
-**All eight are apparatus. None is a bug in the kernel.** That count is the most
+9. **The measurement protocol was a free variable (2026-09-02).** Even the
+   run-to-run interval is an interval over repetitions of *one* protocol. Run
+   the same benchmark under four — 3 or 12 methods per context, crossed with
+   0 or 300 s of saturating preload — and `quant_cold@8192` reads 1.4755 /
+   1.4217 / 1.3968 / 1.3944. The shipped protocol reports the highest of the
+   four, and its range misses the other three entirely. The 2x2 says what the
+   channel is: method count is worth +3.8% with no preload and **−0.2%** after
+   one, so run length was only ever a proxy for recently-pulled bandwidth. This
+   one was **pre-registered** — the three candidate outcomes and their values
+   were committed before the runs — and the prediction that landed was hit to
+   0.2%. `compare_protocols.py` measures it; `audit_claims.py` carries it as
+   `method.protocol_choice`.
+
+**All nine are apparatus. None is a bug in the kernel.** That count is the most
 transferable thing in this repo: on a thermally-limited consumer part the
 measurement is harder than the optimization, and every one of these corrections
 moved a number that had already been written down as a result.

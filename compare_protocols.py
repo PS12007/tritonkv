@@ -317,6 +317,8 @@ def factorial_effects(per_cell, levels):
                      for k, v in eff.items()},
         "medians": {f"{m}|{pp:g}": statistics.median(v)
                     for (m, pp), v in per_cell.items()},
+        "ranges": {f"{m}|{pp:g}": [min(v), max(v)]
+                   for (m, pp), v in per_cell.items()},
     }
 
 
