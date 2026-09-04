@@ -1430,3 +1430,104 @@ def test_load_bandwidth_law_round_trips(tmp_path):
     f = tmp_path / "bw.json"
     f.write_text(json.dumps(_bwlaw_report()), encoding="utf-8")
     assert audit_claims.load_bandwidth_law(f)["n_positive"] == 2
+
+
+# ---------------------------------------------------------------------------
+# The rival-predictor check
+# ---------------------------------------------------------------------------
+
+
+def _rows_with_time(spec) -> list[dict]:
+    """(method, ctx, gb_s, base_ms, shift) -- `base_ms` is what lets the rival
+    check derive bytes moved without a second input file."""
+    return [{"method": m, "ctx": c, "gb_s": g, "base_ms": t, "shift": s}
+            for m, c, g, t, s in spec]
+
+
+def test_bandwidth_wins_when_bandwidth_is_the_truth():
+    rows = _rows_with_time([("A", c, g, 1.0, g * 1e-4)
+                            for c, g in zip((512, 2048, 8192, 16384),
+                                            (10, 60, 120, 200))]
+                           + [("B", c, g, 1.0, g * 1e-4)
+                              for c, g in zip((512, 2048, 8192, 16384),
+                                              (30, 90, 150, 240))])
+    best = bandwidth_law.rival_predictors(rows)[0]
+    assert best["predictor"] == "achieved GB/s"
+    assert best["residual_sd_pp"] < 1e-6      # an exact line
+
+
+def test_a_better_predictor_is_reported_when_there_is_one():
+    """If the sensitivity really tracked time rather than bandwidth, this check
+    has to say so -- otherwise it is decoration. Bandwidth is held nearly flat
+    while time carries the signal."""
+    gbs = [100, 101, 99, 102, 100, 101, 99, 102]
+    times = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+    rows = _rows_with_time([("A" if i < 4 else "B", 512 * (i + 1), g, t, t * 1e-3)
+                            for i, (g, t) in enumerate(zip(gbs, times))])
+    ranked = bandwidth_law.rival_predictors(rows)
+    assert ranked[0]["predictor"] != "achieved GB/s"
+    names = [d["predictor"] for d in ranked]
+    assert names.index("time") < names.index("achieved GB/s")
+
+
+def test_a_rival_that_wins_everywhere_is_named():
+    gbs = [100, 101, 99, 102, 100, 101, 99, 102]
+    times = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+    rows = _rows_with_time([("A" if i < 4 else "B", 512 * (i + 1), g, t, t * 1e-3)
+                            for i, (g, t) in enumerate(zip(gbs, times))])
+    rep = bandwidth_law.build({"bandwidth_sensitivity":
+                               {p: {"rows": rows} for p in ("p1", "p2")},
+                               "telemetry": []})
+    assert rep["rival_beats_bandwidth_everywhere"]
+
+
+def test_a_rival_winning_under_one_protocol_only_is_not_adopted():
+    """One protocol out of three is a coin landing heads, and the report has to
+    treat it that way."""
+    true_bw = _rows_with_time([("A", c, g, 1.0, g * 1e-4)
+                               for c, g in zip((512, 2048, 8192, 16384),
+                                               (10, 60, 120, 200))]
+                              + [("B", c, g, 1.0, g * 1e-4)
+                                 for c, g in zip((512, 2048, 8192, 16384),
+                                                 (30, 90, 150, 240))])
+    # one protocol where a squared term happens to fit better
+    curved = _rows_with_time([(r["method"], r["ctx"], r["gb_s"], r["base_ms"],
+                               (r["gb_s"] ** 2) * 1e-7) for r in true_bw])
+    rep = bandwidth_law.build({"bandwidth_sensitivity":
+                               {"p1": {"rows": true_bw}, "p2": {"rows": true_bw},
+                                "p3": {"rows": curved}},
+                               "telemetry": []})
+    assert rep["rival_beats_bandwidth_everywhere"] == []
+    assert rep["rival_wins"]                       # but it is still reported
+    md = bandwidth_law.render(rep)
+    assert "Reported, not adopted." in md
+
+
+def test_the_rival_table_lists_every_predictor_for_every_protocol():
+    rows = _rows_with_time([("A", c, g, 1.0, g * 1e-4)
+                            for c, g in zip((512, 2048, 8192, 16384),
+                                            (10, 60, 120, 200))]
+                           + [("B", c, g, 2.0, g * 1e-4)
+                              for c, g in zip((512, 2048, 8192, 16384),
+                                              (30, 90, 150, 240))])
+    rep = bandwidth_law.build({"bandwidth_sensitivity":
+                               {p: {"rows": rows} for p in ("p1", "p2")},
+                               "telemetry": []})
+    md = bandwidth_law.render(rep)
+    for name in ("achieved GB/s", "bytes moved", "log time"):
+        assert name in md
+
+
+def test_the_rival_check_degrades_without_base_ms():
+    """A report written before `base_ms` was recorded still gets the
+    bandwidth-shape comparison rather than an exception."""
+    rows = [{"method": "A", "ctx": c, "gb_s": g, "shift": g * 1e-4}
+            for c, g in zip((512, 2048, 8192, 16384), (10, 60, 120, 200))]
+    names = [d["predictor"] for d in bandwidth_law.rival_predictors(rows)]
+    assert "achieved GB/s" in names
+    assert "time" not in names and "bytes moved" not in names
+    # ...and with it, the time-derived rivals come back
+    for r, t in zip(rows, (1.0, 2.0, 3.0, 4.0)):
+        r["base_ms"] = t
+    names = [d["predictor"] for d in bandwidth_law.rival_predictors(rows)]
+    assert "time" in names and "bytes moved" in names

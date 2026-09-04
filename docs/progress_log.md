@@ -1510,3 +1510,32 @@ not be worth printing.
 
 **72 claims: 26 TRUE / 22 CONDITIONAL / 12 MISLEADING / 12 FALSE.** No existing
 verdict moved. `test_between_run.py`: 87 → **94**.
+
+
+### And bandwidth is the best of the obvious predictors
+
+The natural follow-up to "why does the control misfit" is "is bandwidth even the
+right axis". `bandwidth_law.py` fits |shift| against seven candidates derivable
+from the same file — bandwidth, its square and its log, bytes moved, log bytes,
+time, log time. Bandwidth has the smallest residual spread under `preloaded`
+(1.12 pp) and `fullpre` (1.02) and is second under `subset` (1.44). Bytes moved
+(2.25 / 1.95 / 1.41), time and their logs are all clearly worse. **Nothing beats
+bandwidth under every protocol.**
+
+`GB/s squared` wins under `subset` alone — 0.95 against 1.44 — and loses under
+the other two. On twelve points that is what a coin landing heads looks like, so
+it is reported and **not adopted**; the report says so in those words.
+
+The framing matters more than the table. Bandwidth was the *hypothesis*, fixed
+before this comparison existed, so this is a robustness check and not a selection
+procedure — picking the best of seven predictors on twelve points is precisely
+how a spurious one gets chosen, and a table like this can manufacture a finding
+if it is read the other way round.
+
+So the control's misfit is not bytes moved, not footprint, and not time. It stays
+open, and it is a better-posed question than the one it replaced.
+
+The rival check **degrades rather than fails** when `base_ms` is absent: an older
+`compare_protocols.json` gets the bandwidth-shape comparison and loses only the
+time-derived rivals. There is a test for that. `test_between_run.py`: 94 →
+**100**.

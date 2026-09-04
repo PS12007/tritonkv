@@ -111,6 +111,57 @@ def decompose(rows: list[dict]) -> dict:
     return {"within": within, "between": between, "between_monotone": monotone}
 
 
+# Everything here is derived from `gb_s` and `base_ms`, which are both already in
+# `compare_protocols.json` -- bytes moved is bandwidth times time. Keeping the
+# script single-input means it cannot silently disagree with the file it is
+# auditing about what a row's footprint was.
+def _predictors(rows: list[dict]) -> dict:
+    gb = np.array([r["gb_s"] for r in rows], dtype=float)
+    out = {
+        "achieved GB/s": gb,
+        "GB/s squared": gb ** 2,
+        "log GB/s": np.log(gb),
+    }
+    # `base_ms` is what makes the time-derived rivals possible. A report written
+    # before it was recorded still gets the bandwidth-shape comparison rather
+    # than an exception -- the check degrades, it does not fail.
+    if all("base_ms" in r for r in rows):
+        ms = np.array([r["base_ms"] for r in rows], dtype=float)
+        by = gb * ms  # proportional to bytes moved; the constant does not affect r
+        out.update({
+            "bytes moved": by,
+            "log bytes moved": np.log(by),
+            "time": ms,
+            "log time": np.log(ms),
+        })
+    return out
+
+
+def rival_predictors(rows: list[dict]) -> list[dict]:
+    """Does anything else predict protocol sensitivity better than bandwidth?
+
+    Bandwidth was the *hypothesis*, chosen before this comparison existed, so
+    this is a robustness check and not a selection procedure -- which matters,
+    because picking the best of seven predictors on twelve points is exactly how
+    a spurious one gets chosen. A rival that wins under one protocol and loses
+    under the other two is what a chance win looks like, and is reported that way
+    rather than adopted.
+    """
+    P = _predictors(rows)
+    y = np.array([abs(r["shift"]) for r in rows], dtype=float) * 100.0
+    out = []
+    for name, x in P.items():
+        if x.std() == 0:
+            continue
+        slope, intercept = np.polyfit(x, y, 1)
+        resid = y - (slope * x + intercept)
+        out.append({"predictor": name,
+                    "abs_r": abs(pearson(x, y)),
+                    "residual_sd_pp": float(resid.std())})
+    out.sort(key=lambda d: d["residual_sd_pp"])
+    return out
+
+
 def residuals(rows: list[dict]) -> list[dict]:
     """Per-row residual against the fitted |shift| ~ bandwidth line."""
     gb = np.array([r["gb_s"] for r in rows], dtype=float)
@@ -158,6 +209,7 @@ def build(payload: dict) -> dict:
             "loo": leave_one_out(rows),
             "decomposition": decompose(rows),
             "residuals": residuals(rows),
+            "rivals": rival_predictors(rows),
         }
 
     # The sign test: every (method, protocol) pair whose bandwidth actually
@@ -187,8 +239,20 @@ def build(payload: dict) -> dict:
     for d in misfit:
         by_method.setdefault(d["method"], []).append(d["mean_abs_residual_pp"])
 
+    # A rival only counts as beating bandwidth if it does so under every
+    # protocol. One protocol out of three is a coin landing heads.
+    rival_wins: dict[str, int] = {}
+    for block in per_protocol.values():
+        best = block["rivals"][0]["predictor"]
+        if best != "achieved GB/s":
+            rival_wins[best] = rival_wins.get(best, 0) + 1
+    n_protocols = len(per_protocol)
+
     return {
         "protocols": protocols,
+        "rival_wins": rival_wins,
+        "rival_beats_bandwidth_everywhere": [
+            k for k, v in rival_wins.items() if v == n_protocols],
         "per_protocol": per_protocol,
         "within_method_looks": looks,
         "n_looks": len(looks),
@@ -247,6 +311,39 @@ def render(rep: dict) -> str:
     L.append("By method: " + ", ".join(
         f"`{m}` {v:.2f} pp" for m, v in sorted(rep["misfit_by_method"].items(),
                                                key=lambda kv: -kv[1])) + ".")
+    L += ["", "## Does anything predict better than bandwidth?", "",
+          "Residual spread around a straight-line fit, lower is better. Bandwidth "
+          "was the hypothesis, fixed before this table existed, so this is a "
+          "robustness check rather than a search -- best-of-seven on twelve points "
+          "is how a spurious predictor gets picked.", ""]
+    heads = list(rep["per_protocol"])
+    L.append("| predictor | " + " | ".join(f"`{h}`" for h in heads) + " |")
+    L.append("|---" * (len(heads) + 1) + "|")
+    order = [d["predictor"] for d in
+             next(iter(rep["per_protocol"].values()))["rivals"]]
+    for name in order:
+        cells = []
+        for h in heads:
+            hit = next((d for d in rep["per_protocol"][h]["rivals"]
+                        if d["predictor"] == name), None)
+            cells.append(f"{hit['residual_sd_pp']:.2f}" if hit else "--")
+        mark = "**" if name == "achieved GB/s" else ""
+        L.append(f"| {mark}{name}{mark} | " + " | ".join(cells) + " |")
+    L.append("")
+    beats = rep["rival_beats_bandwidth_everywhere"]
+    if beats:
+        L.append(f"**{', '.join(beats)} beats achieved bandwidth under every "
+                 f"protocol.** That is not a chance win and the law should be "
+                 f"restated in those terms.")
+    elif rep["rival_wins"]:
+        L.append("Rivals that win under *some* protocol but not all: "
+                 + ", ".join(f"`{k}` ({v}/{len(heads)})"
+                             for k, v in rep["rival_wins"].items())
+                 + ". Reported, not adopted.")
+    else:
+        L.append("Achieved bandwidth has the smallest residual spread under every "
+                 "protocol.")
+
     mc = rep["mem_clock"]
     L += ["", "## Is the memory clock constant across protocols?", ""]
     L.append(f"**{mc['n_varying']} of {mc['n_rows']}** measurement rows have a "
@@ -291,6 +388,17 @@ def main():
     print("   by method: " + ", ".join(
         f"{m} {v:.2f}" for m, v in sorted(rep["misfit_by_method"].items(),
                                           key=lambda kv: -kv[1])))
+    print()
+    print("rival predictors (residual sd, pp -- lower is better):")
+    for proto, block in rep["per_protocol"].items():
+        top = block["rivals"][:3]
+        print(f"   {proto:<10} " + "  ".join(
+            f"{d['predictor']} {d['residual_sd_pp']:.2f}" for d in top))
+    beats = rep["rival_beats_bandwidth_everywhere"]
+    print("   -> " + (f"{', '.join(beats)} beats bandwidth under every protocol"
+                      if beats else
+                      "nothing beats achieved bandwidth under every protocol"))
+
     mc = rep["mem_clock"]
     print()
     print(f"memory clock varies across protocols on {mc['n_varying']}/{mc['n_rows']} rows"

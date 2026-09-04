@@ -39,7 +39,7 @@ Everything below is verified on this machine, not assumed.
   `min_effect_frac`. Post-hoc from the raw samples, so it runs on any results
   JSON ever recorded and never touches `benchmark.py`. Run 3: **39 quotable /
   7 pinned / 2 rejected**.
-- `python -m pytest test_between_run.py -q` → **94** CPU-only tests, ~11 s,
+- `python -m pytest test_between_run.py -q` → **100** CPU-only tests, ~11 s,
   covering `between_run.py`, `clock_excursions.py`, `compare_protocols.py` and
   `dispersion_tier.py` (including the 2x2 arithmetic, the design reader, and the
   tier's calibration bar and per-claim admissibility).
@@ -254,6 +254,11 @@ re-run it after any benchmark run without thinking about it:
      clock does **not** answer it — `control@8k` is the worst-fitting row of the
      twelve and its memory clock is constant at 11001 MHz under all four
      protocols.
+   - Bandwidth is also the **best of seven candidate predictors** (its own
+     square and log, bytes moved, log bytes, time, log time): smallest residual
+     spread under `preloaded` and `fullpre`, second under `subset`, and nothing
+     beats it under every protocol. So the control's misfit is not explained by
+     bytes moved, by footprint, or by time either.
    - The law itself survived the test that could have killed it: within a single
      kernel, r is positive in **6 of 6** (method x protocol) pairs that have any
      bandwidth range (sign test p = 0.016), the between-method means are
