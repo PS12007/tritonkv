@@ -1905,3 +1905,38 @@ That is **one run**, so it is an observation and not a shift. Recording it as
 such: context order is a candidate protocol variable, the 16k cell is where it
 would show, and establishing it needs three reversed runs rather than one. The
 headline `quant_cold@8192` is unaffected either way.
+
+### Correction: the 16k observation does not replicate cleanly
+
+A second reversed run (`reversed2`, 776 s, 42/48 quotable) was run before the
+previous section's observation could harden into a belief, and it is worth
+recording what it did to it.
+
+| | `quant_cold@8192` | `quant_cold@16384` |
+|---|---|---|
+| run1 / run2 / run3 (normal) | 1.4766 / 1.4766 / 1.4801 | 1.3796 / 1.4246 / 1.4424 |
+| reversed1 | 1.4844 | **1.5125** |
+| reversed2 | 1.3174 *(not usable)* | **1.4113** |
+
+**At 8192 the gate did its job.** `reversed2` reads 1.3174, far below anything
+else here — and `fused_triton_4b@8192` is tier-3 in that run, so the ratio is not
+usable and is not quoted. The usable reversed value is `reversed1`'s 1.4844,
+which sits with the normal runs. This is the machinery working: the outlier was
+caught by a rule written long before this experiment.
+
+**At 16384 both runs are usable and they disagree by 7.2%.** 1.5125 and 1.4113,
+against a normal three-run range of 1.3796–1.4424. So the earlier reading — "the
+most protocol-sensitive row moved, consistent with the bandwidth law" — is *not
+supported by two runs*. Both reversed values are at or above the normal maximum,
+which keeps the direction alive, but the spread *within* the reversed protocol
+(7.2%) is larger than the spread between normal runs (4.5%), and two points
+cannot separate a shift from a noisy protocol.
+
+The hedge in the previous section was the right one and is now the operative
+statement: it was an observation, not a shift. A third reversed run is in flight;
+whatever it says, the honest summary of the pair is **"the reversed protocol is
+noisier, and the 16k cell has not been shown to move."**
+
+Independent support for the noise half: `clock_excursions.py` over the two
+reversed runs gives a memory P-state excursion rate of **7.8%** (15 of 192)
+against **4.9%** (14 of 288) for the three normal runs.
