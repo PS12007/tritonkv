@@ -31,6 +31,8 @@ import argparse
 import json
 import math
 import statistics
+
+import dispersion_tier
 from pathlib import Path
 
 from audit_claims import CONTROL, Bench, bootstrap_ratio_ci
@@ -62,6 +64,31 @@ def _samples(b: Bench, method: str, ctx: int, regime: str):
     return b.cold(method, ctx) if regime == "cold" else b.hot_raw(method, ctx)
 
 
+_TIER_CACHE: dict[int, dict] = {}
+
+
+def _tiers(b: Bench) -> dict:
+    """This run's three-way verdict per row, computed once per Bench.
+
+    A protocol's spread is quoted as the range of its runs' point estimates, and
+    a run whose rows this project would refuse to quote individually has no
+    business setting that range. Caching matters: the tier runs a bootstrap over
+    every row, and `ratio_ranges` walks every ratio x context.
+    """
+    key = id(b)
+    if key not in _TIER_CACHE:
+        _TIER_CACHE[key] = dispersion_tier.by_row(dispersion_tier.build(b.p))
+    return _TIER_CACHE[key]
+
+
+def _usable(b: Bench, num: str, den: str, ctx: int, value: float) -> bool:
+    """Would this project quote both of this ratio's rows, for this effect?"""
+    idx = _tiers(b)
+    effect = abs(value - 1.0)
+    recs = [idx.get((num, ctx)), idx.get((den, ctx))]
+    return all(r is not None and dispersion_tier.usable_for(r, effect) for r in recs)
+
+
 def ratio_ranges(groups, contexts):
     """Per (ratio, ctx): each group's min/max point estimate over its runs."""
     out = []
@@ -70,16 +97,19 @@ def ratio_ranges(groups, contexts):
             per_group = {}
             ok = True
             for gname, entries in groups.items():
-                vals = []
+                vals, usable = [], []
                 for _, b in entries:
                     x, y = _samples(b, num, ctx, regime), _samples(b, den, ctx, regime)
                     if not (x and y):
                         ok = False
                         break
-                    vals.append(bootstrap_ratio_ci(x, y)[0])
+                    v = bootstrap_ratio_ci(x, y)[0]
+                    vals.append(v)
+                    if _usable(b, num, den, ctx, v):
+                        usable.append(v)
                 if not ok:
                     break
-                per_group[gname] = vals
+                per_group[gname] = (vals, usable)
             if not ok or len(per_group) < 2:
                 continue
             names = list(per_group)
@@ -87,8 +117,17 @@ def ratio_ranges(groups, contexts):
             rec = {
                 "name": name, "ctx": ctx, "regime": regime,
                 "groups": {g: {"min": min(v), "max": max(v),
-                               "median": statistics.median(v), "values": v}
-                           for g, v in per_group.items()},
+                               "median": statistics.median(v), "values": v,
+                               # The same range restricted to runs this project
+                               # would actually quote. A protocol that looks
+                               # unsteady only because it produced rows the gate
+                               # rejects is a different fact from one whose
+                               # usable measurements disagree.
+                               "n_usable": len(u),
+                               "usable_min": (min(u) if u else None),
+                               "usable_max": (max(u) if u else None),
+                               "usable_values": u}
+                           for g, (v, u) in per_group.items()},
             }
             # Disjoint from the first group, which is the reference protocol.
             for g in names[1:]:
@@ -470,6 +509,36 @@ def render(ratios, telem, groups, bw_by_group=None, fac=None,
         cells.append("**" + ", ".join(dj) + "**" if dj else "")
         L.append("| " + " | ".join(cells) + " |")
     L.append("")
+
+    # A protocol whose range is set by runs this project would refuse to quote is
+    # a different fact from one whose usable measurements disagree, and the two
+    # were being reported as one number.
+    shrunk = [r for r in ratios
+              if any(g["n_usable"] < len(g["values"]) for g in r["groups"].values())]
+    if shrunk:
+        L.append("## The same ranges, over usable runs only\n")
+        L.append("A run whose rows this project would not quote individually should "
+                 "not set a protocol's range. Rows below are the ratios where at "
+                 "least one group lost a run to the gate; `n` is how many of its "
+                 "runs survive.\n")
+        hdr2 = ["ratio", "ctx"] + [f"`{g}`" for g in names]
+        L.append("| " + " | ".join(hdr2) + " |")
+        L.append("|" + "---|" * len(hdr2))
+        for r in shrunk:
+            cells = [f"`{r['name']}`", str(r["ctx"])]
+            for g in names:
+                d = r["groups"][g]
+                n_all, n_ok = len(d["values"]), d["n_usable"]
+                if n_ok == 0:
+                    cells.append("none usable")
+                elif n_ok == 1:
+                    cells.append(f"{d['usable_min']:.3f} (n=1)")
+                else:
+                    tag = "" if n_ok == n_all else f" (n={n_ok}/{n_all})"
+                    cells.append(f"{d['usable_min']:.3f}–{d['usable_max']:.3f}{tag}")
+            L.append("| " + " | ".join(cells) + " |")
+        L.append("")
+
 
     L.append("## Where the timings move and the telemetry does not\n")
     L.append("Rows whose median time differs from the reference by more than 1% "

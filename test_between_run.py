@@ -1923,3 +1923,45 @@ def test_the_stability_table_survives_a_failed_thermal_fit():
     md = thermal_check.render(rep)
     assert "Not enough temperature variation" in md
     assert "Does the telemetry know" in md
+
+
+# ---------------------------------------------------------------------------
+# Protocol ranges over usable runs only
+# ---------------------------------------------------------------------------
+
+
+def test_a_rejected_run_does_not_set_a_protocols_range():
+    """The finding this was written for: a protocol can look unsteady purely
+    because one of its runs produced rows the gate rejects."""
+    good = [Bench(_payload(1.0, seed=i)) for i in range(2)]
+    # a third run whose fused row is far off and gate-rejected
+    bad = _payload(1.30, seed=9, quotable=False)
+    # ratio_ranges needs two groups to have anything to compare
+    groups = {"p": [(f"r{i}", b) for i, b in enumerate(good)] + [("r2", Bench(bad))],
+              "q": [(f"s{i}", Bench(_payload(1.0, seed=i + 5))) for i in range(3)]}
+    recs = compare_protocols.ratio_ranges(groups, [CTX])
+    r = _find(recs, "quant_cold")
+    g = r["groups"]["p"]
+    assert len(g["values"]) == 3
+    assert g["n_usable"] < 3
+    # the full range is wider than the usable one
+    assert (g["max"] - g["min"]) > (g["usable_max"] - g["usable_min"])
+
+
+def test_usable_range_equals_full_range_when_nothing_is_rejected():
+    groups = {"p": [(f"r{i}", Bench(_payload(1.0, seed=i))) for i in range(3)],
+              "q": [(f"s{i}", Bench(_payload(1.02, seed=i + 5))) for i in range(3)]}
+    g = _find(compare_protocols.ratio_ranges(groups, [CTX]), "quant_cold")["groups"]["p"]
+    assert g["n_usable"] == 3
+    assert g["usable_min"] == g["min"] and g["usable_max"] == g["max"]
+
+
+def test_the_usable_section_appears_only_when_a_run_was_lost():
+    clean = {"p": [(f"r{i}", Bench(_payload(1.0, seed=i))) for i in range(3)],
+             "q": [(f"s{i}", Bench(_payload(1.02, seed=i + 5))) for i in range(3)]}
+    recs = compare_protocols.ratio_ranges(clean, [CTX])
+    telem = compare_protocols.telemetry_agreement(clean, [CTX], ["fused_triton_4b"])
+    cells, levels, note = compare_protocols.design_cells(clean)
+    md = compare_protocols.render(recs, telem, clean, fac=[], fac_note=note,
+                                  design=cells, levels=levels)
+    assert "over usable runs only" not in md

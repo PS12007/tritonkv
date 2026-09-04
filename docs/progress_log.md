@@ -2049,3 +2049,58 @@ a variable the current sampler does not record, and on this part the obvious one
   strongest form of the verdict, not a case to fall over on.
 
 `test_between_run.py`: 126 → **131**.
+
+## The protocol spreads were mostly rejected runs
+
+The two-mechanism investigation was motivated by a table: spread at
+`quant_cold@8192` of 0.6% (`full`), 13.2% (`subset`), 0.6% (`preloaded`), 8.4%
+(`fullpre`) — the shortest and the longest protocols being the unsteady ones.
+Both candidate mechanisms are now dead, and the reason turns out to be partly
+that the table was measuring something else.
+
+A protocol's spread is the range of its runs' point estimates. Nothing was
+checking whether those runs were ones this project would quote. They were not:
+
+| protocol | all runs | **usable runs only** | runs surviving | excursion rate |
+|---|---|---|---|---|
+| `full` | 1.469–1.478 (0.6%) | 1.469–1.478 (0.6%) | 3/3 | 2.8% |
+| `subset` | 1.277–1.445 (13.2%) | 1.445 (n=1) | **1/3** | 12.5% |
+| `preloaded` | 1.395–1.402 (0.6%) | 1.395–1.402 (0.6%) | 3/3 | 2.8% |
+| `fullpre` | 1.290–1.398 (8.4%) | 1.394–1.398 (**0.3%**) | **2/3** | 6.9% |
+
+**`fullpre`'s 8.4% is one rejected run.** Over the runs that survive the gate it
+is **0.3%** — the tightest protocol measured here, not the second worst.
+`subset` loses two of three and cannot be given a range at all. The two protocols
+that looked steady lost nothing.
+
+So "the shortest and the longest protocols are the noisy ones" was, for the
+longest one, an artefact of quoting a run whose `fused_triton_4b@8192` sat at
+10232 MHz against a cell median of 11001 — exactly the memory P-state excursion
+`clock_excursions.py` flags, and exactly the row the gate rejects. The protocol
+spread ranking and the excursion-rate ranking are the same ranking, which they
+should be, because one is largely composed of the other.
+
+This does not dissolve the question, it re-poses it: **why do the shortest and
+longest protocols produce more P-state excursions?** That is a rate on 72–288
+observations rather than a range over three runs, so it is a better-conditioned
+question than the one it replaces. And it removes `fullpre` from the puzzle —
+whatever is going on, the longest protocol's *usable* measurements are the
+steadiest in the repo.
+
+`compare_protocols.py` now reports both ranges. The full range is still primary,
+because a protocol that produces unusable runs is genuinely worse to run; but the
+gated range is printed beside it whenever they differ, so nobody quotes a spread
+that is really a rejection count.
+
+### A statistic I got wrong on the way
+
+The first version of this analysis computed each run's ratio as
+`median(control) / median(fused)`. That is not what this repo means by the ratio:
+`compare_protocols.py` uses `bootstrap_ratio_ci(x, y)[0]`, computed from the raw
+paired samples. The two disagree by up to 1.8% per run and gave `preloaded` a
+4.9% spread instead of its true 0.6% — which would have inverted the conclusion.
+Caught by noticing the ad-hoc numbers did not reproduce the tool's published
+ranges. Recomputing with the repo's own statistic reproduced them exactly, and
+the finding above survived.
+
+`test_between_run.py`: 131 → **134**.
