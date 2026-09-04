@@ -79,21 +79,37 @@ def series(monitor: ClockMonitor, t0: float, t1: float) -> list[dict]:
 
 
 def time_to_ceiling(rows: list[dict], key: str = "mem_mhz") -> dict:
-    """When did `key` first reach, and then hold, its loaded ceiling?
+    """When did `key` first reach, and then hold, its **sustained** loaded level?
 
-    Only samples taken under load define the ceiling: at idle this part reports a
-    *higher* memory clock (12001 MHz) than it ever sustains under load, so an
-    idle-inclusive maximum would set a target the measurement can never reach --
-    the exact bug `benchmark.py` had to fix in its ramp.
+    The first version of this took the ceiling to be the maximum over loaded
+    samples, and that was wrong in a way the summary hid. On this part the memory
+    clock boosts to 12001 MHz for the first few seconds of a load and then settles
+    to 11001 for the rest -- 96% of a 180 s window. Taking the maximum makes the
+    transient the target, so the answer becomes "time to the peak" when the
+    question is "time to the state a benchmark actually runs in".
+
+    The ceiling is therefore the **median of the loaded samples**, which is the
+    level the card holds. The peak is reported alongside with how long it lasted,
+    because a boost that decays is a real feature of the ramp and not noise.
+
+    Arrival is measured against *all* samples in the window rather than only the
+    loaded ones: the clock here leaves idle while utilization is still climbing
+    through 39%, so a utilization filter would date the ramp later than it
+    happened. Utilization decides what the ceiling *is*, not when it was reached.
     """
     loaded = [r for r in rows if r.get("util_pct", 0.0) >= LOADED_UTIL_PCT]
     if not loaded:
         return {"n_loaded": 0, "ceiling": None}
-    ceiling = max(r[key] for r in loaded)
-    threshold = ceiling * CEILING_FRAC
+    values = [r[key] for r in loaded]
+    sustained = float(statistics.median(values))
+    peak = float(max(values))
+    at_peak = [r for r in loaded if r[key] >= peak * CEILING_FRAC]
+    peak_seconds = (at_peak[-1]["t"] - at_peak[0]["t"]) if len(at_peak) > 1 else 0.0
+
+    threshold = sustained * CEILING_FRAC
     first = None
     arrived = None
-    for i, r in enumerate(loaded):
+    for r in rows:
         if r[key] < threshold:
             first = None
             continue
@@ -102,17 +118,19 @@ def time_to_ceiling(rows: list[dict], key: str = "mem_mhz") -> dict:
         if r["t"] - first >= HOLD_SECONDS:
             arrived = first
             break
-    # A ramp that reaches the ceiling and holds it to the end of the window
-    # counts, even if the window ended before HOLD_SECONDS elapsed.
-    if arrived is None and first is not None and loaded[-1][key] >= threshold:
+    if arrived is None and first is not None and rows[-1][key] >= threshold:
         arrived = first
     return {
         "n_loaded": len(loaded),
-        "ceiling": float(ceiling),
+        "ceiling": sustained,
+        "sustained_frac_of_loaded": float(
+            sum(1 for v in values if v >= threshold) / len(values)),
+        "peak": peak,
+        "peak_seconds": float(peak_seconds),
+        "peak_is_transient": bool(peak > sustained * 1.01),
         "threshold": float(threshold),
         "first_at_ceiling_s": (float(arrived) if arrived is not None else None),
-        "held_to_end": bool(arrived is not None
-                            and loaded[-1][key] >= threshold),
+        "idle_exit_s": next((r["t"] for r in rows if r[key] >= threshold), None),
         "first_loaded_value": float(loaded[0][key]),
         "last_value": float(loaded[-1][key]),
     }
@@ -171,6 +189,15 @@ def render(rep: dict, v: dict, args) -> str:
         L.append(f"| time to {name} ceiling | "
                  + (f"**{t:.1f} s**" if t is not None else "never held")
                  + " | |")
+    if m.get("peak_is_transient"):
+        L += ["",
+              f"The memory clock **boosts to {m['peak']:.0f} MHz for the first "
+              f"{m['peak_seconds']:.1f} s** and then settles to "
+              f"{m['ceiling']:.0f} MHz, which it holds for "
+              f"{m['sustained_frac_of_loaded'] * 100:.0f}% of the loaded window. "
+              f"The sustained figure is the one a benchmark runs in, so it is what "
+              f"the ramp time is measured against; taking the peak as the ceiling "
+              f"would answer a different question."]
     L += ["", "## What it means", ""]
     if not v["settled"]:
         L.append(v["note"])
@@ -209,9 +236,31 @@ def main():
                     help="wall seconds of the shortest protocol in the repo, which "
                          "is what the ramp time is judged against")
     ap.add_argument("--interval-ms", type=int, default=100)
+    ap.add_argument("--from-json", default=None,
+                    help="re-analyse a saved clock_ramp.json instead of measuring. "
+                         "The raw series is recorded, so a correction to the "
+                         "analysis never needs the GPU again.")
     ap.add_argument("--out", default=str(RESULTS_DIR / "clock_ramp.json"))
     ap.add_argument("--md", default=str(RESULTS_DIR / "clock_ramp.md"))
     args = ap.parse_args()
+
+    if args.from_json:
+        prior = json.loads(Path(args.from_json).read_text(encoding="utf-8"))
+        load_rows = prior["load_series"]
+        idle_rows = prior.get("idle_series") or []
+        rep = build(idle_rows, load_rows)
+        # the idle summary is not recoverable from the load series alone
+        for key in ("mem_mhz", "sm_mhz"):
+            for f in ("idle_median", "idle_min", "idle_max"):
+                rep[key][f] = prior[key][f]
+        rep["n_idle_samples"] = prior["n_idle_samples"]
+        v = verdict(rep, args.shortest_protocol)
+        rep["verdict"] = v
+        rep["args"] = vars(args)
+        rep["load_series"] = load_rows
+        rep["idle_series"] = idle_rows
+        _report(rep, v, args)
+        return
 
     if not torch.cuda.is_available():
         raise SystemExit("no CUDA device")
@@ -241,12 +290,20 @@ def main():
     rep["args"] = vars(args)
     rep["load_series"] = load_rows
 
+    rep["idle_series"] = idle_rows
+    _report(rep, v, args)
+
+
+def _report(rep: dict, v: dict, args) -> None:
     m, s = rep["mem_mhz"], rep["sm_mhz"]
     print()
     print(f"idle:   mem {m['idle_median']:.0f} MHz   sm {s['idle_median']:.0f} MHz")
     if m["ceiling"]:
-        print(f"loaded: mem ceiling {m['ceiling']:.0f} MHz   "
-              f"sm ceiling {s['ceiling']:.0f} MHz")
+        print(f"loaded: mem sustained {m['ceiling']:.0f} MHz   "
+              f"sm sustained {s['ceiling']:.0f} MHz")
+        if m.get("peak_is_transient"):
+            print(f"        (memory boosts to {m['peak']:.0f} MHz for the first "
+                  f"{m['peak_seconds']:.1f} s, then settles)")
         t = m.get("first_at_ceiling_s")
         print(f"memory clock reached and held its ceiling: "
               + (f"{t:.1f} s after load start" if t is not None else "never"))

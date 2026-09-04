@@ -21,6 +21,7 @@ import pytest
 import analyze_dispersion
 import audit_claims
 import bandwidth_law
+import clock_ramp
 import between_run
 import clock_excursions
 import compare_protocols
@@ -1763,3 +1764,72 @@ def test_the_report_states_what_the_underpowered_test_would_need():
     assert "The other arm" in md
     assert "runs/protocol needed" in md
     assert "measure the clock ramp directly" in md
+
+
+# ---------------------------------------------------------------------------
+# clock_ramp -- the time constant, and the bug that hid in the summary
+# ---------------------------------------------------------------------------
+
+
+def _ramp_rows(spec):
+    """(t, mem_mhz, sm_mhz, util_pct) tuples."""
+    return [{"t": t, "mem_mhz": mem, "sm_mhz": sm, "util_pct": u,
+             "temp_c": 60.0, "power_w": 70.0} for t, mem, sm, u in spec]
+
+
+def test_the_ceiling_is_the_sustained_level_not_the_boost():
+    """The bug this function had. A card that boosts for a few seconds and then
+    settles must be measured against the level it settles at -- taking the peak
+    answers 'time to the peak' when the question is 'time to the state the
+    benchmark runs in'."""
+    rows = _ramp_rows(
+        [(0.1 * i, 12001.0, 2700.0, 99.0) for i in range(50)]        # 5 s boost
+        + [(5.0 + 0.1 * i, 11001.0, 2700.0, 99.0) for i in range(500)])  # 50 s settled
+    got = clock_ramp.time_to_ceiling(rows)
+    assert got["ceiling"] == pytest.approx(11001.0)
+    assert got["peak"] == pytest.approx(12001.0)
+    assert got["peak_is_transient"]
+    assert got["peak_seconds"] == pytest.approx(4.9, abs=0.2)
+
+
+def test_arrival_is_dated_from_all_samples_not_only_loaded_ones():
+    """The clock leaves idle while utilization is still climbing, so filtering
+    the arrival search by utilization dates the ramp later than it happened."""
+    rows = _ramp_rows(
+        [(0.0, 405.0, 400.0, 2.0), (0.1, 405.0, 400.0, 2.0),
+         (0.2, 11001.0, 600.0, 39.0)]                                 # low util, clock up
+        + [(0.3 + 0.1 * i, 11001.0, 2700.0, 99.0) for i in range(200)])
+    got = clock_ramp.time_to_ceiling(rows)
+    assert got["first_at_ceiling_s"] == pytest.approx(0.2)
+
+
+def test_a_single_touch_of_the_ceiling_does_not_end_the_ramp():
+    rows = _ramp_rows(
+        [(0.0, 11001.0, 2700.0, 99.0)]                     # one sample, then falls
+        + [(0.1 + 0.1 * i, 9001.0, 2700.0, 99.0) for i in range(100)]
+        + [(10.2 + 0.1 * i, 11001.0, 2700.0, 99.0) for i in range(200)])
+    got = clock_ramp.time_to_ceiling(rows)
+    assert got["first_at_ceiling_s"] == pytest.approx(10.2, abs=0.05)
+
+
+def test_no_loaded_samples_means_no_ceiling():
+    rows = _ramp_rows([(0.1 * i, 405.0, 400.0, 2.0) for i in range(50)])
+    got = clock_ramp.time_to_ceiling(rows)
+    assert got["n_loaded"] == 0 and got["ceiling"] is None
+
+
+def test_the_verdict_turns_on_the_pre_registered_threshold():
+    """H1/H2 was committed as 10% of the shortest protocol, so the verdict has to
+    move at exactly that line and not somewhere convenient."""
+    fast = {"mem_mhz": {"first_at_ceiling_s": 20.0}}
+    slow = {"mem_mhz": {"first_at_ceiling_s": 21.0}}
+    assert not clock_ramp.verdict(fast, 205.0)["warm_up_arm_viable"]
+    assert clock_ramp.verdict(slow, 205.0)["warm_up_arm_viable"]
+
+
+def test_a_clock_that_never_holds_is_reported_as_such():
+    rows = _ramp_rows([(0.1 * i, 9001.0 if i % 2 else 11001.0, 2700.0, 99.0)
+                       for i in range(200)])
+    v = clock_ramp.verdict({"mem_mhz": clock_ramp.time_to_ceiling(rows)}, 205.0)
+    assert not v["settled"]
+    assert "does not simply" in v["note"]

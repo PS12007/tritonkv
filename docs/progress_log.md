@@ -1698,3 +1698,70 @@ longer window, are the obvious candidates and neither is tested here.
 The threshold, the hold rule, and both hypotheses are committed before the
 measurement exists. This is the same discipline as the fourth protocol, which is
 the only reason that result was worth anything.
+
+
+## The result: H2, and the warm-up arm is dead
+
+Pre-registered H1 ≥ 20.5 s / H2 < 20.5 s, prediction "H2, and specifically
+1–4 s". **Observed: 0.4 s.** H2 by a factor of 50, and the point prediction was
+wrong in the direction of caution — the ramp is 2.5× faster than predicted.
+
+| | idle | sustained under load | time to reach and hold |
+|---|---|---|---|
+| memory clock | 405 MHz | **11001 MHz** | **0.4 s** |
+| SM clock | 435 MHz | 2640 MHz | 7.4 s |
+
+The memory clock is at its sustained operating point **0.4 s** after the load
+starts — 0.2% of the shortest protocol in this repo. A 205 s run spends 99.8% of
+itself with the memory clock already up. **The warm-up arm cannot explain why a
+205 s protocol behaves differently from a 775 s one.** Both arms of the
+two-mechanism hypothesis are now dead: the thermal one on effect size, this one
+on time constant.
+
+Two things worth keeping from the series:
+
+- **The memory clock leads the SM clock by 18×.** Memory is at its sustained
+  level in 0.4 s; the SM clock takes 7.4 s. That is the opposite of the
+  intuition the original ramp bug came from — the first ramp drove the SM clock
+  and assumed memory would follow, and in fact memory arrives first and by a
+  long way.
+- **There is a boost transient.** The memory clock runs at 12001 MHz for the
+  first 6.5 s and then settles to 11001 for the remaining 96% of the window.
+  Real, reproducible in the trace, and irrelevant at these timescales — but it
+  is what caused the bug below.
+
+### A correction to this measurement, found by reading the series
+
+The first version of `time_to_ceiling` took the ceiling to be the **maximum**
+over loaded samples. That made the 12001 MHz boost the target, so the reported
+answer was "0.8 s to the peak" when the question is "how long until the card is
+in the state a benchmark actually runs in". The summary looked fine; the series
+did not. The ceiling is now the **median** of loaded samples, with the peak
+reported separately alongside how long it lasted.
+
+A second, smaller one in the same function: arrival was being searched only among
+samples with utilization ≥ 50%, but the memory clock leaves idle at t = 0.41 s
+while utilization is still climbing through 39%. Utilization decides what the
+ceiling *is*; it should not decide when the clock got there.
+
+Neither correction changes the verdict — 0.8 s and 0.4 s are both far inside H2 —
+which is the only reason it is comfortable to report them. The raw series is
+written into `results/clock_ramp.json` and `--from-json` re-runs the analysis on
+it, so both corrections were applied **without touching the GPU again**.
+
+### What this leaves open, and it is now sharper
+
+`subset` → `preloaded` is a real improvement: spread at `quant_cold@8192` goes
+13.2% → 0.6% and the excursion rate 12.5% → 2.8%, for 300 s of preload. That is
+not in dispute. What is now excluded is the explanation: it is **not** that the
+memory clock had not come up, because the memory clock comes up in 0.4 s.
+
+Candidates that survive and are untested here: the power governor integrating
+over a window much longer than the clock ramp; thermal steady state in the sense
+of a settled fan curve rather than a temperature; and allocator or driver state
+that a preload happens to warm. The measurement that would separate them is not
+obvious, and inventing one is a better use of the next session than another
+protocol repetition.
+
+`test_between_run.py`: 118 → **124**, including a test that plants a boost
+transient and requires the sustained level to be chosen over it.
