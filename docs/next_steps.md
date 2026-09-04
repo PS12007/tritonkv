@@ -35,7 +35,7 @@ Everything below is verified on this machine, not assumed.
   `min_effect_frac`. Post-hoc from the raw samples, so it runs on any results
   JSON ever recorded and never touches `benchmark.py`. Run 3: **39 quotable /
   7 pinned / 2 rejected**.
-- `python -m pytest test_between_run.py -q` → **74** CPU-only tests, ~10 s,
+- `python -m pytest test_between_run.py -q` → **77** CPU-only tests, ~11 s,
   covering `between_run.py`, `clock_excursions.py`, `compare_protocols.py` and
   `dispersion_tier.py` (including the 2x2 arithmetic, the design reader, and the
   tier's calibration bar and per-claim admissibility).
@@ -134,10 +134,10 @@ re-run it after any benchmark run without thinking about it:
    `method.dispersion_gate`. **26 TRUE / 21 CONDITIONAL / 12 MISLEADING /
    12 FALSE.**
 
-   Still open, and it is now the smallest half: the **README tables** still carry
-   the "clears in one run and not the others" qualifier at ctx=512 and ctx=2048,
-   which the six-run table above supersedes. `key_numbers.md` has not been
-   revisited either.
+   README and `key_numbers.md` are updated: both timing tables mark those rows
+   `~`, the qualifier is replaced by the six-run table, and `key_numbers.md`
+   carries it as **correction 10**. Figure: `docs/plots/dispersion_tier.png`
+   (`make_session_plots.py`).
 
    Note that **promotion is a property of the run**, exactly as quotability is:
    no row is promoted in all six full runs, and the most any manages is four.

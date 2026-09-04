@@ -630,6 +630,145 @@ def plot_dispersion(rows: list[dict]):
 
 
 # ---------------------------------------------------------------------------
+# The second dispersion tier (results/dispersion.json + dispersion_tier.py)
+# ---------------------------------------------------------------------------
+
+# The six full runs the tier's coverage is reported over. Six, not one, because
+# promotion is a property of the run exactly as quotability is.
+FULL_RUNS = ("results/runs/run1.json", "results/runs/run2.json",
+             "results/runs/run3.json", "results/tail/fullpre3.json",
+             "results/tail/fullpre4.json", "results/tail/fullpre5.json")
+
+# The rows the L2-residency conditional is built from. If all three survive at a
+# context, that context can carry the finding; if one is missing, it cannot.
+CHAIN = ("fp16_sdpa", "triton_fp16_control", "fused_triton_4b")
+
+
+def _chain_coverage(paths) -> tuple[dict, dict, int] | None:
+    """How often the attribution chain is complete at each context, on the gate
+    alone and with the pinned tier admitted."""
+    import dispersion_tier as dt
+
+    gate: dict[int, int] = {}
+    tier: dict[int, int] = {}
+    n = 0
+    for rel in paths:
+        p = ROOT / rel
+        if not p.exists():
+            continue
+        report = dt.build(json.loads(p.read_text(encoding="utf-8")))
+        idx = dt.by_row(report)
+        ctxs = sorted({c for _, c in idx})
+        n += 1
+        for c in ctxs:
+            recs = [idx.get((m, c)) for m in CHAIN]
+            if any(r is None for r in recs):
+                continue
+            gate.setdefault(c, 0)
+            tier.setdefault(c, 0)
+            if all(r["tier"] == dt.TIER_QUOTABLE for r in recs):
+                gate[c] += 1
+            if all(r["tier"] in (dt.TIER_QUOTABLE, dt.TIER_PINNED) for r in recs):
+                tier[c] += 1
+    return (gate, tier, n) if n else None
+
+
+def plot_dispersion_tier(rows: list[dict]):
+    """The gate cuts vertically; the question the tables ask cuts horizontally.
+
+    Left is the same scatter as `dispersion_gate`, recoloured by the three-way
+    verdict and with the calibration bar drawn on it. The two lines are
+    perpendicular, which is the whole argument: the gate rejects on the x axis
+    and every number quoted from these tables lives on the y axis. Right is what
+    that bought, counted over six runs rather than the one that motivated it.
+    """
+    import dispersion_tier as dt
+
+    tier_path = ROOT / "results" / "dispersion_tier.json"
+    if not tier_path.exists():
+        return False
+    report = json.loads(tier_path.read_text(encoding="utf-8"))
+    bar = report["calibration"]["bar_frac"]
+    if bar is None:
+        return False
+    by = {(r["method"], r["ctx"]): r for r in report["rows"]}
+
+    fig, axes = plt.subplots(1, 2, figsize=(13.4, 4.8),
+                             gridspec_kw={"width_ratios": [1.35, 1], "wspace": 0.34})
+
+    # -- left: the two axes the two tests use ------------------------------
+    ax = axes[0]
+    # Colour is the *row's* verdict, position is the *measurement's*. A row is
+    # judged on its worse regime, so a blue point can sit left of the gate line:
+    # that measurement was fine and its partner regime was not.
+    groups = {dt.TIER_QUOTABLE: ("in a row that passes", MUTED),
+              dt.TIER_PINNED: ("in a promoted row", S1),
+              dt.TIER_REJECTED: ("in an unusable row", S2)}
+    for tier_id, (label, colour) in groups.items():
+        sel = [d for d in rows
+               if (by.get((d["method"], d["ctx"])) or {}).get("tier") == tier_id]
+        if not sel:
+            continue
+        ax.scatter([d["iqr_frac"] * 100 for d in sel],
+                   [d["median_ci_halfwidth_frac"] * 100 for d in sel],
+                   s=30, color=colour, alpha=0.85, edgecolor="none",
+                   label=f"{label} ({len(sel)})", zorder=3)
+    ax.set_yscale("log")
+    ax.axvline(5.0, color=INK2, lw=1.2, ls="--", zorder=2)
+    ax.text(5.35, ax.get_ylim()[0] * 2.4, "the gate\ncuts here",
+            fontsize=8.5, color=INK2, va="bottom")
+    ax.axhline(bar * 100, color=S3, lw=1.4, ls="-", zorder=2)
+    ax.text(0.4, bar * 112, f"the tier cuts here: +-{bar * 100:.2f}%",
+            fontsize=8.5, color=S3, ha="left", va="bottom")
+    ax.legend(loc="lower right", fontsize=8.6, title="colour = the row's verdict",
+              title_fontsize=8.2)
+    style(ax, "Two tests, two axes",
+          subtitle="the bar is the worst-pinned row the gate already accepts",
+          xlabel="per-sample IQR (% of median)  -- what the gate tests",
+          ylabel="median uncertainty (+-%)\n-- what the tables quote")
+
+    # -- right: what it bought, over six runs ------------------------------
+    ax = axes[1]
+    cov = _chain_coverage(FULL_RUNS)
+    if cov is None:
+        ax.axis("off")
+    else:
+        gate, tier, n_runs = cov
+        ctxs = sorted(gate)
+        y = np.arange(len(ctxs))
+        h = 0.36
+        ax.barh(y + h / 2, [gate[c] for c in ctxs], h, color=MUTED,
+                label="gate alone")
+        ax.barh(y - h / 2, [tier[c] for c in ctxs], h, color=S1,
+                label="with the pinned tier")
+        for yi, c in zip(y, ctxs):
+            ax.text(gate[c] + 0.09, yi + h / 2, f"{gate[c]}/{n_runs}", va="center",
+                    fontsize=9, color=INK)
+            ax.text(tier[c] + 0.09, yi - h / 2, f"{tier[c]}/{n_runs}", va="center",
+                    fontsize=9, fontweight="bold", color=INK)
+        ax.set_yticks(y)
+        ax.set_yticklabels([f"ctx={CTX_LABEL.get(c, c)}" for c in ctxs], fontsize=9)
+        ax.set_xlim(0, n_runs * 1.28)
+        ax.set_xticks(range(n_runs + 1))
+        # below the bars rather than over them: at ctx=512 the tier bar
+        # reaches the right edge and a corner legend lands on its own label
+        ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.16), ncol=2,
+                  fontsize=8.8, frameon=False)
+        style(ax, "The two contexts carrying the sign flip",
+              subtitle=f"attribution chain complete, over {n_runs} full runs",
+              xlabel="runs where all three rows survive")
+
+    figure_header(
+        fig,
+        "A third verdict, not a wider gate",
+        "Widening the gate would admit the two rows that really are unpinned. Asking the\n"
+        "second question separately admits the seven that are not, and keeps those two out.",
+    )
+    save(fig, "dispersion_tier")
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Memory-clock gate (results/benchmark.json)
 # ---------------------------------------------------------------------------
 # The 2x2 (results/compare_protocols.json, written by compare_protocols.py)
@@ -872,6 +1011,9 @@ def main():
     disp = _sweep(ROOT / "results" / "dispersion.json")
     if disp:
         plot_dispersion(disp)
+        if not plot_dispersion_tier(disp):
+            print("  (skipped dispersion_tier: no results/dispersion_tier.json --"
+                  " run dispersion_tier.py)")
     else:
         print("  (skipped dispersion_gate: no results/dispersion.json --"
               " run analyze_dispersion.py)")

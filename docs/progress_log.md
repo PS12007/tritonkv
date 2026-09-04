@@ -1405,3 +1405,22 @@ the *worst* of its rows, and `max()` on the strings gets that backwards. Hence
 `worst_mark`, and a test for it.
 
 `test_between_run.py`: 62 -> **74** tests.
+
+
+### A figure for it
+
+`docs/plots/dispersion_tier.png` (`make_session_plots.py`). Left: the same
+scatter as `dispersion_gate`, recoloured by the three-way verdict, with the gate
+drawn as a vertical line and the calibration bar as a horizontal one. The two
+lines are perpendicular, which is the argument in one picture -- the gate cuts on
+per-sample IQR and every number these tables quote lives on the median-precision
+axis. Right: the six-run chain coverage, gate alone against gate plus tier.
+
+Colour is the *row's* verdict while position is the *measurement's*, so a
+promoted point can sit left of the gate line: that measurement was fine and its
+partner regime was not. A row is judged on its worse regime, and the figure shows
+that rather than hiding it.
+
+`_chain_coverage` is the function that produces the numbers quoted in the README
+and in `key_numbers.md`, so it has its own tests rather than being trusted
+because a figure looked right. `test_between_run.py`: 74 -> **77**.

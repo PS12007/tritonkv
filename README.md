@@ -779,6 +779,12 @@ The two that stay rejected are pinned to ±2.33% and ±2.68% — which is exactl
 `MAX_IQR_FRAC` was not widened instead. Widening admits those two along with the
 seven that deserve it; the median-precision test separates them.
 
+![A third verdict, not a wider gate](docs/plots/dispersion_tier.png)
+
+The two lines in the left panel are perpendicular, and that is the whole
+argument: the gate cuts on the x axis, and every number these tables quote lives
+on the y axis.
+
 Two restrictions keep it a report rather than a loophole. A **clock-rejected row
 is never promoted** — the gate is not a P-state filter, so that failure is
 invisible here. And promotion is **per claim**: a pinned row carries a floor of 5×
@@ -850,7 +856,7 @@ python -m venv .venv
 .venv/Scripts/python.exe -m pip install -r requirements.txt
 
 .venv/Scripts/python.exe -m pytest test_correctness.py -q   # 106 tests, ~89 s (GPU)
-.venv/Scripts/python.exe -m pytest test_between_run.py -q    # 74 tests, ~10 s (no GPU)
+.venv/Scripts/python.exe -m pytest test_between_run.py -q    # 77 tests, ~11 s (no GPU)
 .venv/Scripts/python.exe benchmark.py --quick                # ~75 s smoke run
 .venv/Scripts/python.exe benchmark.py --samples 50           # full suite, ~13 min
 .venv/Scripts/python.exe dispersion_tier.py                  # three-tier verdict per row
@@ -917,7 +923,7 @@ committed.
 | `kernels/fused_decode_attn.py` | the fused kernel. |
 | `kernels/fp16_decode_attn.py` | the control: identical shape, unquantized. Isolates the flash-decoding effect. |
 | `test_correctness.py` | 106 tests on the kernel, explicit asserted thresholds. |
-| `test_between_run.py` | 74 CPU-only tests on the between-run, excursion, protocol and dispersion-tier machinery — including the 2x2 arithmetic, the design reader and the tier's calibration bar — against synthetic runs with known answers. |
+| `test_between_run.py` | 77 CPU-only tests on the between-run, excursion, protocol and dispersion-tier machinery — including the 2x2 arithmetic, the design reader and the tier's calibration bar — against synthetic runs with known answers. |
 | `benchmark.py` | timing + memory. Rotating working set for the cold regime, CUDA-graph replay for the hot one. |
 | `audit_claims.py` | adversarial self-audit: bootstrap CIs over raw timings, attribution against the fp16 control, per-optimization claims with their own controls, and a clock-verification gate. |
 | `between_run.py` | what a bootstrap CI does not cover: compares N independent full runs, reports the run-to-run interval, the inflation over the single-run CI, and whether any verdict moved. |

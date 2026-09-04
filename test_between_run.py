@@ -1121,3 +1121,86 @@ def test_load_tiers_indexes_by_method_and_ctx(tmp_path):
     tiers = audit_claims.load_tiers(f)
     assert ("fused_triton_4b", CTX) in tiers
     assert tiers[("fused_triton_4b", CTX)]["tier"] == dispersion_tier.TIER_PINNED
+
+
+# ---------------------------------------------------------------------------
+# The six-run coverage counter behind the figure and the README table
+# ---------------------------------------------------------------------------
+
+
+def _coverage_payload(tiers: dict) -> dict:
+    """A payload whose chain rows land in the tiers named by `tiers`.
+
+    `tiers` maps method -> "quotable" | "pinned" | "rejected". The series are
+    chosen so the tier falls out of the data rather than being asserted: tight
+    passes, wide-but-many fails the IQR gate and pins, drifting fails both. The
+    calibrator row is always present so there is a bar to judge against.
+    """
+    shape = {"quotable": lambda seed: (_tight(10.0, seed=seed), _tight(5.0, seed=seed + 1), True),
+             "pinned": lambda seed: (_wide(10.0, 400, seed=seed), _tight(5.0, seed=seed + 1), True),
+             "rejected": lambda seed: (_drift(10.0, seed=seed), _tight(5.0, seed=seed + 1), True)}
+    spec = {"triton_fp16_control_bar": (_grid(10.0, seed=99), _tight(5.0, seed=98), True)}
+    for i, (method, name) in enumerate(tiers.items()):
+        spec[method] = shape[name](i * 7 + 1)
+    return _tier_payload(spec)
+
+
+def _write_runs(tmp_path, specs) -> list[str]:
+    paths = []
+    for i, spec in enumerate(specs):
+        f = tmp_path / f"run{i}.json"
+        f.write_text(json.dumps(_coverage_payload(spec)), encoding="utf-8")
+        paths.append(f.name)
+    return paths
+
+
+def test_chain_coverage_counts_runs_not_rows(tmp_path, monkeypatch):
+    """Two runs: the chain is complete in both once the pinned tier is admitted,
+    and in only one on the gate alone."""
+    import make_session_plots as msp
+
+    monkeypatch.setattr(msp, "ROOT", tmp_path)
+    monkeypatch.setattr(msp, "CHAIN", ("fp16_sdpa", "triton_fp16_control",
+                                       "fused_triton_4b"))
+    names = _write_runs(tmp_path, [
+        {"fp16_sdpa": "quotable", "triton_fp16_control": "quotable",
+         "fused_triton_4b": "quotable"},
+        {"fp16_sdpa": "quotable", "triton_fp16_control": "quotable",
+         "fused_triton_4b": "pinned"},
+    ])
+    gate, tier, n = msp._chain_coverage(names)
+    assert n == 2
+    assert gate[CTX] == 1
+    assert tier[CTX] == 2
+
+
+def test_chain_coverage_does_not_admit_a_rejected_row(tmp_path, monkeypatch):
+    import make_session_plots as msp
+
+    monkeypatch.setattr(msp, "ROOT", tmp_path)
+    monkeypatch.setattr(msp, "CHAIN", ("fp16_sdpa", "triton_fp16_control",
+                                       "fused_triton_4b"))
+    names = _write_runs(tmp_path, [
+        {"fp16_sdpa": "quotable", "triton_fp16_control": "quotable",
+         "fused_triton_4b": "rejected"},
+    ])
+    gate, tier, n = msp._chain_coverage(names)
+    assert n == 1
+    assert gate[CTX] == 0 and tier[CTX] == 0
+
+
+def test_chain_coverage_skips_runs_that_are_not_there(tmp_path, monkeypatch):
+    """The figure is drawn from whatever runs exist; a missing file is not an
+    error, but it must not count toward the denominator either."""
+    import make_session_plots as msp
+
+    monkeypatch.setattr(msp, "ROOT", tmp_path)
+    monkeypatch.setattr(msp, "CHAIN", ("fp16_sdpa", "triton_fp16_control",
+                                       "fused_triton_4b"))
+    names = _write_runs(tmp_path, [
+        {"fp16_sdpa": "quotable", "triton_fp16_control": "quotable",
+         "fused_triton_4b": "quotable"},
+    ])
+    _, tier, n = msp._chain_coverage(names + ["nope.json"])
+    assert n == 1 and tier[CTX] == 1
+    assert msp._chain_coverage(["nope.json"]) is None
