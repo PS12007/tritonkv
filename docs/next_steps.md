@@ -288,6 +288,24 @@ re-run it after any benchmark run without thinking about it:
      there is a real **6.5 s boost transient** at 12001 MHz before the card
      settles to 11001.
 
+     **And the cooling loop does not explain the dispersion either — H-context,
+     pre-registered, landed (2026-09-04, `results/tail/reversed1.json`).** One
+     run with `--contexts 16384 8192 2048 512`. Failures by context went
+     512:2/2048:7/8192:1/16384:0 (normal) → 16384:1/8192:1/2048:1/512:4
+     (reversed): they follow the **context**, not the position. The correlation
+     between position and IQR **flipped sign**, −0.226 → +0.231. H-position
+     wanted ≥4 failures on ctx=16384/8192 and got 2. Short-context rows are noisy
+     because they are 3–5 µs long, not because of when they are measured.
+
+     Two by-products. The **L2-conditional survives** a protocol it was never
+     measured under (`quant_hot` < 1 everywhere; `quant_cold` 0.904 → 1.158 →
+     1.484 → 1.512, same crossing point). And **`quant_cold@16384` read 1.512
+     against 1.416–1.469 from three full runs** — on a tier-2 row, so usable, and
+     consistent with the bandwidth law: `control@16384` at 305 GB/s is the most
+     protocol-sensitive row here and reversal moves it from last to first.
+     **One run, so an observation not a shift** — establishing it needs three
+     reversed runs. `quant_cold@8192` is unaffected (+0.3%).
+
      **Both arms of the two-mechanism hypothesis are now dead** — thermal on
      effect size, warm-up on time constant. What survives is the observation
      itself: `subset` → `preloaded` improves spread 13.2% → 0.6% for 300 s of

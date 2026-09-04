@@ -1855,3 +1855,53 @@ reason to be suspicious of wanting it.
 A mixed outcome is possible and is not a failure of the design: failures moving
 partly is evidence for both mechanisms operating, and the split is the number to
 report.
+
+## The result: H-context, and position was a proxy all along
+
+One reversed run, 790 s, 41/48 quotable, `results/tail/reversed1.json`.
+
+| | context order | failures by context | by quarter of the run | corr(position, IQR) |
+|---|---|---|---|---|
+| normal | 512 → 16384 | 512:2 2048:7 8192:1 16384:0 | 2 / 7 / 1 / 0 | **−0.226** |
+| reversed | 16384 → 512 | 16384:1 8192:1 2048:1 512:4 | 1 / 1 / 1 / 4 | **+0.231** |
+
+**The correlation with position flipped sign while the association with context
+stayed.** Failures sat on the short contexts when those were measured first, and
+on the short contexts when those were measured last. Position was a proxy for
+context and nothing more.
+
+Pre-registered H-position wanted **≥ 4** failures on ctx=16384/8192 in the
+reversed run; it got **2**. H-context wanted ctx=16384 to stay near zero and the
+pattern to be unchanged; it got 1, and the pattern is unchanged. **H-context
+lands**, which is the side that was predicted — worth saying, because H-position
+was the more interesting result and wanting it was a reason to distrust it.
+
+So the cooling loop's ~120 s time constant is real and does **not** show up as
+timing dispersion by position. The short-context rows are noisy because they are
+3–5 µs long, where a fixed amount of jitter is a large fraction of the median.
+That mechanism never needed position to explain anything.
+
+### Two by-products of the reversed run
+
+**The L2-conditional survives a protocol it was never measured under.**
+`quant_hot` is below 1 at every context (0.853 / 0.895 / 0.797 / 0.733 — the bits
+cost, L2-resident) and `quant_cold` crosses 1 between 512 and 2048 (0.904 →
+1.158 → 1.484 → 1.512). Same sign, same crossing point, a different measurement
+order. This is the first time the conditional has been checked against a protocol
+change that was not designed around it.
+
+**But `quant_cold@16384` moved +4.9%, and it should be watched.** 1.442 in run 3
+against **1.512** reversed, which is outside the 1.416–1.469 that three full runs
+gave. It is not a rejected row: `triton_fp16_control@16384` is tier-2 in this run
+(pinned to ±1.25%, floor 6.2%, against a 51% effect), so the number is usable.
+
+The obvious reading is that this is the bandwidth law again. `control@16384` at
+305 GB/s is the most protocol-sensitive row in the benchmark, and reversing the
+order moves it from being measured *last* — after ten minutes of work — to being
+measured *first*, before the machine has settled. `quant_cold@8192`, whose
+control pulls 257 GB/s, moved +0.3%. The most exposed row moved most.
+
+That is **one run**, so it is an observation and not a shift. Recording it as
+such: context order is a candidate protocol variable, the 16k cell is where it
+would show, and establishing it needs three reversed runs rather than one. The
+headline `quant_cold@8192` is unaffected either way.
