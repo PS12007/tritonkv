@@ -699,22 +699,37 @@ open. It does not explain the control's misfit in general, though: `@8k` is the
 under all four. Spread at this cell, and the rate at which
 a row drops a memory P-state:
 
-| protocol | wall | spread | excursions | DRAM-resident |
-|---|---|---|---|---|
-| `full` | 785 s | 0.6% | 2.8% | 0 |
-| `subset` | 205 s | 13.2% | 12.5% | 2 |
-| `preloaded` | 502 s | 0.6% | 2.8% | 0 |
-| `fullpre` | 1080 s | 8.4% | 6.9% | 1 |
+| protocol | wall | spread | spread, usable runs only | runs surviving | excursions |
+|---|---|---|---|---|---|
+| `full` | 785 s | 0.6% | 0.6% | 3/3 | 2.8% |
+| `subset` | 205 s | 13.2% | *n=1* | **1/3** | 12.5% |
+| `preloaded` | 502 s | 0.6% | 0.6% | 3/3 | 2.8% |
+| `fullpre` | 1080 s | 8.4% | **0.3%** | **2/3** | 6.9% |
 
-The two steady protocols are the 785 s one and the 502 s one; the two unsteady
-ones are the **shortest** and the **longest**. That is not monotone in load, and
-not in temperature either — 69.3 / 69.5 / 70.8 / 72.1 C on these rows, so the
-coolest protocol and the hottest are the two that misbehave. A two-mechanism
-reading fits (too little preceding work and the clock never comes up; too much
-and thermal pressure pulls it back down), but four protocols on one card with two
-free parameters is a description, not a test. It is on the open list, and it is
-the reason "sustained load holds the memory clock up" is no longer stated here
-without qualification.
+The third column is the correction, and it is a large one. A protocol's spread is
+the range of its runs' point estimates, and nothing was checking whether those
+runs were ones this project would quote. **`fullpre`'s 8.4% is one rejected
+run** — over the runs that survive the gate it is **0.3%**, the tightest protocol
+measured here rather than the second worst. `subset` loses two of three and
+cannot be given a range at all. The two protocols that looked steady lost
+nothing.
+
+So "the shortest and the longest are the unsteady ones" was, for the longest,
+an artefact of quoting a run whose `fused_triton_4b@8192` sat at 10232 MHz
+against a cell median of 11001 — the memory P-state excursion
+`clock_excursions.py` flags and the row the gate rejects. The spread ranking and
+the excursion ranking are the same ranking, because one is largely made of the
+other.
+
+That re-poses the open question rather than answering it: **why do the shortest
+and the longest protocols produce more P-state excursions?** That is a rate over
+72–288 observations instead of a range over three runs, which is far better
+conditioned — and `fullpre` drops out of the puzzle. `compare_protocols.py` now
+prints both ranges whenever they differ, so a spread that is really a rejection
+count cannot be quoted as though it were a measurement.
+
+It remains the reason "sustained load holds the memory clock up" is not stated
+here without qualification.
 
 **The thermal half of that reading is now ruled out at these temperatures.**
 `thermal_check.py` expresses every observation as a deviation from its own
@@ -977,7 +992,7 @@ python -m venv .venv
 .venv/Scripts/python.exe -m pip install -r requirements.txt
 
 .venv/Scripts/python.exe -m pytest test_correctness.py -q   # 106 tests, ~89 s (GPU)
-.venv/Scripts/python.exe -m pytest test_between_run.py -q    # 124 tests, ~13 s (no GPU)
+.venv/Scripts/python.exe -m pytest test_between_run.py -q    # 134 tests, ~16 s (no GPU)
 .venv/Scripts/python.exe benchmark.py --quick                # ~75 s smoke run
 .venv/Scripts/python.exe benchmark.py --samples 50           # full suite, ~13 min
 .venv/Scripts/python.exe dispersion_tier.py                  # three-tier verdict per row
@@ -1045,7 +1060,7 @@ committed.
 | `kernels/fused_decode_attn.py` | the fused kernel. |
 | `kernels/fp16_decode_attn.py` | the control: identical shape, unquantized. Isolates the flash-decoding effect. |
 | `test_correctness.py` | 106 tests on the kernel, explicit asserted thresholds. |
-| `test_between_run.py` | 124 CPU-only tests on the between-run, excursion, protocol, dispersion-tier and bandwidth-law machinery — including the 2x2 arithmetic, the design reader and the tier's calibration bar — against synthetic runs with known answers. |
+| `test_between_run.py` | 134 CPU-only tests on the between-run, excursion, protocol, dispersion-tier and bandwidth-law machinery — including the 2x2 arithmetic, the design reader and the tier's calibration bar — against synthetic runs with known answers. |
 | `benchmark.py` | timing + memory. Rotating working set for the cold regime, CUDA-graph replay for the hot one. |
 | `audit_claims.py` | adversarial self-audit: bootstrap CIs over raw timings, attribution against the fp16 control, per-optimization claims with their own controls, and a clock-verification gate. |
 | `between_run.py` | what a bootstrap CI does not cover: compares N independent full runs, reports the run-to-run interval, the inflation over the single-run CI, and whether any verdict moved. |

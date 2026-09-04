@@ -49,7 +49,7 @@ Everything below is verified on this machine, not assumed.
   `min_effect_frac`. Post-hoc from the raw samples, so it runs on any results
   JSON ever recorded and never touches `benchmark.py`. Run 3: **39 quotable /
   7 pinned / 2 rejected**.
-- `python -m pytest test_between_run.py -q` → **131** CPU-only tests, ~13 s,
+- `python -m pytest test_between_run.py -q` → **134** CPU-only tests, ~16 s,
   covering `between_run.py`, `clock_excursions.py`, `compare_protocols.py` and
   `dispersion_tier.py` (including the 2x2 arithmetic, the design reader, and the
   tier's calibration bar and per-claim admissibility).
@@ -338,6 +338,21 @@ re-run it after any benchmark run without thinking about it:
      **Do not run more protocol repetitions.** What would settle this is a
      variable the current sampler does not record, and the obvious one cannot be
      read on this hardware.
+
+   - **AND THE SPREADS THAT MOTIVATED ALL OF THIS WERE MOSTLY REJECTED RUNS
+     (2026-09-04).** A protocol's spread is the range of its runs' point
+     estimates and nothing checked whether those runs were quotable. At
+     `quant_cold@8192`, over runs that survive the gate: `full` 0.6% (3/3),
+     `subset` n=1 (**1/3**), `preloaded` 0.6% (3/3), `fullpre` **0.3%**
+     (**2/3**). **`fullpre`'s 8.4% was one rejected run** — over usable runs it
+     is the *tightest* protocol measured. `subset` cannot be given a range at
+     all. The spread ranking and the excursion ranking are the same ranking
+     because one is largely made of the other.
+
+     So the open question is now **why do the shortest and longest protocols
+     produce more P-state excursions** — a rate over 72–288 observations rather
+     than a range over three runs, and `fullpre` drops out of it.
+     `compare_protocols.py` prints both ranges whenever they differ.
 
    - Original framing, kept for the record. Spreads
      at `quant_cold@8192` are `full` 0.6%, `subset` 13.2%, `preloaded` 0.6%,
