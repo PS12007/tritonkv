@@ -34,10 +34,15 @@ exists to avoid.
 
 **The sign flip is fully clock-verified at ctx=8192, in all three runs.** SDPA,
 the fp16 control and the fused kernel all pass the gate there every time:
-**0.800–0.813× L2-resident, 1.469–1.478× DRAM-resident.** ctx=512 and ctx=2048
-clear the gate in one run and not the others — a fact about the card, not the
-kernel — so they are quoted with that qualifier. Earlier versions of this claim
-rested on rows where the fp16 control had failed the gate.
+**0.800–0.813× L2-resident, 1.469–1.478× DRAM-resident.**
+
+ctx=512 and ctx=2048 were previously quoted with "clears the gate in one run and
+not the others". Measured over six full runs and admitting the pinned tier, all
+three rows of the chain survive at **6/6** runs at both contexts (against 3/6 and
+2/6 on the gate alone). ctx=8192 is unchanged at 5/6 and ctx=16384 goes 2/6 →
+4/6. Promotion is still a property of the run — no row is promoted in all six —
+so this is stated with a denominator, not as a star. Earlier versions of this
+claim rested on rows where the fp16 control had failed the gate.
 
 ---
 
@@ -47,8 +52,8 @@ rested on rows where the fp16 control had failed the gate.
 
 | ctx | SDPA fp16 | Triton fp16 control | fused 4-bit | fused 2-bit | gather-meta 4-bit | split | quant |
 |---|---|---|---|---|---|---|---|
-| 512 | 46.4 | 3.3 | 4.6* | 5.9* | 5.3 | 14.0× | 0.73× |
-| 2048 | 174.9 | 6.7* | 8.2* | 7.9* | 9.9* | 26.2× | 0.81× |
+| 512 | 46.4 | 3.3 | 4.6~ | 5.9~ | 5.3 | 14.0× | 0.73× |
+| 2048 | 174.9 | 6.7~ | 8.2~ | 7.9~ | 9.9~ | 26.2× | 0.81× |
 | 8192 | 734.7 | 13.5 | 17.1 | 16.8 | 23.6 | 54.3× | **0.79×** |
 | 16384 | 1456.9 | 21.3 | 29.2 | 29.3 | 43.0 | 68.4× | **0.73×** |
 
@@ -56,8 +61,8 @@ rested on rows where the fp16 control had failed the gate.
 
 | ctx | SDPA fp16 | Triton fp16 control | fused 4-bit | fused 2-bit | gather-meta 4-bit | split | quant |
 |---|---|---|---|---|---|---|---|
-| 512 | 49.0 | 4.6 | 5.1* | 6.4* | 5.9 | 10.5× | 0.90× |
-| 2048 | 179.6 | 11.8* | 9.7* | 9.3* | 11.4* | 15.3× | 1.21× |
+| 512 | 49.0 | 4.6 | 5.1~ | 6.4~ | 5.9 | 10.5× | 0.90× |
+| 2048 | 179.6 | 11.8~ | 9.7~ | 9.3~ | 11.4~ | 15.3× | 1.21× |
 | 8192 | 735.6 | 32.8 | 22.2 | 20.7 | 27.5 | 22.4× | **1.48×** |
 | 16384 | 1464.1 | 55.6 | 38.6 | 35.8 | 48.7 | 26.3× | **1.44×** |
 
@@ -71,6 +76,15 @@ every `nvidia-smi` sample during its sampling loop was ≥ 70% of the 3090 MHz
 maximum SM clock, its own IQR was ≤ 5% of its median, **and its clock window
 holds ≥ 4 samples**. Every rejection in this run is dispersion; there are no
 clock rejections left.
+
+**`~` is the second tier, not a star.** All nine rejections in this run are
+dispersion, and `dispersion_tier.py` asks the question the gate does not: how
+well is the *median* pinned, which is the number these tables quote? Seven of the
+nine pin every regime at least as well as the worst row the gate already accepts
+(±1.70%, itself an unstarred row here), so they are marked `~` and used for
+effects at least 5× their own pin. The `~` rows above are pinned to ±0.20–1.04%
+against quantization effects of 10–27%. Two rows are **not** promoted — pinned
+only to ±2.33% and ±2.68% — which is why the gate was not widened instead.
 
 ---
 
@@ -224,7 +238,21 @@ unrealistically easy input for a quantizer.
    0.2%. `compare_protocols.py` measures it; `audit_claims.py` carries it as
    `method.protocol_choice`.
 
-**All nine are apparatus. None is a bug in the kernel.** That count is the most
+10. **The gate tested a statistic nobody quotes (2026-09-03).** A row is
+    rejected when its *per-sample IQR* exceeds 5% of its median, but every table
+    here quotes the *median*, and on the short L2-resident rows those two come
+    apart completely — eight of run 3's ten rejected measurements pin their
+    medians to ±0.05–1.31% while scattering 5.6–11.5% per sample. The fix is not
+    a wider gate, which would also admit the two rows pinned only to ±2.33% and
+    ±2.68%; it is a second verdict whose bar is **the worst-pinned row the gate
+    already accepts** (±1.70%), so it cannot admit anything less certain than a
+    number already printed unstarred. Over six full runs this takes the
+    attribution chain at ctx=512 from 3/6 runs to 6/6 and at ctx=2048 from 2/6 to
+    6/6 — the two contexts carrying the sign flip, previously quoted with an
+    apologetic qualifier. `dispersion_tier.py` measures it; `audit_claims.py`
+    carries it as `method.dispersion_tier` and marks promoted rows `~`.
+
+**All ten are apparatus. None is a bug in the kernel.** That count is the most
 transferable thing in this repo: on a thermally-limited consumer part the
 measurement is harder than the optimization, and every one of these corrections
 moved a number that had already been written down as a result.

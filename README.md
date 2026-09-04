@@ -75,8 +75,8 @@ and which side of 1.0 it lands on depends on whether the cache fits in L2.
 
 | ctx | SDPA fp16 | Triton fp16 (control) | fused 4-bit | fused 2-bit | flash-decode effect | quantization effect |
 |---|---|---|---|---|---|---|
-| 512 | 46.4 | 3.3 | 4.6* | 5.9* | 14.0× | 0.73× |
-| 2048 | 174.9 | 6.7* | 8.2* | 7.9* | 26.2× | 0.81× |
+| 512 | 46.4 | 3.3 | 4.6~ | 5.9~ | 14.0× | 0.73× |
+| 2048 | 174.9 | 6.7~ | 8.2~ | 7.9~ | 26.2× | 0.81× |
 | 8192 | 734.7 | 13.5 | 17.1 | 16.8 | 54.3× | **0.79×** |
 | 16384 | 1456.9 | 21.3 | 29.2 | 29.3 | 68.4× | **0.73×** |
 
@@ -87,13 +87,16 @@ whole apparent win is the split.
 
 | ctx | SDPA fp16 | Triton fp16 (control) | fused 4-bit | fused 2-bit | flash-decode effect | quantization effect |
 |---|---|---|---|---|---|---|
-| 512 | 49.0 | 4.6 | 5.1* | 6.4* | 10.5× | 0.90× |
-| 2048 | 179.6 | 11.8* | 9.7* | 9.3* | 15.3× | 1.21× |
+| 512 | 49.0 | 4.6 | 5.1~ | 6.4~ | 10.5× | 0.90× |
+| 2048 | 179.6 | 11.8~ | 9.7~ | 9.3~ | 15.3× | 1.21× |
 | 8192 | 735.6 | 32.8 | 22.2 | 20.7 | 22.4× | **1.48×** |
 | 16384 | 1464.1 | 55.6 | 38.6 | 35.8 | 26.3× | **1.44×** |
 
-`*` = did not pass the clock-verification gate (see below) and is not quoted as
-evidence anywhere; every conclusion here rests on unstarred rows.
+`~` = failed the *per-sample dispersion* half of the gate, but pins its median
+at least as well as the worst row the gate accepts (`dispersion_tier.py`), and is
+quoted only for effects at least 5× that pin. `*` would mean not usable at all;
+there are none in these two tables. The distinction matters: every `~` row here
+is pinned to ±0.20–1.04% against quantization effects of 10–27%.
 
 The sign flips: once the cache genuinely comes from DRAM, 4-bit leads — but by
 **1.21–1.48×, not by an order of magnitude**.
@@ -101,11 +104,32 @@ The sign flips: once the cache genuinely comes from DRAM, 4-bit leads — but by
 **At ctx = 8192 the sign flip is fully clock-verified in all three runs**, with
 SDPA, the fp16 control and the fused kernel passing the gate at the same context
 every time: **0.79–0.81× L2-resident, 1.469–1.478× DRAM-resident** (the ranges
-are across the three runs, not a within-run CI — see below). It is the only
-context where that is true of all three runs; 512 and 2048 clear it in one run
-and not the others, which is a fact about the card's mood and not about the
-kernel. Earlier versions of this claim rested on rows where the control had
-failed the gate.
+are across the three runs, not a within-run CI — see below).
+
+ctx=512 and ctx=2048 used to be quoted with an apologetic "clears the gate in one
+run and not the others". That qualifier was wrong in a specific way: those rows
+were being rejected for their *per-sample* spread, while the number quoted from
+them is the *median*, and on rows this short the two come apart. Measured over
+six full runs, all three rows of the attribution chain survive at each context:
+
+| ctx | gate alone | gate + pinned tier |
+|---|---|---|
+| 512 | 3/6 | **6/6** |
+| 2048 | 2/6 | **6/6** |
+| 8192 | 5/6 | 5/6 |
+| 16384 | 2/6 | 4/6 |
+
+The bar for the second tier is not a chosen number — it is the worst-pinned row
+the gate already accepts (±1.70% on run 3), so it cannot admit anything less
+certain than a row this README already prints unstarred. ctx=8192 does not move,
+because its one incomplete run fails on a median genuinely pinned to only
+±1.91%. See `docs/next_steps.md`.
+
+Two things this does **not** fix: promotion is a property of the run, exactly as
+quotability is — no row is promoted in all six runs — and the ranges above are
+still the run-to-run ones, which are a median 2.4× wider than any single run's
+CI. Earlier versions of this claim rested on rows where the control had failed
+the gate.
 
 ![What the quantization itself buys](docs/plots/quantization_effect_4b.png)
 
@@ -740,7 +764,28 @@ unknown*.
 
 **The gate is unchanged.** Loosening a gate because it is inconvenient is how the
 numbers this project exists to avoid get published. What changed is that the
-audit now states this against itself, as `method.dispersion_gate`.
+audit states this against itself, as `method.dispersion_gate` — and that there is
+now a third verdict instead of a wider gate.
+
+`dispersion_tier.py` splits the rejects in two. A row joins the **pinned** tier if
+it failed the per-sample IQR gate but pins every regime's median at least as well
+as *the worst row the gate itself accepts* — ±1.70% on run 3, from
+`fused_gather_meta_4b@512`, a row this README prints unstarred. The bar is read
+off the instrument per run rather than chosen, so the tier cannot admit a number
+less certain than one already quoted, and across six full runs it lands at
+1.43–1.96%. Run 3: **39 quotable / 7 pinned / 2 rejected** of 48.
+
+The two that stay rejected are pinned to ±2.33% and ±2.68% — which is exactly why
+`MAX_IQR_FRAC` was not widened instead. Widening admits those two along with the
+seven that deserve it; the median-precision test separates them.
+
+Two restrictions keep it a report rather than a loophole. A **clock-rejected row
+is never promoted** — the gate is not a P-state filter, so that failure is
+invisible here. And promotion is **per claim**: a pinned row carries a floor of 5×
+its own median uncertainty, and the audit marks it `~` rather than starring it,
+against the effect it is actually being asked to support. Today no promoted row
+is asked to support an effect below its floor — the guard is slack, which is a
+statement about the claims and not about the guard.
 
 Historically the `FALSE` verdicts have been this project's own claims about the
 L2-resident regime, and the audit is what puts them there.
@@ -805,9 +850,10 @@ python -m venv .venv
 .venv/Scripts/python.exe -m pip install -r requirements.txt
 
 .venv/Scripts/python.exe -m pytest test_correctness.py -q   # 106 tests, ~89 s (GPU)
-.venv/Scripts/python.exe -m pytest test_between_run.py -q    # 32 tests, ~3 s (no GPU)
+.venv/Scripts/python.exe -m pytest test_between_run.py -q    # 74 tests, ~10 s (no GPU)
 .venv/Scripts/python.exe benchmark.py --quick                # ~75 s smoke run
 .venv/Scripts/python.exe benchmark.py --samples 50           # full suite, ~13 min
+.venv/Scripts/python.exe dispersion_tier.py                  # three-tier verdict per row
 .venv/Scripts/python.exe audit_claims.py                     # reads results/benchmark.json
 .venv/Scripts/python.exe make_plots.py                       # regenerates docs/plots/
 .venv/Scripts/python.exe make_session_plots.py               # the process figures
@@ -871,13 +917,14 @@ committed.
 | `kernels/fused_decode_attn.py` | the fused kernel. |
 | `kernels/fp16_decode_attn.py` | the control: identical shape, unquantized. Isolates the flash-decoding effect. |
 | `test_correctness.py` | 106 tests on the kernel, explicit asserted thresholds. |
-| `test_between_run.py` | 47 CPU-only tests on the between-run, excursion and protocol machinery — including the 2x2 arithmetic and the design reader — against synthetic runs with known answers. |
+| `test_between_run.py` | 74 CPU-only tests on the between-run, excursion, protocol and dispersion-tier machinery — including the 2x2 arithmetic, the design reader and the tier's calibration bar — against synthetic runs with known answers. |
 | `benchmark.py` | timing + memory. Rotating working set for the cold regime, CUDA-graph replay for the hot one. |
 | `audit_claims.py` | adversarial self-audit: bootstrap CIs over raw timings, attribution against the fp16 control, per-optimization claims with their own controls, and a clock-verification gate. |
 | `between_run.py` | what a bootstrap CI does not cover: compares N independent full runs, reports the run-to-run interval, the inflation over the single-run CI, and whether any verdict moved. |
 | `clock_excursions.py` | the rate at which a row drops a memory P-state, split by run protocol and regime, with the gate's verdict on each. |
 | `compare_protocols.py` | whether two measurement protocols produce the same numbers at all, the bandwidth law that says which rows they will disagree on, and the 2x2 that separates run length from recent saturation. |
 | `analyze_dispersion.py` | decomposes every rejected measurement into trend, tail and floor, so the gate is argued with rather than tuned. |
+| `dispersion_tier.py` | the third verdict: which gate-failed rows pin their medians well enough to be used anyway, judged against the worst row the gate already accepts. Post-hoc, so it never touches the instrument. |
 | `sweep_group_size.py`, `probe_gs128.py` | the metadata-load sweep and the static PTX probe behind the gs=128 cliff. |
 | `make_plots.py` | the figures in `docs/plots/`, regenerated from `results/benchmark.json`. |
 | `make_session_plots.py` | the argument figures about the project's own measurement process. |
