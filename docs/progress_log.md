@@ -2231,3 +2231,68 @@ four of the nine.**
 
 `make_session_plots.py` draws the figure from the same list, so
 `docs/plots/dispersion_tier.png` is regenerated with the nine-run denominator.
+
+## A kernel change that is free, correct, and worth nothing
+
+First kernel work in a while, and it produced a negative that sharpens a claim
+this repo has been making.
+
+**The change.** The shipped dequantization widens the per-group scale and zero to
+fp32, reconstructs `code * scale + zero` there, and narrows the result back to
+fp16 for `tl.dot`. `dequant_fp16=True` does the same arithmetic without ever
+leaving fp16.
+
+**It is bitwise identical.** Not close — equal, `torch.equal` across 40
+(S, nbits, group_size) cases. That is not luck: the code is a 2- or 4-bit
+integer and the scale and zero are fp16 values read straight from memory, so the
+product and the sum are exactly representable at fp16 and the wider intermediate
+had nothing to add. The test asserts equality rather than a tolerance, so it will
+notice if that stops being true — at a larger bit width, or if the metadata ever
+becomes fp32 in memory.
+
+**It removes real work.** PTX op counts, `ctx=8192`, 4-bit, gs=32:
+
+| op | fp32 dequant | fp16 dequant | delta |
+|---|---|---|---|
+| `cvt.` | 369 | 289 | **−80** |
+| `ld.global` | 10 | 10 | 0 |
+| `ld.shared` / `st.shared` | 62 / 28 | 62 / 28 | 0 |
+| `mma.sync` | 32 | 32 | 0 |
+| **total** | **576** | **496** | **−80** |
+
+Every other op is unchanged; the entire difference is the conversion round-trip.
+Registers are identical at 128 with no spills, so the register-pressure guess
+that motivated the change was simply wrong.
+
+**And it buys nothing.** Interleaved A/B, CUDA-graph replay, L2-resident — the
+regime where issue cost should matter most:
+
+| ctx | fp32 dequant | fp16 dequant | speedup |
+|---|---|---|---|
+| 2048 | 8.22 µs (IQR 1.8%) | 8.16 µs (IQR 2.4%) | 1.0075x |
+| 8192 | 18.61 µs (IQR 2.2%) | 18.56 µs (IQR 2.2%) | 1.0029x |
+| 16384 | 28.76 µs (IQR 0.7%) | 28.89 µs (IQR 0.8%) | 0.9954x |
+
++0.7% to −0.5%, all inside the IQRs. The honest statement is **no effect larger
+than about 1%**, which is what this measurement can resolve.
+
+### What it corrects
+
+`_load_group_meta`'s docstring said the kernel is issue-bound and "instruction
+count is the binding constraint". That was inferred from the metadata-broadcast
+win: 16x fewer metadata **loads** bought 1.29x. This result shows the
+generalisation is wrong — 14% fewer instructions, *all of them conversions*,
+buys nothing.
+
+So the binding constraint is **load issue**, not instruction issue. Conversions
+are free here; they hide behind memory latency. The docstring now says so, and
+says not to generalise from the first result to the second kind.
+
+The flag stays. It defaults to `False`, Triton specialises on the constexpr so
+the shipped path compiles to exactly what it compiled to before (the 146 tests
+confirm), and it costs one branch in the source to keep a measured negative
+reproducible rather than a paragraph claiming one. It is deliberately **not**
+added as a benchmark method: that would change the method count, which this
+project has measured as worth +3.8% on the headline cell.
+
+`test_correctness.py`: 106 → **146**.

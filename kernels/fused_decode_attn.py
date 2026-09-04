@@ -99,8 +99,14 @@ if triton is not None:
         GS: tl.constexpr,
         D: tl.constexpr,
         BCAST: tl.constexpr,
+        FP16: tl.constexpr,
     ):
-        """Return a ``(BLOCK_N, D)`` fp32 tile of a per-group scale or zero.
+        """Return a ``(BLOCK_N, D)`` tile of a per-group scale or zero.
+
+        ``FP16=True`` keeps the tile in fp16 instead of widening it to fp32.
+        The tile is ``BLOCK_N x D`` and there are four of them live per loop
+        iteration (K and V, scale and zero), so the width of this decision is
+        most of the kernel's register budget rather than a detail.
 
         Both branches produce identical values; they differ only in how many
         load instructions it takes.
@@ -118,6 +124,14 @@ if triton is not None:
         bandwidth-bound: the 4-bit path reaches ~64 GB/s while the fp16 control
         does ~410 GB/s out of L2, so instruction count is the binding
         constraint and DRAM traffic is not.
+
+        More precisely -- and this was measured, not assumed -- it is the count
+        of *load* instructions that binds, not of instructions generally. The
+        ``DEQ_FP16`` path below removes 80 conversion instructions per kernel
+        (14% of the PTX op count) for a speed change of +0.7% to -0.5%, inside
+        the measurement's own IQR. Cutting metadata loads 16x bought 1.29x;
+        cutting conversions bought nothing. Do not generalise "fewer
+        instructions" from the first result to the second kind.
         """
         if BCAST:
             meta = tl.load(
@@ -126,7 +140,7 @@ if triton is not None:
                 + tl.arange(0, NG)[None, :] * stride_g,
                 mask=n_mask[:, None],
                 other=0.0,
-            ).to(tl.float32)
+            ).to(tl.float16 if FP16 else tl.float32)
             return tl.reshape(
                 tl.broadcast_to(meta[:, :, None], (BLOCK_N, NG, GS)), (BLOCK_N, D)
             )
@@ -135,7 +149,7 @@ if triton is not None:
             base + offs_n[:, None] * stride_n + grp_idx[None, :] * stride_g,
             mask=n_mask[:, None],
             other=0.0,
-        ).to(tl.float32)
+        ).to(tl.float16 if FP16 else tl.float32)
 
     @triton.jit
     def _fused_decode_attn_split(
@@ -166,6 +180,7 @@ if triton is not None:
         SINGLE_SPLIT: tl.constexpr,
         BCAST_META: tl.constexpr,
         FOLD_ZP: tl.constexpr,
+        DEQ_FP16: tl.constexpr,
     ):
         pid_bh = tl.program_id(0)
         pid_s = tl.program_id(1)
@@ -263,13 +278,21 @@ if triton is not None:
                 kcode = (kp >> bit_shift[None, :]) & code_mask
                 ksc = _load_group_meta(
                     ks_base, offs_n, n_mask, stride_ksn, stride_ksg,
-                    BLOCK_N, NG, GS, D, BCAST_META,
+                    BLOCK_N, NG, GS, D, BCAST_META, DEQ_FP16,
                 )
                 kze = _load_group_meta(
                     kz_base, offs_n, n_mask, stride_ksn, stride_ksg,
-                    BLOCK_N, NG, GS, D, BCAST_META,
+                    BLOCK_N, NG, GS, D, BCAST_META, DEQ_FP16,
                 )
-                k_deq = (kcode.to(tl.float32) * ksc + kze).to(tl.float16)
+                # The result is cast to fp16 for `tl.dot` either way; DEQ_FP16
+                # only decides whether the multiply-add that produces it is done
+                # at fp32 or fp16 width. The code is 2 or 4 bits, so the value
+                # being reconstructed carries far less information than either
+                # format holds -- the question is register pressure, not range.
+                if DEQ_FP16:
+                    k_deq = kcode.to(tl.float16) * ksc + kze
+                else:
+                    k_deq = (kcode.to(tl.float32) * ksc + kze).to(tl.float16)
                 qk = tl.dot(q, tl.trans(k_deq), out_dtype=tl.float32) * qk_scale
 
             # ---- online softmax ------------------------------------------
@@ -292,13 +315,16 @@ if triton is not None:
             vcode = (vp >> bit_shift[None, :]) & code_mask
             vsc = _load_group_meta(
                 vs_base, offs_n, n_mask, stride_vsn, stride_vsg,
-                BLOCK_N, NG, GS, D, BCAST_META,
+                BLOCK_N, NG, GS, D, BCAST_META, DEQ_FP16,
             )
             vze = _load_group_meta(
                 vz_base, offs_n, n_mask, stride_vsn, stride_vsg,
-                BLOCK_N, NG, GS, D, BCAST_META,
+                BLOCK_N, NG, GS, D, BCAST_META, DEQ_FP16,
             )
-            v_deq = (vcode.to(tl.float32) * vsc + vze).to(tl.float16)
+            if DEQ_FP16:
+                v_deq = vcode.to(tl.float16) * vsc + vze
+            else:
+                v_deq = (vcode.to(tl.float32) * vsc + vze).to(tl.float16)
 
             acc += tl.dot(p.to(tl.float16), v_deq, out_dtype=tl.float32)
 
@@ -400,6 +426,7 @@ def fused_decode_attention(
     num_splits: int | None = None,
     meta_bcast: bool = True,
     fold_zp: bool = False,
+    dequant_fp16: bool = False,
     out: torch.Tensor | None = None,
     _workspace: dict | None = None,
 ) -> torch.Tensor:
@@ -522,6 +549,7 @@ def fused_decode_attention(
         SINGLE_SPLIT=single,
         BCAST_META=meta_bcast,
         FOLD_ZP=fold_zp,
+        DEQ_FP16=dequant_fp16,
         num_warps=num_warps,
         num_stages=num_stages,
     )

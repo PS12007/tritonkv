@@ -1006,7 +1006,7 @@ python -m venv .venv
 .venv/Scripts/python.exe -m pip install torch==2.12.0 --index-url https://download.pytorch.org/whl/cu130
 .venv/Scripts/python.exe -m pip install -r requirements.txt
 
-.venv/Scripts/python.exe -m pytest test_correctness.py -q   # 106 tests, ~89 s (GPU)
+.venv/Scripts/python.exe -m pytest test_correctness.py -q   # 146 tests, ~2 min (GPU)
 .venv/Scripts/python.exe -m pytest test_between_run.py -q    # 139 tests, ~18 s (no GPU)
 .venv/Scripts/python.exe benchmark.py --quick                # ~75 s smoke run
 .venv/Scripts/python.exe benchmark.py --samples 50           # full suite, ~13 min
@@ -1074,7 +1074,7 @@ committed.
 | `reference.py` | fp32 ground truth + the baselines. Probes six fp16 attention strategies per shape and caches the fastest, so the baseline is not a strawman. |
 | `kernels/fused_decode_attn.py` | the fused kernel. |
 | `kernels/fp16_decode_attn.py` | the control: identical shape, unquantized. Isolates the flash-decoding effect. |
-| `test_correctness.py` | 106 tests on the kernel, explicit asserted thresholds. |
+| `test_correctness.py` | 146 tests on the kernel, explicit asserted thresholds — including two bitwise-identity suites (metadata broadcast, fp16 dequant) that assert equality rather than a tolerance. |
 | `test_between_run.py` | 139 CPU-only tests on the between-run, excursion, protocol, dispersion-tier and bandwidth-law machinery — including the 2x2 arithmetic, the design reader and the tier's calibration bar — against synthetic runs with known answers. |
 | `benchmark.py` | timing + memory. Rotating working set for the cold regime, CUDA-graph replay for the hot one. |
 | `audit_claims.py` | adversarial self-audit: bootstrap CIs over raw timings, attribution against the fp16 control, per-optimization claims with their own controls, and a clock-verification gate. |

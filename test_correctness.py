@@ -312,3 +312,32 @@ def test_metadata_broadcast_is_bitwise_identical(S: int, nbits: int, group_size:
         f"S={S} nbits={nbits} gs={group_size}: max|diff| = "
         f"{(gathered - broadcast).abs().max().item():.3e}"
     )
+
+
+@requires_triton
+@pytest.mark.parametrize("S", [1, 17, 512, 2048, 8192])
+@pytest.mark.parametrize("nbits", SUPPORTED_BITS)
+@pytest.mark.parametrize("group_size", [16, 32, 64, 128])
+def test_fp16_dequant_is_bitwise_identical(S: int, nbits: int, group_size: int):
+    """Doing the dequantization multiply-add at fp16 width must change nothing.
+
+    The shipped path widens the per-group scale and zero to fp32, reconstructs
+    ``code * scale + zero`` there, and narrows the result back to fp16 for
+    ``tl.dot``. ``dequant_fp16=True`` does the same arithmetic without ever
+    leaving fp16, which removes 80 conversion instructions per kernel.
+
+    It is exactly equal rather than merely close, and that is not a coincidence:
+    the code is a 2- or 4-bit integer and the scale and zero are fp16 values read
+    straight from memory, so the product and sum are representable at fp16 and
+    the wider intermediate had nothing to add. Asserting equality is what would
+    catch that stopping being true -- at a larger bit width, or if the metadata
+    ever became fp32 in memory.
+    """
+    q, k, v = make_random_kv(1, 12, 2, S, 128, device="cuda", seed=13)
+    kq, vq = quantize_kv(k, v, nbits, group_size)
+    wide = fused_decode_attention(q, kq, vq, dequant_fp16=False)
+    narrow = fused_decode_attention(q, kq, vq, dequant_fp16=True)
+    assert torch.equal(wide, narrow), (
+        f"S={S} nbits={nbits} gs={group_size}: max|diff| = "
+        f"{(wide - narrow).abs().max().item():.3e}"
+    )

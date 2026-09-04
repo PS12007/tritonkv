@@ -12,7 +12,7 @@ Everything below is verified on this machine, not assumed.
   3.8.0.post28`, matplotlib, pytest, transformers. CUDA is live on an
   **RTX 5060 Laptop, sm_120, 26 SMs, 8 GB, 33.6 MB L2, 80 W**.
   Run things as `./.venv/Scripts/python.exe ...` — no activation needed.
-- `python -m pytest test_correctness.py -q` → **106 passed in ~89 s**.
+- `python -m pytest test_correctness.py -q` → **146 passed in ~2 min**.
 - `python benchmark.py --samples 50` → ~13 min, clock-monitored, writes
   `results/benchmark.json`. Three back-to-back runs on 2026-09-02 gave
   **42 / 41 / 39 of 48 rows quotable** (was 25/48 before the ramp fix), and
@@ -158,7 +158,20 @@ re-run it after any benchmark run without thinking about it:
    no row is promoted in all nine full runs, and the most any manages is four.
    Report tier-2 coverage over runs, never from a single one.
 
-2. **Where the metadata-load curve actually bends.** `sweep_group_size.py` ran
+2. **MEASURED AND REJECTED (2026-09-04): fp16 dequantization.** Doing
+   `code * scale + zero` at fp16 width instead of widening to fp32 is **bitwise
+   identical** (40 cases) and removes **80 conversion instructions** per kernel,
+   14% of the PTX op count — for a speed change of **+0.7% to −0.5%**, inside the
+   IQR. Registers unchanged at 128, no spills. Kept behind `dequant_fp16=False`
+   with tests, not added as a benchmark method (that would change the method
+   count, worth +3.8% on the headline cell).
+
+   **It corrects a claim:** the kernel is bound by **load** issue, not
+   instruction issue. 16x fewer metadata *loads* bought 1.29x; 14% fewer
+   *conversions* bought nothing. Do not generalise the first result to the second
+   kind.
+
+3. **Where the metadata-load curve actually bends.** `sweep_group_size.py` ran
    the sweep on both paths and the prediction ("broadcast sloped, gather flat")
    was refuted: broadcast is flat too, 1.07-1.17x across an 8x range of load
    counts. The honest shape is *saturation* -- 16x fewer loads bought 1.29x, a
