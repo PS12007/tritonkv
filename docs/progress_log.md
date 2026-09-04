@@ -1539,3 +1539,34 @@ The rival check **degrades rather than fails** when `base_ms` is absent: an olde
 `compare_protocols.json` gets the bandwidth-shape comparison and loses only the
 time-derived rivals. There is a test for that. `test_between_run.py`: 94 →
 **100**.
+
+
+### How solid is "the control misfits"? Less than it looked
+
+Two follow-ups, and the second cost the finding some of its strength.
+
+**Is the straight line the problem?** If the true relationship curved, a linear
+fit would dump its residuals onto the highest-bandwidth rows, which are all
+control rows — the misfit would be an artefact of the fit. Fitting
+`|shift| ~ GB/s**k` in log-log gives **k = 0.82 / 0.84 / 0.98**. Essentially
+linear, so no.
+
+**Is it just that the control's shifts are bigger?** A constant-variance fit
+under-weights rows with large values, so a method with 3.13 pp mean shifts will
+show larger absolute residuals than one with 1.15 pp for no interesting reason.
+Relative residuals are not flat either (control 1.66, fused 0.69), so not that.
+
+**But under the scale-free fit the control is worst in only 2 of 3 protocols**,
+against all three under the linear fit. Under `fullpre` the fused kernel is worst.
+So the misfit is real under the fit this repo uses and **not robust to the choice
+of fit**, and with four rows per method it is weak evidence either way. The report
+says exactly that rather than quoting the linear result alone.
+
+Ruled out so far, for why the fp16 control fits worst: bytes moved, footprint
+over L2, time, curvature, and shift magnitude. The memory clock does not explain
+it either — `control@8k` is the worst-fitting row and its clock is flat at
+11001 MHz under all four protocols. It stays open, better characterised than
+before, and it is now clear it is a small effect measured on four rows rather
+than a structural fact waiting to be named.
+
+`test_between_run.py`: 100 → **105**.

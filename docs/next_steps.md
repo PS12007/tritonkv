@@ -39,7 +39,7 @@ Everything below is verified on this machine, not assumed.
   `min_effect_frac`. Post-hoc from the raw samples, so it runs on any results
   JSON ever recorded and never touches `benchmark.py`. Run 3: **39 quotable /
   7 pinned / 2 rejected**.
-- `python -m pytest test_between_run.py -q` → **100** CPU-only tests, ~11 s,
+- `python -m pytest test_between_run.py -q` → **105** CPU-only tests, ~11 s,
   covering `between_run.py`, `clock_excursions.py`, `compare_protocols.py` and
   `dispersion_tier.py` (including the 2x2 arithmetic, the design reader, and the
   tier's calibration bar and per-claim admissibility).
@@ -250,8 +250,13 @@ re-run it after any benchmark run without thinking about it:
      *fourth-best fit of twelve* (mean |residual| 0.45 pp). The misfits are all
      four `triton_fp16_control` rows: 1.74 pp against 0.41 pp for everything
      else, worst at `@8k` (2.32) and `@16k` (2.28). `bandwidth_law.py` measures
-     it. Why the control specifically is now the open question, and the memory
-     clock does **not** answer it — `control@8k` is the worst-fitting row of the
+     it. Why the control specifically is now the open question — and it is
+     weaker than it first looked: under a scale-free log-log fit (exponent
+     0.82/0.84/0.98, so the relationship is essentially linear) the control is
+     worst under only **2 of 3** protocols. Ruled out so far: bytes moved,
+     footprint, time, curvature of the fit, and "its shifts are just bigger"
+     (relative residuals are not flat either). The memory clock does **not**
+     answer it — `control@8k` is the worst-fitting row of the
      twelve and its memory clock is constant at 11001 MHz under all four
      protocols.
    - Bandwidth is also the **best of seven candidate predictors** (its own

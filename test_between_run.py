@@ -1531,3 +1531,66 @@ def test_the_rival_check_degrades_without_base_ms():
         r["base_ms"] = t
     names = [d["predictor"] for d in bandwidth_law.rival_predictors(rows)]
     assert "time" in names and "bytes moved" in names
+
+
+# ---------------------------------------------------------------------------
+# The scale-free power-law fit
+# ---------------------------------------------------------------------------
+
+
+def test_the_power_law_recovers_a_planted_exponent():
+    # scaled so every row clears SHIFT_FLOOR_PCT -- below it the rows are
+    # dropped and there is nothing left to recover an exponent from
+    rows = [{"method": "A", "ctx": i, "gb_s": g, "shift": (g ** 1.5) * 1e-4}
+            for i, g in enumerate((10, 40, 90, 160, 250))]
+    pl = bandwidth_law.power_law(rows)
+    assert pl["exponent"] == pytest.approx(1.5, abs=1e-6)
+    assert pl["r"] == pytest.approx(1.0, abs=1e-6)
+
+
+def test_rows_at_the_measurement_floor_are_dropped_and_counted():
+    """Their logarithm says more about the sampler's resolution than about
+    bandwidth, so they are excluded -- and the exclusion is reported, not silent."""
+    rows = [{"method": "A", "ctx": i, "gb_s": g, "shift": s}
+            for i, (g, s) in enumerate([(10, 0.0000001), (40, 0.004),
+                                        (90, 0.009), (160, 0.016),
+                                        (250, 0.025)])]
+    pl = bandwidth_law.power_law(rows)
+    assert pl["n_total"] == 5 and pl["n_used"] == 4 and pl["n_below_floor"] == 1
+
+
+def test_the_power_law_declines_when_too_little_survives_the_floor():
+    rows = [{"method": "A", "ctx": i, "gb_s": g, "shift": 1e-9}
+            for i, g in enumerate((10, 40, 90, 160))]
+    pl = bandwidth_law.power_law(rows)
+    assert pl["exponent"] is None
+    assert pl["n_used"] == 0
+
+
+def test_the_power_law_names_the_method_that_misfits():
+    # `bad` must be *scattered*, not merely offset: a uniform multiplier is
+    # absorbed by the fit's intercept and misfits nothing
+    clean = [{"method": "good", "ctx": i, "gb_s": g, "shift": g * 1e-3}
+             for i, g in enumerate((10, 40, 90, 160))]
+    off = [{"method": "bad", "ctx": i, "gb_s": g, "shift": s}
+           for i, (g, s) in enumerate([(20, 0.200), (60, 0.005),
+                                       (110, 0.400), (200, 0.010)])]
+    pl = bandwidth_law.power_law(clean + off)
+    assert pl["worst_method"] == "bad"
+
+
+def test_the_report_says_when_the_misfit_does_not_survive_the_refit():
+    """A method worst under the linear fit but not under the scale-free one must
+    be described as not robust, not quietly kept."""
+    rows_a = [{"method": "A", "ctx": i, "gb_s": g, "base_ms": 1.0,
+               "shift": g * 1e-4} for i, g in enumerate((10, 40, 90, 160))]
+    rows_b = [{"method": "B", "ctx": i, "gb_s": g, "base_ms": 1.0,
+               "shift": g * 1e-4 * 4} for i, g in enumerate((20, 60, 110, 200))]
+    flipped = ([dict(r, shift=r["shift"] * 4) for r in rows_a]
+               + [dict(r, shift=r["shift"] / 4) for r in rows_b])
+    rep = bandwidth_law.build({"bandwidth_sensitivity": {
+        "p1": {"rows": rows_a + rows_b}, "p2": {"rows": rows_a + rows_b},
+        "p3": {"rows": flipped}}, "telemetry": []})
+    md = bandwidth_law.render(rep)
+    assert "Is the straight line the problem?" in md
+    assert "not robust to the choice of fit" in md or "in all 3 protocols" in md

@@ -771,6 +771,17 @@ pp). The misfits are all four `triton_fp16_control` rows — 1.74 pp against 0.4
 pp for every other row, a 4× difference — with `@8k` and `@16k` the worst two.
 The open item named the wrong kernel.
 
+**How solid is that, though.** Two checks, and the second weakens it. Fitting
+`|shift| ~ GB/s**k` in log-log gives an exponent of **0.82 / 0.84 / 0.98** — so
+the relationship really is essentially linear, and a straight line is not what
+throws the residuals onto the highest-bandwidth rows. But under that scale-free
+fit the control is worst under only **2 of 3** protocols, against all three under
+the linear fit. And the control's residuals are not consistently signed, so this
+is extra variance rather than curvature. With four rows per method that is weak
+evidence either way. The honest statement is that the control fits worst and the
+reason is unknown — not bytes moved, not footprint, not time, and not simply that
+its shifts are larger.
+
 It also says which *ratios* are exposed, and the answer is uncomfortable. The
 quantization ratio divides the highest-bandwidth row in the benchmark (the fp16
 control, 257 GB/s) by a much lower one (the fused kernel, 118 GB/s), so it
@@ -909,7 +920,7 @@ python -m venv .venv
 .venv/Scripts/python.exe -m pip install -r requirements.txt
 
 .venv/Scripts/python.exe -m pytest test_correctness.py -q   # 106 tests, ~89 s (GPU)
-.venv/Scripts/python.exe -m pytest test_between_run.py -q    # 100 tests, ~11 s (no GPU)
+.venv/Scripts/python.exe -m pytest test_between_run.py -q    # 105 tests, ~11 s (no GPU)
 .venv/Scripts/python.exe benchmark.py --quick                # ~75 s smoke run
 .venv/Scripts/python.exe benchmark.py --samples 50           # full suite, ~13 min
 .venv/Scripts/python.exe dispersion_tier.py                  # three-tier verdict per row
@@ -977,7 +988,7 @@ committed.
 | `kernels/fused_decode_attn.py` | the fused kernel. |
 | `kernels/fp16_decode_attn.py` | the control: identical shape, unquantized. Isolates the flash-decoding effect. |
 | `test_correctness.py` | 106 tests on the kernel, explicit asserted thresholds. |
-| `test_between_run.py` | 100 CPU-only tests on the between-run, excursion, protocol, dispersion-tier and bandwidth-law machinery — including the 2x2 arithmetic, the design reader and the tier's calibration bar — against synthetic runs with known answers. |
+| `test_between_run.py` | 105 CPU-only tests on the between-run, excursion, protocol, dispersion-tier and bandwidth-law machinery — including the 2x2 arithmetic, the design reader and the tier's calibration bar — against synthetic runs with known answers. |
 | `benchmark.py` | timing + memory. Rotating working set for the cold regime, CUDA-graph replay for the hot one. |
 | `audit_claims.py` | adversarial self-audit: bootstrap CIs over raw timings, attribution against the fp16 control, per-optimization claims with their own controls, and a clock-verification gate. |
 | `between_run.py` | what a bootstrap CI does not cover: compares N independent full runs, reports the run-to-run interval, the inflation over the single-run CI, and whether any verdict moved. |

@@ -174,6 +174,53 @@ def residuals(rows: list[dict]) -> list[dict]:
             for r, s, p in zip(rows, sh, pred)]
 
 
+# A shift smaller than this is at the resolution of the measurement rather than
+# a small effect, and its logarithm is dominated by that. Two of twelve rows sit
+# below it under most protocols.
+SHIFT_FLOOR_PCT = 0.05
+
+
+def power_law(rows: list[dict]) -> dict:
+    """Fit |shift| ~ GB/s**k in log-log, and check who misfits under *that*.
+
+    Two questions at once. First, is the straight-line fit the reason the fp16
+    control misfits -- if the true relationship curved, a linear fit would throw
+    its residuals onto the highest-bandwidth rows, which are all control rows.
+    An exponent near 1 says no. Second, does the control still misfit once the
+    fit is scale-free? A log-log fit weights a 10% error on a small shift the
+    same as on a large one, which is the natural handling of the fact that the
+    control's shifts are simply bigger.
+
+    Rows whose shift is at the measurement floor are dropped, with the count
+    reported: their logarithm says more about resolution than about bandwidth.
+    """
+    gb = np.array([r["gb_s"] for r in rows], dtype=float)
+    sh = np.abs(np.array([r["shift"] for r in rows], dtype=float)) * 100.0
+    keep = sh >= SHIFT_FLOOR_PCT
+    if keep.sum() < 4:
+        return {"n_used": int(keep.sum()), "n_total": len(rows), "exponent": None}
+    x, y = np.log(gb[keep]), np.log(sh[keep])
+    slope, intercept = np.polyfit(x, y, 1)
+    resid = y - (slope * x + intercept)
+    by: dict[str, list] = {}
+    for r, e in zip([r for r, k in zip(rows, keep) if k], resid):
+        by.setdefault(r["method"], []).append(abs(float(e)))
+    per_method = sorted(
+        ({"method": m, "n": len(v), "mean_abs_log_residual": statistics.fmean(v)}
+         for m, v in by.items()),
+        key=lambda d: -d["mean_abs_log_residual"])
+    return {
+        "n_used": int(keep.sum()),
+        "n_total": len(rows),
+        "n_below_floor": int((~keep).sum()),
+        "exponent": float(slope),
+        "r": pearson(x, y),
+        "residual_sd_log": float(resid.std()),
+        "per_method": per_method,
+        "worst_method": per_method[0]["method"] if per_method else None,
+    }
+
+
 def mem_clock_constancy(telemetry: list[dict], protocols: list[str]) -> dict:
     """Is the memory clock really the same under every protocol, per row?"""
     rows = []
@@ -210,6 +257,7 @@ def build(payload: dict) -> dict:
             "decomposition": decompose(rows),
             "residuals": residuals(rows),
             "rivals": rival_predictors(rows),
+            "power_law": power_law(rows),
         }
 
     # The sign test: every (method, protocol) pair whose bandwidth actually
@@ -344,6 +392,34 @@ def render(rep: dict) -> str:
         L.append("Achieved bandwidth has the smallest residual spread under every "
                  "protocol.")
 
+    L += ["", "## Is the straight line the problem?", "",
+          "Fitting `|shift| ~ GB/s**k` in log-log answers two things: whether the "
+          "relationship curves (an exponent near 1 says it does not, so a linear "
+          "fit is not what throws residuals onto the highest-bandwidth rows), and "
+          "whether the same method still misfits once the fit is scale-free.", ""]
+    L += ["| protocol | exponent | r | rows used | worst-fitting method |",
+          "|---|---|---|---|---|"]
+    for proto, block in rep["per_protocol"].items():
+        pl = block["power_law"]
+        if pl.get("exponent") is None:
+            L.append(f"| `{proto}` | -- | -- | {pl['n_used']}/{pl['n_total']} | -- |")
+            continue
+        L.append(f"| `{proto}` | {pl['exponent']:.2f} | {pl['r']:+.3f} | "
+                 f"{pl['n_used']}/{pl['n_total']} | `{pl['worst_method']}` |")
+    L.append("")
+    worst = [b["power_law"].get("worst_method") for b in rep["per_protocol"].values()]
+    worst = [w for w in worst if w]
+    if worst and len(set(worst)) == 1:
+        L.append(f"`{worst[0]}` is the worst-fitting method under the scale-free fit "
+                 f"too, in all {len(worst)} protocols -- the misfit is not an artefact "
+                 f"of fitting a straight line to unequal variances.")
+    elif worst:
+        top = max(set(worst), key=worst.count)
+        L.append(f"`{top}` is worst under {worst.count(top)} of {len(worst)} "
+                 f"protocols here, against all of them under the linear fit. The "
+                 f"misfit is real but **not robust to the choice of fit**, and with "
+                 f"four rows per method it is weak evidence either way.")
+
     mc = rep["mem_clock"]
     L += ["", "## Is the memory clock constant across protocols?", ""]
     L.append(f"**{mc['n_varying']} of {mc['n_rows']}** measurement rows have a "
@@ -398,6 +474,16 @@ def main():
     print("   -> " + (f"{', '.join(beats)} beats bandwidth under every protocol"
                       if beats else
                       "nothing beats achieved bandwidth under every protocol"))
+
+    print()
+    print("power-law fit (|shift| ~ GB/s**k):")
+    for proto, block in rep["per_protocol"].items():
+        pl = block["power_law"]
+        if pl.get("exponent") is None:
+            print(f"   {proto:<10} too few rows above the shift floor")
+            continue
+        print(f"   {proto:<10} k = {pl['exponent']:.2f}  r = {pl['r']:+.3f}  "
+              f"({pl['n_used']}/{pl['n_total']} rows)  worst: {pl['worst_method']}")
 
     mc = rep["mem_clock"]
     print()
