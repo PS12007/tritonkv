@@ -990,6 +990,14 @@ Be specific about what is *not* solved:
 
 ## Reproducing
 
+> **Running this on a different GPU?** See
+> [`docs/RUN_ON_YOUR_GPU.md`](docs/RUN_ON_YOUR_GPU.md) — a complete standalone
+> guide written for someone who has never seen this project, with install steps,
+> troubleshooting, and exactly what to send back. The single most valuable
+> contribution anyone can make here is one run on a card with a different L2,
+> because that is the axis the central conditional is stated in terms of and the
+> one thing a single machine cannot test.
+
 **Hardware actually used:** NVIDIA GeForce RTX 5060 Laptop GPU (Blackwell,
 sm_120, 26 SMs, 8 GB, 34 MB L2), Windows 11, driver 610.47. This is a
 thermally-limited 80 W laptop part sharing the GPU with the desktop compositor,
