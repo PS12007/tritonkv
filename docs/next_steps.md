@@ -49,7 +49,7 @@ Everything below is verified on this machine, not assumed.
   `min_effect_frac`. Post-hoc from the raw samples, so it runs on any results
   JSON ever recorded and never touches `benchmark.py`. Run 3: **39 quotable /
   7 pinned / 2 rejected**.
-- `python -m pytest test_between_run.py -q` → **134** CPU-only tests, ~16 s,
+- `python -m pytest test_between_run.py -q` → **139** CPU-only tests, ~18 s,
   covering `between_run.py`, `clock_excursions.py`, `compare_protocols.py` and
   `dispersion_tier.py` (including the 2x2 arithmetic, the design reader, and the
   tier's calibration bar and per-claim admissibility).
@@ -353,6 +353,16 @@ re-run it after any benchmark run without thinking about it:
      produce more P-state excursions** — a rate over 72–288 observations rather
      than a range over three runs, and `fullpre` drops out of it.
      `compare_protocols.py` prints both ranges whenever they differ.
+
+     **First candidate for that, tested and NULL: row duration.** Excursion rate
+     falls hard with duration pooled — 3.5 / 8.3 / 11.1 / 6.9 / 1.4 / **0.0%**
+     across six buckets over 864 observations, r = −0.686, and the slowest bucket
+     has zero excursions in 144 observations. But duration is confounded with
+     kernel identity (fused Triton rows are short, SDPA rows long), and holding
+     the method fixed only **7 of 11** come out negative. Not a sweep, so it is a
+     null. `clock_excursions.py` carries `duration_effect` and prints the verdict
+     either way. Do not revive this without a design that varies duration within
+     a kernel.
 
    - Original framing, kept for the record. Spreads
      at `quant_cold@8192` are `full` 0.6%, `subset` 13.2%, `preloaded` 0.6%,

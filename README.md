@@ -992,7 +992,7 @@ python -m venv .venv
 .venv/Scripts/python.exe -m pip install -r requirements.txt
 
 .venv/Scripts/python.exe -m pytest test_correctness.py -q   # 106 tests, ~89 s (GPU)
-.venv/Scripts/python.exe -m pytest test_between_run.py -q    # 134 tests, ~16 s (no GPU)
+.venv/Scripts/python.exe -m pytest test_between_run.py -q    # 139 tests, ~18 s (no GPU)
 .venv/Scripts/python.exe benchmark.py --quick                # ~75 s smoke run
 .venv/Scripts/python.exe benchmark.py --samples 50           # full suite, ~13 min
 .venv/Scripts/python.exe dispersion_tier.py                  # three-tier verdict per row
@@ -1060,11 +1060,11 @@ committed.
 | `kernels/fused_decode_attn.py` | the fused kernel. |
 | `kernels/fp16_decode_attn.py` | the control: identical shape, unquantized. Isolates the flash-decoding effect. |
 | `test_correctness.py` | 106 tests on the kernel, explicit asserted thresholds. |
-| `test_between_run.py` | 134 CPU-only tests on the between-run, excursion, protocol, dispersion-tier and bandwidth-law machinery — including the 2x2 arithmetic, the design reader and the tier's calibration bar — against synthetic runs with known answers. |
+| `test_between_run.py` | 139 CPU-only tests on the between-run, excursion, protocol, dispersion-tier and bandwidth-law machinery — including the 2x2 arithmetic, the design reader and the tier's calibration bar — against synthetic runs with known answers. |
 | `benchmark.py` | timing + memory. Rotating working set for the cold regime, CUDA-graph replay for the hot one. |
 | `audit_claims.py` | adversarial self-audit: bootstrap CIs over raw timings, attribution against the fp16 control, per-optimization claims with their own controls, and a clock-verification gate. |
 | `between_run.py` | what a bootstrap CI does not cover: compares N independent full runs, reports the run-to-run interval, the inflation over the single-run CI, and whether any verdict moved. |
-| `clock_excursions.py` | the rate at which a row drops a memory P-state, split by run protocol and regime, with the gate's verdict on each. |
+| `clock_excursions.py` | the rate at which a row drops a memory P-state, split by run protocol and regime, with the gate's verdict on each — and whether the row's own duration predicts it, decomposed within method as well as pooled. |
 | `compare_protocols.py` | whether two measurement protocols produce the same numbers at all, the bandwidth law that says which rows they will disagree on, and the 2x2 that separates run length from recent saturation. |
 | `bandwidth_law.py` | whether "achieved bandwidth predicts protocol sensitivity" is a law or a method label: the within-method decomposition, leave-one-out, per-row residuals, and whether the memory clock really is constant across protocols. |
 | `clock_ramp.py` | the memory clock's time constant, measured directly: idle the GPU, load it, and watch. Answers in minutes what repeating protocols could not settle in hundreds of runs. |
