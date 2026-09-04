@@ -966,11 +966,25 @@ Be specific about what is *not* solved:
    budget. The conditional is stated in terms of L2 residency precisely because
    that is the axis expected to move.
 8. ~~**The 8k and 16k SDPA baselines are not clock-verified.**~~ Fixed by the
-   bandwidth-aware ramp: `fp16_sdpa` at 8k and 16k now passes the gate in all
-   three runs with a timing IQR of 0.1–0.4%. What replaces it as the honest
-   caveat is narrower — only **ctx=8192** has every input of the attribution
-   chain passing the gate in *all three* runs; 512 and 2048 pass in one run and
-   not the others.
+   bandwidth-aware ramp: `fp16_sdpa` at 8k and 16k now passes the gate with a
+   timing IQR of 0.1–0.4%. ~~What replaces it is narrower — only ctx=8192 has
+   every input of the attribution chain passing the gate in all three runs; 512
+   and 2048 pass in one run and not the others.~~ **Also retired**, by the
+   dispersion tier: over nine full-method runs across three protocols the chain
+   is complete at ctx=512 and ctx=2048 in **9/9**, once rows that fail the
+   per-sample IQR gate but pin their medians at least as well as the worst row
+   the gate accepts are admitted with that qualifier. The honest caveat that
+   survives is **ctx=16384 at 7/9**, and that promotion is a property of the run:
+   no row is promoted in more than four of the nine.
+9. **Some measurement protocols produce four times more memory P-state
+   excursions than others, and nothing here explains why.** The rate is 2.8%
+   (`full`), 12.5% (`subset`), 1.4% (`preloaded`), 5.6% (`fullpre`), 4.2%
+   (`reversed`). Temperature, clock warm-up time, all four monitored telemetry
+   variables, row duration and predecessor duration have each been tested and
+   ruled out; testing further hypotheses against the same observations was
+   stopped deliberately rather than continued. The gate catches the excursions
+   that would matter, which is what protects the numbers above — but the cause
+   is unknown and would need data collected for the question.
 
 ---
 
