@@ -1570,3 +1570,34 @@ before, and it is now clear it is a small effect measured on four rows rather
 than a structural fact waiting to be named.
 
 `test_between_run.py`: 100 → **105**.
+
+
+## Dropping 2-bit would be a protocol change, not a tidy-up
+
+Open item 4 has read "either implement per-channel keys and re-measure, or state
+plainly that 2-bit is out of scope and stop benchmarking it" for some time, with
+the second option carrying the tone of the cheap one. It is not.
+
+2-bit is **5 of the 12 methods** timed at every context and **43% of the run's
+measured wall clock** — 284 s of 661 s inside clock windows, against 775 s end to
+end. Removing it takes the shipped protocol from 12 methods per context to 7.
+
+Method count is not a free parameter here. It is one of the two factors in the
+2x2, and at `quant_cold@8192` its simple effect with no preload is **+3.78%**
+(3 methods 1.4217 → 12 methods 1.4755). A 7-method run sits between those
+endpoints, on the axis the repo has already measured as moving its headline
+number, in the direction that reads lower.
+
+So "stop benchmarking 2-bit" means the headline cell must be **re-measured under
+the new protocol**, not re-rendered from the old JSON. That is three clean runs,
+not an edit.
+
+None of which argues for keeping 2-bit. It argues that the option that looked
+free is the one with a measurable price, and that the price is known because of
+work already done. A third option is cheaper than both: keep timing it, leaving
+the protocol untouched, and mark it in the tables as a research row rather than
+a candidate — which is what `correct.2bit_usable` already says in prose and what
+no table currently reflects.
+
+This is a decision about scope rather than a measurement, so it is written down
+here rather than taken.

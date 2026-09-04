@@ -274,11 +274,32 @@ re-run it after any benchmark run without thinking about it:
    Do **not** re-run the confounded comparison: the 2x2 supersedes it.
 
 4. **2-bit still deserves a decision, not a table row.** Numerically unusable
-   (rel L2 ≈ 0.7) under per-token grouping along `head_dim`. KIVI's result is
-   that keys want per-channel grouping. Either implement per-channel keys and
-   re-measure, or state plainly that 2-bit is out of scope and stop benchmarking
-   it. Right now it is carried at full cost in every table without being a
-   candidate for use. (Note it is also where `fold_zp` is *worst*, 0.66×.)
+   (rel L2 ≈ 0.7; the audit carries it as `correct.2bit_usable`, MISLEADING —
+   the *kernel* is correct to cosine 1.000000, the *quantization* is 72% off)
+   under per-token grouping along `head_dim`. KIVI's result is that keys want
+   per-channel grouping. Either implement per-channel keys and re-measure, or
+   state plainly that 2-bit is out of scope. (Note it is also where `fold_zp` is
+   *worst*, 0.66×.)
+
+   **What that costs, measured 2026-09-03 — and "just stop benchmarking it" is
+   not free.** 2-bit is **5 of the 12 methods** per context
+   (`fused_triton_2b`, `fused_gather_meta_2b`, `fused_fold_zp_2b`,
+   `dequant_sdpa_eager_2b`, `dequant_sdpa_compiled_2b`) and **43% of the run's
+   measured wall clock** (284 s of 661 s in clock windows; 775 s end to end).
+
+   Dropping it takes the shipped protocol from **12 methods per context to 7** —
+   a move along *exactly* the axis the 2x2 measured. At `quant_cold@8192` the
+   simple effect of method count with no preload is **+3.78%** (3 methods 1.4217
+   → 12 methods 1.4755), and by that sign a shorter run reads *lower*. So
+   removing 2-bit is a **protocol change, not a documentation change**: the
+   headline cell would have to be re-measured under the new protocol, not merely
+   re-rendered, and the repo's own finding is what says so.
+
+   That does not argue for keeping it — it argues that the tidy-up option has a
+   price and the price is known. A third option exists and is cheaper than
+   either: keep timing it (protocol unchanged) and mark it in the tables as a
+   research row rather than a candidate, which is what the accuracy claim
+   already says in prose.
 
 5. **Cross-check on a non-laptop GPU if one becomes available.** Everything here
    is one card with a 9× clock range and a 33.6 MB L2. The L2-residency
