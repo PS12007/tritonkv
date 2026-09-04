@@ -171,7 +171,29 @@ re-run it after any benchmark run without thinking about it:
    *conversions* bought nothing. Do not generalise the first result to the second
    kind.
 
-3. **Where the metadata-load curve actually bends.** `sweep_group_size.py` ran
+3. **MEASURED AND REJECTED (2026-09-04): widening the autotuner's grid.** Two
+   chosen configs sit on an edge of the search box (`block_n=32` is the minimum
+   offered and wins 7 of 8 cells; `num_stages=3` is the maximum and wins at
+   ctx=2048), which usually means the box is too small. It is not.
+   `num_stages` 4-5 is worse everywhere and sometimes catastrophic (486 µs vs
+   40.8 at ctx=8192; 740 µs vs 64.1 at 16384 — ten-fold cliffs of the `gs=128`
+   shape). `block_n=16` is worse at long context, 0.942x at 8192 and 0.897x at
+   16384 with **disjoint** median intervals. **Leave the grid alone.**
+
+   **⚠ And the measurement floor this exposed, which matters far beyond the
+   tuner.** On the way, `block_n=16` looked like a **1.059x win at ctx=2048** —
+   interleaved, 150 samples per arm, 5% IQRs. It does not exist; a second
+   interleaved measurement gave 0.9983x, and the whole difference was the
+   *shipped* config reading 20.16 µs in one invocation and 19.04 in the next
+   (repeats: 20.19, 20.48). Not ordering, not anything measured.
+
+   **An ad-hoc `bench_cold` A/B in a throwaway script cannot resolve effects
+   below about 7% on this machine**, however many samples each arm gets, because
+   the between-invocation term is not in the sample IQR. Use `benchmark.py` +
+   `between_run.py`, which exist for exactly this. CUDA-graph replay in one
+   process is tighter (±0.5% at long context) but not immune (±3% at ctx=2048).
+
+4. **Where the metadata-load curve actually bends.** `sweep_group_size.py` ran
    the sweep on both paths and the prediction ("broadcast sloped, gather flat")
    was refuted: broadcast is flat too, 1.07-1.17x across an 8x range of load
    counts. The honest shape is *saturation* -- 16x fewer loads bought 1.29x, a
