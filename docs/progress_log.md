@@ -2289,8 +2289,13 @@ are free here; they hide behind memory latency. The docstring now says so, and
 says not to generalise from the first result to the second kind.
 
 The flag stays. It defaults to `False`, Triton specialises on the constexpr so
-the shipped path compiles to exactly what it compiled to before (the 146 tests
-confirm), and it costs one branch in the source to keep a measured negative
+the shipped path compiles to exactly what it compiled to before — and that was
+*verified* rather than assumed, by loading the pre-change kernel alongside the
+current one in the same process and comparing: **output bitwise identical,
+registers 128 → 128, spills 0 → 0, total PTX ops 576 → 576, and no per-op
+difference at all.** Adding a constexpr branch to a hot loop is exactly the kind
+of change that is "obviously free" until it is not, and the 146 tests confirm the
+numerics but would not have caught a codegen regression, and it costs one branch in the source to keep a measured negative
 reproducible rather than a paragraph claiming one. It is deliberately **not**
 added as a benchmark method: that would change the method count, which this
 project has measured as worth +3.8% on the headline cell.
