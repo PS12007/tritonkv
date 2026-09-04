@@ -128,10 +128,11 @@ if triton is not None:
         More precisely -- and this was measured, not assumed -- it is the count
         of *load* instructions that binds, not of instructions generally. The
         ``DEQ_FP16`` path below removes 80 conversion instructions per kernel
-        (14% of the PTX op count) for a speed change of +0.7% to -0.5%, inside
-        the measurement's own IQR. Cutting metadata loads 16x bought 1.29x;
-        cutting conversions bought nothing. Do not generalise "fewer
-        instructions" from the first result to the second kind.
+        (14% of the PTX op count) for no resolvable speed change: two independent
+        A/B measurements put it at +0.7%/-2.3% at ctx=2048 and within +-0.5% at
+        ctx=8192 and 16384. Cutting metadata loads 16x bought 1.29x; cutting
+        conversions bought nothing. Do not generalise "fewer instructions" from
+        the first result to the second kind.
         """
         if BCAST:
             meta = tl.load(

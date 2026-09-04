@@ -2296,3 +2296,63 @@ added as a benchmark method: that would change the method count, which this
 project has measured as worth +3.8% on the headline cell.
 
 `test_correctness.py`: 106 → **146**.
+
+### Correction to the above, and a floor on what these probes can resolve
+
+The fp16-dequant entry above quoted "no effect larger than about 1%". A repeat of
+the same A/B says that was slightly too strong at one context:
+
+| ctx | run 1 | run 2 |
+|---|---|---|
+| 2048 | 1.0075x | 0.9770x |
+| 8192 | 1.0029x | 0.9981x |
+| 16384 | 0.9954x | 1.0006x |
+
+Both runs agree there is no effect, which is the conclusion and it stands. But
+the point estimates scatter **3.1 percentage points** at ctx=2048 between
+invocations, so the honest bound is **±0.5% at ctx=8192 and 16384, and only ±3%
+at ctx=2048** — not 1% everywhere.
+
+## The tuner's grid sits on its own boundary, and widening it does not help
+
+`tune()` searches `block_n ∈ {32, 64, 128} × num_warps ∈ {2, 4, 8} × num_stages ∈
+{2, 3}`. Two of the chosen configs sit on an edge of that box: `block_n=32` is the
+**minimum** offered and wins at 7 of 8 (ctx, nbits) cells, and `num_stages=3` is
+the **maximum** and wins at ctx=2048. A search whose answer is at the boundary is
+usually a search that is too small.
+
+Probed outside it — `block_n=16`, `num_stages` 4 and 5, `block_n=64` with deeper
+pipelining:
+
+- **`num_stages` 4-5 is worse everywhere**, and sometimes catastrophically:
+  486 µs against 40.8 at ctx=8192, 740 µs against 64.1 at ctx=16384. Ten-fold
+  cliffs, the same shape as the `gs=128` shared-memory cliff. The tuner would
+  never pick these; the point is that the box's upper edge is a real edge and not
+  an arbitrary cutoff.
+- **`block_n=16` is clearly worse at long context** — 0.942x at ctx=8192 and
+  0.897x at 16384, with **disjoint** block-bootstrap median intervals in both
+  cases. Not a boundary worth extending.
+
+**And a false positive on the way, which is the useful part.** The first probe
+made `block_n=16` look like a **1.059x / 1.062x win at ctx=2048**, measured
+interleaved over 150 samples per arm with 5% IQRs. It does not exist. A second
+interleaved measurement gave **0.9983x**, and the entire difference was the
+*shipped* config reading 20.16 µs in one invocation and 19.04 in the next.
+
+Repeating the shipped config alone gave 20.19 and 20.48 µs, and measuring
+ctx=512 first to reproduce the preceding-work conditions changed nothing. So the
+7% swing is not ordering, and is not explained by anything measured here — which
+is the same conclusion the protocol investigation reached, arriving from a
+different direction.
+
+**The operational lesson:** an ad-hoc `bench_cold` A/B in a throwaway script
+**cannot resolve effects below about 7%** on this machine, however many samples
+each arm gets, because the between-invocation term is not in the sample IQR. That
+is precisely why `benchmark.py` and `between_run.py` exist, and it is worth
+knowing before the next quick probe talks someone into a 6% kernel win that is not
+there. The CUDA-graph replay probe used for `dequant_fp16` is tighter (±0.5% at
+long context) because it never leaves one process or one buffer, but it is not
+immune either — see the correction above.
+
+The tuning grid is left exactly as it is. It sits on its boundary because the
+boundary is the right answer.
