@@ -29,13 +29,17 @@ Everything below is verified on this machine, not assumed.
 - `python clock_excursions.py --label full=... --label subset=...` → seconds,
   writes `results/clock_excursions.{md,json}`: the per-run-group rate of memory
   P-state excursions and whether the gate rejected each one.
+- `python bandwidth_law.py` → seconds, writes `results/bandwidth_law.{md,json}`:
+  the within-method decomposition of the bandwidth law, leave-one-out, per-row
+  residuals, and the per-row memory-clock constancy check. Reads
+  `results/compare_protocols.json`; re-measures nothing.
 - `python dispersion_tier.py` → seconds, writes
   `results/dispersion_tier.{md,json}`: the three-tier verdict per row, the
   calibration bar it was judged against, and each promoted row's
   `min_effect_frac`. Post-hoc from the raw samples, so it runs on any results
   JSON ever recorded and never touches `benchmark.py`. Run 3: **39 quotable /
   7 pinned / 2 rejected**.
-- `python -m pytest test_between_run.py -q` → **77** CPU-only tests, ~11 s,
+- `python -m pytest test_between_run.py -q` → **87** CPU-only tests, ~11 s,
   covering `between_run.py`, `clock_excursions.py`, `compare_protocols.py` and
   `dispersion_tier.py` (including the 2x2 arithmetic, the design reader, and the
   tier's calibration bar and per-claim admissibility).
@@ -185,7 +189,10 @@ re-run it after any benchmark run without thinking about it:
    compares per row and finds **r = −0.57** between a row's power shift and its
    time shift across 24 shared rows: more power, less time, at identical SM and
    memory clocks. `triton_fp16_control@8192` runs 3.9% faster on 3.1% more
-   power with the memory clock identical at 11001 MHz.
+   power with the memory clock identical at 11001 MHz. (That row's memory clock
+   really is 11001 under all four protocols. It does **not** generalize: 14 of 24
+   rows differ across the original three protocols, 17 of 24 across all four —
+   see `bandwidth_law.py`.)
 
    **And the protocol effect is now characterised, 2026-09-02 (late).**
    `--preload 300` was the probe: if integrated load explained the gap, a
@@ -237,7 +244,21 @@ re-run it after any benchmark run without thinking about it:
      comes up; too much and thermal pressure pulls it down) but four protocols
      and two free parameters is a description, not a test. A temperature sweep
      at fixed protocol would be the actual experiment.
-   - `fused_triton_4b@16k` still fits neither story.
+   - **CORRECTED (2026-09-03): the misfit is the control, not the fused
+     kernel.** This line used to read "`fused_triton_4b@16k` still fits neither
+     story". Against the fitted |shift| ~ bandwidth line that row is the
+     *fourth-best fit of twelve* (mean |residual| 0.45 pp). The misfits are all
+     four `triton_fp16_control` rows: 1.74 pp against 0.41 pp for everything
+     else, worst at `@8k` (2.32) and `@16k` (2.28). `bandwidth_law.py` measures
+     it. Why the control specifically is now the open question, and the memory
+     clock does **not** answer it — `control@8k` is the worst-fitting row of the
+     twelve and its memory clock is constant at 11001 MHz under all four
+     protocols.
+   - The law itself survived the test that could have killed it: within a single
+     kernel, r is positive in **6 of 6** (method x protocol) pairs that have any
+     bandwidth range (sign test p = 0.016), the between-method means are
+     monotone under all three protocols, and leave-one-out never takes r below
+     +0.644. So bandwidth is not a proxy for method identity.
    - The r values leave ~30-50% of the variance unaccounted.
 
    Do **not** re-run the confounded comparison: the 2x2 supersedes it.

@@ -1424,3 +1424,68 @@ that rather than hiding it.
 `_chain_coverage` is the function that produces the numbers quoted in the README
 and in `key_numbers.md`, so it has its own tests rather than being trusted
 because a figure looked right. `test_between_run.py`: 74 -> **77**.
+
+
+## Is the bandwidth law a law, or a method label?
+
+The protocol finding rests on **r = +0.84** between a row's achieved DRAM
+bandwidth and how far a change of protocol moves it, pooled over 12 rows. Twelve
+points, three methods, four contexts — and the three methods pull 11 / 88 /
+214 GB/s on average. That is precisely the shape in which a **method** effect
+poses as a bandwidth one: "the fp16 control moves more than SDPA" would be the
+whole content, and "bandwidth" only the label on it. The correlation would be
+real and the interpretation empty.
+
+The test that separates them is to hold the method fixed and vary only the
+context, which moves bandwidth 3–4× inside one kernel. `bandwidth_law.py` runs
+it, and the law survives:
+
+| protocol | `fused_triton_4b` | `triton_fp16_control` |
+|---|---|---|
+| `subset` | +0.605 | +0.920 |
+| `preloaded` | +0.998 | +0.761 |
+| `fullpre` | +0.939 | +0.426 |
+
+**6 of 6 positive**, sign test p = 0.016. Each look is n=4 and settles nothing on
+its own; that they agree is the evidence. `fp16_sdpa` is excluded and said to be
+excluded — 11–12 GB/s at every context is no range at all, and a method that
+cannot test the law should not be counted as though it had. Between-method means
+are monotone under all three protocols, and leave-one-out never drops r below
++0.644, so the pooled figure does not rest on one point either.
+
+The test was written so it could fail: `test_a_method_label_masquerading_as_a_law_is_caught`
+feeds it data where bandwidth separates two methods perfectly and predicts
+nothing inside either, and checks that the pooled r is high while the
+within-method r is not. A decomposition that could not return that answer would
+not be evidence when it returns the other one.
+
+### Two corrections that fell out of it
+
+**The named misfit was the wrong row.** `next_steps.md` had carried
+"`fused_triton_4b@16k` still fits neither story" as an open item. Against the
+fitted line that row is the **fourth-best fit of twelve** (mean |residual| 0.45
+pp). The misfits are all four `triton_fp16_control` rows — 1.74 pp against 0.41
+pp for everything else — worst at `@8k` (2.32) and `@16k` (2.28). Why the control
+specifically is the open question now, and it is a better one: the control is the
+only method reading unquantized fp16, so it is the only one whose bytes are not
+what its context length suggests.
+
+**"The clocks are identical across protocols" was true where it was measured and
+false as a generalization.** `triton_fp16_control@8192`, DRAM-resident, reads
+11001 MHz under all four protocols — that line needs no correction. But 14 of 24
+measurement rows differ across the original three protocols (6 of 12
+DRAM-resident), and 17 of 24 across all four. The row that matters is
+`triton_fp16_control@16384`: highest bandwidth in the benchmark at 305 GB/s,
+largest protocol shift here at +10.1%, the only row positive under all three —
+and its memory clock is **11401 MHz under `full` against 11001 under `subset` and
+`preloaded`**, a 400 MHz step its shift orders with (+10.1 / +3.9 / +1.05%). That
+row is not an exception to the story; it is the one place the P-state channel is
+visibly open.
+
+It does **not** explain the control's misfit in general, and saying so is the
+point: `control@8k` is the worst-fitting row of the twelve and its memory clock
+is flat at 11001 MHz under all four. Two rows of the same method, one with the
+clock moving and one without, and both misfit.
+
+Nothing here re-measures anything — it all comes out of the JSON
+`compare_protocols.py` had already written. `test_between_run.py`: 77 → **87**.

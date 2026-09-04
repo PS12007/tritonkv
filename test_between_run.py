@@ -20,6 +20,7 @@ import pytest
 
 import analyze_dispersion
 import audit_claims
+import bandwidth_law
 import between_run
 import clock_excursions
 import compare_protocols
@@ -1204,3 +1205,154 @@ def test_chain_coverage_skips_runs_that_are_not_there(tmp_path, monkeypatch):
     _, tier, n = msp._chain_coverage(names + ["nope.json"])
     assert n == 1 and tier[CTX] == 1
     assert msp._chain_coverage(["nope.json"]) is None
+
+
+# ---------------------------------------------------------------------------
+# bandwidth_law -- can the decomposition tell a law from a method label?
+# ---------------------------------------------------------------------------
+
+
+def _bw_rows(spec) -> list[dict]:
+    """`spec` is (method, ctx, gb_s, shift_fraction) tuples."""
+    return [{"method": m, "ctx": c, "gb_s": g, "shift": s} for m, c, g, s in spec]
+
+
+def _bw_payload(rows, telemetry=None, protocols=("subset",)) -> dict:
+    return {"bandwidth_sensitivity": {p: {"rows": rows} for p in protocols},
+            "telemetry": telemetry or []}
+
+
+def test_a_real_law_shows_up_within_each_method():
+    """Bandwidth predicts inside a kernel as well as between kernels."""
+    rows = _bw_rows([("A", 512, 10, 0.001), ("A", 2048, 40, 0.004),
+                     ("A", 8192, 70, 0.007), ("A", 16384, 100, 0.010),
+                     ("B", 512, 110, 0.011), ("B", 2048, 140, 0.014),
+                     ("B", 8192, 170, 0.017), ("B", 16384, 200, 0.020)])
+    rep = bandwidth_law.build(_bw_payload(rows))
+    within = rep["per_protocol"]["subset"]["decomposition"]["within"]
+    assert all(w["r"] > 0.99 for w in within)
+    assert rep["n_positive"] == rep["n_looks"] == 2
+
+
+def test_a_method_label_masquerading_as_a_law_is_caught():
+    """The test this file exists for. Bandwidth separates the two methods
+    perfectly and predicts *nothing* inside either, so the pooled correlation is
+    high and the within-method correlation is not. A decomposition that could not
+    return this answer would not be evidence when it returns the other one."""
+    rows = _bw_rows([("A", 512, 10, 0.001), ("A", 2048, 20, 0.001),
+                     ("A", 8192, 30, 0.001), ("A", 16384, 40, 0.001),
+                     ("B", 512, 210, 0.020), ("B", 2048, 220, 0.020),
+                     ("B", 8192, 230, 0.020), ("B", 16384, 240, 0.020)])
+    rep = bandwidth_law.build(_bw_payload(rows))
+    assert rep["per_protocol"]["subset"]["loo"]["r"] > 0.9   # pooled: looks like a law
+    within = rep["per_protocol"]["subset"]["decomposition"]["within"]
+    for w in within:                                        # within: says nothing
+        assert np.isnan(w["r"]) or abs(w["r"]) < 0.5
+
+
+def test_a_method_with_no_bandwidth_range_is_marked_untestable():
+    """`fp16_sdpa` sits at 11-12 GB/s at every context, so it cannot test a
+    bandwidth law and must not be counted as though it had."""
+    rows = _bw_rows([("flat", 512, 11.0, 0.001), ("flat", 2048, 11.4, 0.002),
+                     ("flat", 8192, 11.2, 0.001), ("flat", 16384, 11.5, 0.002),
+                     ("wide", 512, 30, 0.003), ("wide", 2048, 90, 0.009),
+                     ("wide", 8192, 150, 0.015), ("wide", 16384, 210, 0.021)])
+    rep = bandwidth_law.build(_bw_payload(rows))
+    within = {w["method"]: w for w in
+              rep["per_protocol"]["subset"]["decomposition"]["within"]}
+    assert not within["flat"]["testable"]
+    assert within["wide"]["testable"]
+    assert rep["n_looks"] == 1          # only the method with range is counted
+
+
+def test_leave_one_out_finds_the_row_carrying_the_correlation():
+    """Seven rows with no relationship plus one far-out point that manufactures
+    one. Dropping that point has to be visible."""
+    # the seven need a little scatter of their own: strip it out and dropping the
+    # outlier leaves a constant y, where a correlation is undefined rather than
+    # small, and the test would be asserting on a nan
+    rows = _bw_rows([("A", i, 10 + i, 0.002 + 0.0002 * ((i * 3) % 5))
+                     for i in range(7)]
+                    + [("A", 99, 300, 0.060)])
+    loo = bandwidth_law.leave_one_out(rows)
+    assert loo["r"] > 0.9
+    assert loo["worst"]["dropped"] == "A@99"
+    assert loo["min_r"] < 0.5
+
+
+def test_residuals_are_centred_and_name_the_planted_misfit():
+    rows = _bw_rows([("A", 512, 10, 0.001), ("A", 2048, 50, 0.005),
+                     ("A", 8192, 100, 0.010), ("A", 16384, 150, 0.015),
+                     ("B", 512, 200, 0.020), ("B", 2048, 250, 0.025),
+                     ("B", 8192, 300, 0.030),
+                     ("odd", 4096, 60, 0.090)])   # far off the line
+    res = bandwidth_law.residuals(rows)
+    assert abs(sum(r["residual_pp"] for r in res)) < 1e-6
+    worst = max(res, key=lambda r: abs(r["residual_pp"]))
+    assert worst["method"] == "odd"
+
+
+def test_between_method_monotonicity_is_reported_both_ways():
+    rising = _bw_rows([("A", 1, 10, 0.001), ("A", 2, 12, 0.001),
+                       ("B", 1, 200, 0.020), ("B", 2, 210, 0.020)])
+    dec = bandwidth_law.decompose(rising)
+    assert dec["between_monotone"]
+    inverted = _bw_rows([("A", 1, 10, 0.030), ("A", 2, 12, 0.030),
+                         ("B", 1, 200, 0.001), ("B", 2, 210, 0.001)])
+    assert not bandwidth_law.decompose(inverted)["between_monotone"]
+
+
+def test_the_sign_test_needs_every_look_to_agree():
+    """One disagreeing look and the p-value is withheld rather than softened."""
+    agree = _bw_rows([("A", 1, 10, 0.001), ("A", 2, 40, 0.004),
+                      ("A", 3, 70, 0.007), ("A", 4, 100, 0.010),
+                      ("B", 1, 110, 0.011), ("B", 2, 140, 0.014),
+                      ("B", 3, 170, 0.017), ("B", 4, 200, 0.020)])
+    rep = bandwidth_law.build(_bw_payload(agree, protocols=("p1", "p2", "p3")))
+    assert rep["n_looks"] == 6 and rep["n_positive"] == 6
+    assert rep["sign_test_p"] == pytest.approx(0.5 ** 6)
+
+    mixed = list(agree)
+    mixed[4] = {"method": "B", "ctx": 1, "gb_s": 110, "shift": 0.030}   # flips B
+    rep2 = bandwidth_law.build(_bw_payload(mixed, protocols=("p1",)))
+    assert rep2["n_positive"] < rep2["n_looks"]
+    assert rep2["sign_test_p"] is None
+
+
+def test_memory_clock_constancy_counts_only_real_p_state_moves():
+    tel = [
+        {"method": "steady", "ctx": 8192, "regime": "cold",
+         "telemetry": {"mem MHz": {"per_group": {"full": 11001.0, "subset": 11001.0}}}},
+        # inside the sampler's own wobble: the same P-state, not a move
+        {"method": "wobble", "ctx": 8192, "regime": "cold",
+         "telemetry": {"mem MHz": {"per_group": {"full": 11001.0, "subset": 11020.0}}}},
+        {"method": "steps", "ctx": 16384, "regime": "cold",
+         "telemetry": {"mem MHz": {"per_group": {"full": 11401.0, "subset": 11001.0}}}},
+    ]
+    mc = bandwidth_law.mem_clock_constancy(tel, ["full", "subset"])
+    assert mc["n_rows"] == 3 and mc["n_varying"] == 1
+    assert mc["worst"]["method"] == "steps"
+    assert mc["worst"]["spread_mhz"] == pytest.approx(400.0)
+
+
+def test_bandwidth_law_end_to_end(tmp_path, monkeypatch):
+    rows = _bw_rows([("A", 512, 10, 0.001), ("A", 2048, 40, 0.004),
+                     ("A", 8192, 70, 0.007), ("A", 16384, 100, 0.010),
+                     ("B", 512, 110, 0.011), ("B", 2048, 140, 0.014),
+                     ("B", 8192, 170, 0.017), ("B", 16384, 200, 0.020)])
+    src = tmp_path / "cmp.json"
+    src.write_text(json.dumps(_bw_payload(rows)), encoding="utf-8")
+    out, md = tmp_path / "bw.json", tmp_path / "bw.md"
+    monkeypatch.setattr("sys.argv", ["bandwidth_law.py", "--input", str(src),
+                                     "--out", str(out), "--md", str(md)])
+    bandwidth_law.main()
+    text = md.read_text(encoding="utf-8")
+    assert "Within a single kernel" in text and "Leave-one-out" in text
+    assert json.loads(out.read_text(encoding="utf-8"))["n_positive"] == 2
+
+
+def test_bandwidth_law_refuses_a_missing_input(tmp_path, monkeypatch):
+    monkeypatch.setattr("sys.argv", ["bandwidth_law.py", "--input",
+                                     str(tmp_path / "nope.json")])
+    with pytest.raises(SystemExit):
+        bandwidth_law.main()

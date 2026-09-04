@@ -681,8 +681,22 @@ any one cell shows across its own runs is 13.2%, set by `subset` — and that
 yardstick was fixed in advance and has not been moved since.
 
 **Where the memory clock does differ — and it is not where load predicts.**
-The earlier three-protocol comparison could say the memory clock was 11001 MHz
-throughout; with the fourth it cannot. Spread at this cell, and the rate at which
+This repo used to say the memory clock was 11001 MHz throughout, which was true
+of the row it was measured on and false as a generalization. `triton_fp16_control`
+at ctx=8192, DRAM-resident, reads **11001 MHz under all four protocols** — that
+claim needs no correction where it was made. But **14 of 24 measurement rows
+differ across the original three protocols alone** (6 of the 12 DRAM-resident
+ones), and 17 of 24 across all four.
+
+The row this matters most for is `triton_fp16_control@16384`: the
+highest-bandwidth row in the benchmark at 305 GB/s, carrying the largest protocol
+shift here (+10.1%) and the only one positive under all three. Its memory clock
+is **11401 MHz under `full` and 11001 under `subset` and `preloaded`** — a 400 MHz
+step, and its shift orders with it (+10.1% / +3.9% / +1.05%). So that row is not
+an exception to the story; it is the one row where the P-state channel is visibly
+open. It does not explain the control's misfit in general, though: `@8k` is the
+*worst*-fitting row of the twelve and its memory clock is constant at 11001 MHz
+under all four. Spread at this cell, and the rate at which
 a row drops a memory P-state:
 
 | protocol | wall | spread | excursions | DRAM-resident |
@@ -717,6 +731,33 @@ shift**, over 12 rows. A row that barely touches DRAM cannot care what state the
 memory subsystem is in; a row that saturates it is entirely at its mercy. That
 makes the finding predictive rather than descriptive — you can say in advance
 which rows a change of protocol will move.
+
+**And it is a law rather than a method label — tested, because it nearly was
+not.** Twelve points over three methods pulling 11 / 88 / 214 GB/s on average is
+exactly the shape in which "the fp16 control moves more than SDPA" can pose as a
+bandwidth finding, with bandwidth only the label on it. The test is to hold the
+method fixed and vary only the context, which moves bandwidth 3–4× inside a
+single kernel. `bandwidth_law.py` runs it:
+
+| protocol | `fused_triton_4b` (32–136 GB/s) | `triton_fp16_control` (113–305 GB/s) |
+|---|---|---|
+| `subset` | +0.605 | +0.920 |
+| `preloaded` | +0.998 | +0.761 |
+| `fullpre` | +0.939 | +0.426 |
+
+**6 of 6 positive** (sign test p = 0.016). Each is only n=4 and settles nothing
+alone; that they agree is the evidence. `fp16_sdpa` is excluded and reported as
+excluded — it sits at 11–12 GB/s at every context, so it has no range to
+correlate against and cannot test anything. The between-method means are monotone
+under all three protocols, and leave-one-out never drops `r` below +0.644, so the
+pooled figure is not resting on a single point either.
+
+**Where the law misfits is not where this repo said it did.** `next_steps.md`
+carried "`fused_triton_4b@16k` fits neither story" as an open item. Against the
+fitted line that row is the **fourth-best fit of twelve** (mean |residual| 0.45
+pp). The misfits are all four `triton_fp16_control` rows — 1.74 pp against 0.41
+pp for every other row, a 4× difference — with `@8k` and `@16k` the worst two.
+The open item named the wrong kernel.
 
 It also says which *ratios* are exposed, and the answer is uncomfortable. The
 quantization ratio divides the highest-bandwidth row in the benchmark (the fp16
@@ -856,7 +897,7 @@ python -m venv .venv
 .venv/Scripts/python.exe -m pip install -r requirements.txt
 
 .venv/Scripts/python.exe -m pytest test_correctness.py -q   # 106 tests, ~89 s (GPU)
-.venv/Scripts/python.exe -m pytest test_between_run.py -q    # 77 tests, ~11 s (no GPU)
+.venv/Scripts/python.exe -m pytest test_between_run.py -q    # 87 tests, ~11 s (no GPU)
 .venv/Scripts/python.exe benchmark.py --quick                # ~75 s smoke run
 .venv/Scripts/python.exe benchmark.py --samples 50           # full suite, ~13 min
 .venv/Scripts/python.exe dispersion_tier.py                  # three-tier verdict per row
@@ -923,12 +964,13 @@ committed.
 | `kernels/fused_decode_attn.py` | the fused kernel. |
 | `kernels/fp16_decode_attn.py` | the control: identical shape, unquantized. Isolates the flash-decoding effect. |
 | `test_correctness.py` | 106 tests on the kernel, explicit asserted thresholds. |
-| `test_between_run.py` | 77 CPU-only tests on the between-run, excursion, protocol and dispersion-tier machinery — including the 2x2 arithmetic, the design reader and the tier's calibration bar — against synthetic runs with known answers. |
+| `test_between_run.py` | 87 CPU-only tests on the between-run, excursion, protocol, dispersion-tier and bandwidth-law machinery — including the 2x2 arithmetic, the design reader and the tier's calibration bar — against synthetic runs with known answers. |
 | `benchmark.py` | timing + memory. Rotating working set for the cold regime, CUDA-graph replay for the hot one. |
 | `audit_claims.py` | adversarial self-audit: bootstrap CIs over raw timings, attribution against the fp16 control, per-optimization claims with their own controls, and a clock-verification gate. |
 | `between_run.py` | what a bootstrap CI does not cover: compares N independent full runs, reports the run-to-run interval, the inflation over the single-run CI, and whether any verdict moved. |
 | `clock_excursions.py` | the rate at which a row drops a memory P-state, split by run protocol and regime, with the gate's verdict on each. |
 | `compare_protocols.py` | whether two measurement protocols produce the same numbers at all, the bandwidth law that says which rows they will disagree on, and the 2x2 that separates run length from recent saturation. |
+| `bandwidth_law.py` | whether "achieved bandwidth predicts protocol sensitivity" is a law or a method label: the within-method decomposition, leave-one-out, per-row residuals, and whether the memory clock really is constant across protocols. |
 | `analyze_dispersion.py` | decomposes every rejected measurement into trend, tail and floor, so the gate is argued with rather than tuned. |
 | `dispersion_tier.py` | the third verdict: which gate-failed rows pin their medians well enough to be used anyway, judged against the worst row the gate already accepts. Post-hoc, so it never touches the instrument. |
 | `sweep_group_size.py`, `probe_gs128.py` | the metadata-load sweep and the static PTX probe behind the gs=128 cliff. |
