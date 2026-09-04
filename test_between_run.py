@@ -1855,3 +1855,71 @@ def test_genuinely_identical_protocols_still_say_so():
     groups = {"a": [("a", Bench(_payload()))], "b": [("b", Bench(_payload()))]}
     _, _, note = compare_protocols.design_cells(groups)
     assert "are the same protocol" in note
+
+
+def _telemetry_payload(spec) -> dict:
+    """(method, ctx, regime, sm, mem, temp, power) tuples."""
+    byrow: dict = {}
+    for m, c, reg, sm, mem, t, pw in spec:
+        byrow.setdefault((m, c), {})[reg] = {
+            "clocks": {"sm_mhz_mean": sm, "mem_mhz_mean": mem,
+                       "temp_c_mean": t, "power_w_mean": pw}}
+    return {"results": [{"method": m, "ctx": c, "clocks": regs}
+                        for (m, c), regs in byrow.items()]}
+
+
+def test_telemetry_stability_recovers_a_planted_spread():
+    runs = [_telemetry_payload([("A", 8192, "cold", 2700.0 + d, 11000.0,
+                                 70.0, 75.0)])
+            for d in (-10.0, 0.0, 10.0)]
+    out = thermal_check.telemetry_stability(runs)
+    assert out["n_cells"] == 1
+    assert out["per_key"]["sm_mhz"]["mean_within_cell_sd"] == pytest.approx(10.0)
+    assert out["per_key"]["mem_mhz"]["mean_within_cell_sd"] == pytest.approx(0.0)
+
+
+def test_telemetry_stability_skips_thin_cells():
+    runs = [_telemetry_payload([("A", 8192, "cold", 2700.0, 11000.0, 70.0, 75.0)]),
+            _telemetry_payload([("A", 8192, "cold", 2710.0, 11000.0, 70.0, 75.0)])]
+    assert thermal_check.telemetry_stability(runs)["n_cells"] == 0
+
+
+def test_telemetry_stability_tolerates_a_missing_variable():
+    """An older run may not carry every field; the ones it does carry still
+    count, rather than the whole comparison failing."""
+    runs = []
+    for d in (-10.0, 0.0, 10.0):
+        pl = _telemetry_payload([("A", 8192, "cold", 2700.0 + d, 11000.0,
+                                  70.0, 75.0)])
+        del pl["results"][0]["clocks"]["cold"]["clocks"]["power_w_mean"]
+        runs.append(pl)
+    out = thermal_check.telemetry_stability(runs)
+    assert out["per_key"]["sm_mhz"]["mean_within_cell_sd"] == pytest.approx(10.0)
+    assert out["per_key"]["power_w"]["mean_within_cell_sd"] is None
+
+
+def test_the_report_shows_the_stability_table_only_when_comparing():
+    one = {"p": [_telemetry_payload([("A", 8192, "cold", 2700.0 + d, 11000.0,
+                                      70.0 + d / 10, 75.0)])
+                 for d in (-10.0, 0.0, 10.0)]}
+    assert "Does the telemetry know" not in thermal_check.render(
+        thermal_check.build(one))
+    two = dict(one)
+    two["q"] = [_telemetry_payload([("A", 8192, "cold", 2700.0 + d, 11000.0,
+                                     70.0 + d / 10, 75.0)])
+                for d in (-2.0, 0.0, 2.0)]
+    assert "Does the telemetry know" in thermal_check.render(
+        thermal_check.build(two))
+
+
+def test_the_stability_table_survives_a_failed_thermal_fit():
+    """The two calculations are independent, so a report must not drop the
+    stability table because there was no temperature variation to fit."""
+    flat = {g: [_telemetry_payload([("A", 8192, "cold", 2700.0 + d, 11000.0,
+                                     70.0, 75.0)]) for d in (-10.0, 0.0, 10.0)]
+            for g in ("p", "q")}
+    rep = thermal_check.build(flat)
+    assert rep["pooled"]["slope_mhz_per_c"] is None
+    md = thermal_check.render(rep)
+    assert "Not enough temperature variation" in md
+    assert "Does the telemetry know" in md

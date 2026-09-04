@@ -224,6 +224,44 @@ def preload_decay(warm: list[dict], cold: list[dict]) -> dict:
     }
 
 
+TELEMETRY_KEYS = ("sm_mhz", "mem_mhz", "temp_c", "power_w")
+
+
+def telemetry_stability(payloads: list[dict]) -> dict:
+    """How much does each monitored variable move between runs, within a cell?
+
+    The question this answers is not "is the protocol noisy" but "does anything
+    the instrument records *know* that it is". A protocol whose ratios move 20x
+    more than another's, while every monitored variable is equally steady in
+    both, is telling you the channel is not in the telemetry.
+
+    Within-cell again, for the same reason as everywhere else here: between cells
+    these variables differ by more than any protocol effect could.
+    """
+    cells: dict[tuple, list[dict]] = {}
+    for payload in payloads:
+        for r in payload.get("results") or []:
+            for regime in REGIMES:
+                w = ((r.get("clocks") or {}).get(regime) or {}).get("clocks") or {}
+                if w.get("mem_mhz_mean") is None:
+                    continue
+                cells.setdefault((r["method"], r["ctx"], regime), []).append(w)
+    out = {"n_cells": 0, "per_key": {}}
+    spreads: dict[str, list[float]] = {k: [] for k in TELEMETRY_KEYS}
+    for group in cells.values():
+        if len(group) < MIN_PER_CELL:
+            continue
+        out["n_cells"] += 1
+        for k in TELEMETRY_KEYS:
+            vals = [w[f"{k}_mean"] for w in group if w.get(f"{k}_mean") is not None]
+            if len(vals) >= 2:
+                spreads[k].append(statistics.stdev(vals))
+    for k, v in spreads.items():
+        out["per_key"][k] = {"mean_within_cell_sd": statistics.fmean(v) if v else None,
+                             "n": len(v)}
+    return out
+
+
 def degrees_for_a_p_state(slope_mhz_per_c: float | None) -> dict:
     if not slope_mhz_per_c:
         return {}
@@ -253,6 +291,9 @@ def build(groups: dict[str, list[dict]], pairs: list[tuple] | None = None) -> di
             if len(protocol_temps) > 1 else 0.0)
     predicted = (span * abs(pooled["slope_mhz_per_c"])
                  if pooled.get("slope_mhz_per_c") else None)
+    stability = {name: telemetry_stability(payloads)
+                 for name, payloads in groups.items()}
+
     decay = {}
     for warm, cold in (pairs or []):
         if warm in groups and cold in groups:
@@ -260,6 +301,7 @@ def build(groups: dict[str, list[dict]], pairs: list[tuple] | None = None) -> di
 
     return {
         "per_protocol": per_protocol,
+        "telemetry_stability": stability,
         "warm_up_arm": decay,
         "pooled": pooled,
         "protocol_mean_temp_c": protocol_temps,
@@ -271,11 +313,36 @@ def build(groups: dict[str, list[dict]], pairs: list[tuple] | None = None) -> di
     }
 
 
+def _stability_section(rep: dict) -> list[str]:
+    """The telemetry-stability table, or nothing if there is only one protocol."""
+    stab = rep.get("telemetry_stability") or {}
+    if len(stab) < 2:
+        return []
+    L = ["", "## Does the telemetry know which protocol is steady?", "",
+         "Mean within-cell run-to-run standard deviation of each monitored "
+         "variable. If a protocol whose ratios move far more than another's looks "
+         "the same here, the channel is not in the telemetry.", "",
+         "| protocol | cells | " + " | ".join(TELEMETRY_KEYS) + " |",
+         "|---" * (len(TELEMETRY_KEYS) + 2) + "|"]
+    for name, blk in stab.items():
+        cells = [f"{blk['per_key'][k]['mean_within_cell_sd']:.2f}"
+                 if blk["per_key"][k]["mean_within_cell_sd"] is not None else "--"
+                 for k in TELEMETRY_KEYS]
+        L.append(f"| `{name}` | {blk['n_cells']} | " + " | ".join(cells) + " |")
+    return L + [""]
+
+
 def render(rep: dict) -> str:
     p = rep["pooled"]
     L = ["# Can temperature explain the protocol spreads?", ""]
     if p.get("slope_mhz_per_c") is None:
-        return "\n".join(L + ["Not enough data to fit."])
+        # The stability comparison does not depend on the thermal fit, so it
+        # must not disappear because that fit had nothing to work with. A
+        # report that silently drops a section when an unrelated calculation
+        # failed is worse than one that says the calculation failed.
+        return "\n".join(
+            L + ["Not enough temperature variation to fit a slope."]
+            + _stability_section(rep))
     L += [
         f"Every observation is expressed as a deviation from its own "
         f"(method, ctx, regime, protocol) cell mean, so this is a within-cell "
@@ -298,6 +365,18 @@ def render(rep: dict) -> str:
             L.append(f"| `{name}` | {blk['n_observations']} | {blk['n_cells']} | "
                      f"{f['slope_mhz_per_c']:.1f} | {f['r']:+.3f} |")
     need = rep["degrees_for_a_p_state"]
+    if not need:
+        # A slope of exactly zero survives the `is None` guard above but leaves
+        # nothing to divide a P-state step by. Temperature having *no*
+        # measurable effect is the strongest possible version of the verdict,
+        # not a case to crash on.
+        return "\n".join(L + [
+            "", "## The number that settles it", "",
+            "Temperature has no measurable effect on the memory clock here "
+            "(slope 0.0 MHz per degree), so no temperature difference moves a "
+            "P-state. The thermal mechanism is ruled out outright rather than "
+            "on magnitude.",
+        ] + _stability_section(rep))
     L += ["", "## The number that settles it", ""]
     L.append(f"A memory P-state step on this part is "
              f"{P_STATE_STEP_MIN_MHZ:.0f}-{P_STATE_STEP_MAX_MHZ:.0f} MHz, and it is "
@@ -317,6 +396,8 @@ def render(rep: dict) -> str:
              if rep["thermal_mechanism_sufficient"] else
              "So temperature cannot be the mechanism at these temperatures.")
           + "**", ""]
+    L += _stability_section(rep)
+
     decay = rep.get("warm_up_arm") or {}
     if decay:
         L += ["", "## The other arm: does a preload's advantage decay?", "",
@@ -428,6 +509,18 @@ def main():
           f"needs {need['min_step_c']:.1f}-{need['max_step_c']:.1f} C")
     print(f"the protocols span {rep['protocol_temp_span_c']:.1f} C "
           f"-> {rep['predicted_mhz_over_span']:.0f} MHz predicted")
+    stab = rep.get("telemetry_stability") or {}
+    if len(stab) > 1:
+        print("within-cell run-to-run SD of the telemetry:")
+        print("   " + f"{'protocol':<12}" + "".join(f"{k:>11}" for k in TELEMETRY_KEYS))
+        for name, blk in stab.items():
+            row = "".join(
+                (f"{blk['per_key'][k]['mean_within_cell_sd']:>11.2f}"
+                 if blk["per_key"][k]["mean_within_cell_sd"] is not None else f"{'--':>11}")
+                for k in TELEMETRY_KEYS)
+            print(f"   {name:<12}{row}")
+        print()
+
     for name, d in (rep.get("warm_up_arm") or {}).items():
         if d.get("early_mhz") is None:
             print(f"{name}: too few shared cells")

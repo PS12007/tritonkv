@@ -1990,3 +1990,62 @@ original four protocols is byte-for-byte unchanged (`quant_cold@8192` still
 `test_between_run.py`: 124 → **126**, one test for each branch — groups that
 differ only in order must not be called the same protocol, and groups that really
 are identical still must be.
+
+## Nothing the instrument records knows which protocol is steady
+
+With both mechanisms dead, the remaining question is what the 300 s preload
+actually does. Three candidates were left: the power governor integrating over a
+long window, a settled fan curve, and allocator or driver state.
+
+**The fan curve is not observable on this hardware.** `nvidia-smi
+--query-gpu=fan.speed` returns `[N/A]`: this is a laptop part cooled by the
+chassis, so the GPU does not report a fan it does not control. That candidate is
+untestable here, which is different from being false and is recorded as such.
+
+**The power governor is already weakened** by the clock-ramp trace — power pins
+at 79.8 W within 10 s and drifts +0.03 W over the following 120 s.
+
+So the direct question: does *any* monitored variable distinguish a steady
+protocol from an unsteady one? `thermal_check.py` now reports the mean within-cell
+run-to-run standard deviation of each, next to the ratio spread each protocol
+produces at `quant_cold@8192`:
+
+| protocol | ratio spread | SM MHz | mem MHz | temp C | power W |
+|---|---|---|---|---|---|
+| `full` | **0.6%** | 4.94 | 150.9 | 0.98 | 0.68 |
+| `subset` | **13.2%** | 8.74 | 135.7 | 0.93 | 0.64 |
+| `preloaded` | **0.6%** | 9.95 | 122.1 | 0.41 | 0.96 |
+| `fullpre` | **8.4%** | 10.77 | 151.8 | 0.86 | 0.75 |
+
+**Nothing tracks the spread.** `subset` and `full` differ by 20x in ratio spread
+and are within 6% of each other on temperature SD and within 10% on memory-clock
+SD. `preloaded` is as steady as `full` in its ratios while having the *second
+worst* SM-clock reproducibility in the table. Whatever the preload does, it is
+not visible in SM clock, memory clock, temperature or power as this instrument
+samples them.
+
+One sub-observation, not a finding: `preloaded` has a temperature SD of 0.41
+against 0.86-0.98 for the other three — its temperature is about twice as
+reproducible run-to-run. But `full` is equally steady in its ratios with the
+*highest* temperature SD in the table, so reproducible temperature is not
+necessary for reproducible ratios, and one cell of four is not a pattern.
+
+This is the second time this project has reached "no telemetry explains it", and
+the first time was **wrong** — the figure being compared then was a whole-run
+power average, flat by construction. This one is a within-cell run-to-run spread
+of per-window means, which is a different quantity and the right one for the
+question. It could still be wrong in a way not yet seen; what would settle it is
+a variable the current sampler does not record, and on this part the obvious one
+(fan) is unavailable.
+
+### Two bugs the tests found
+
+- `render` returned early when the thermal fit had nothing to work with, which
+  **silently dropped the stability table** — a section that does not depend on
+  that fit at all. A report that loses content because an unrelated calculation
+  failed is worse than one that says the calculation failed.
+- A slope of **exactly zero** passed the `is None` guard and then crashed on the
+  empty `degrees_for_a_p_state`. Temperature having no measurable effect is the
+  strongest form of the verdict, not a case to fall over on.
+
+`test_between_run.py`: 126 → **131**.
