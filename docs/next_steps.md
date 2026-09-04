@@ -35,6 +35,9 @@ Everything below is verified on this machine, not assumed.
   need. With `--pair warm=cold` it also tests the warm-up arm — whether a
   preload's clock advantage decays across a run — and reports how many runs
   that test would need. Re-measures nothing.
+- `python clock_ramp.py --idle 90 --load 180` → ~4.5 min **on the GPU**, writes
+  `results/clock_ramp.{md,json}` including the raw 10 Hz series.
+  `--from-json results/clock_ramp.json` re-runs the analysis without the GPU.
 - `python bandwidth_law.py` → seconds, writes `results/bandwidth_law.{md,json}`
   (figure: `docs/plots/bandwidth_law.png`, from `make_session_plots.py`):
   the within-method decomposition of the bandwidth law, leave-one-out, per-row
@@ -46,7 +49,7 @@ Everything below is verified on this machine, not assumed.
   `min_effect_frac`. Post-hoc from the raw samples, so it runs on any results
   JSON ever recorded and never touches `benchmark.py`. Run 3: **39 quotable /
   7 pinned / 2 rejected**.
-- `python -m pytest test_between_run.py -q` → **118** CPU-only tests, ~11 s,
+- `python -m pytest test_between_run.py -q` → **124** CPU-only tests, ~13 s,
   covering `between_run.py`, `clock_excursions.py`, `compare_protocols.py` and
   `dispersion_tier.py` (including the 2x2 arithmetic, the design reader, and the
   tier's calibration bar and per-claim admissibility).
@@ -271,10 +274,28 @@ re-run it after any benchmark run without thinking about it:
      At the scatter these cells show, settling it by this route needs
      **~200 runs per protocol** — tens of hours.
 
-     So do not run more protocol repetitions for this. Measure the **clock ramp
-     directly** during an idle-to-load transition instead: it answers "does the
-     memory clock take time to come up, and how long" in minutes rather than
-     inferring it from benchmark cells.
+     **DONE, and the arm is dead (2026-09-03, `clock_ramp.py`, pre-registered in
+     `05c1be3`, result `b29ff18`).** Idle 90 s, then 180 s of the same
+     DRAM-saturating load `benchmark.py` ramps with, sampling at 10 Hz. The
+     memory clock goes 405 MHz idle → **11001 MHz sustained, reached and held
+     0.4 s after the load starts** — 0.2% of the shortest protocol. Pre-registered
+     H1 ≥ 20.5 s / H2 < 20.5 s; predicted "H2, 1–4 s"; observed 0.4 s. A 205 s run
+     spends 99.8% of itself with the clock up, so the warm-up arm cannot explain
+     it behaving differently from a 775 s run.
+
+     Two by-products: the memory clock **leads the SM clock by 18×** (0.4 s vs
+     7.4 s), the opposite of the intuition behind the original ramp bug; and
+     there is a real **6.5 s boost transient** at 12001 MHz before the card
+     settles to 11001.
+
+     **Both arms of the two-mechanism hypothesis are now dead** — thermal on
+     effect size, warm-up on time constant. What survives is the observation
+     itself: `subset` → `preloaded` improves spread 13.2% → 0.6% for 300 s of
+     preload, and nothing here explains why. Untested candidates: the power
+     governor integrating over a window far longer than the clock ramp; a settled
+     fan curve rather than a temperature; allocator or driver state a preload
+     warms. **Do not run more protocol repetitions** — design a measurement that
+     separates those three.
 
    - Original framing, kept for the record. Spreads
      at `quant_cold@8192` are `full` 0.6%, `subset` 13.2%, `preloaded` 0.6%,

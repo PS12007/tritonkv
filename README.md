@@ -740,7 +740,32 @@ late**, while `fullpre` under `full` is −38 and −31, a preload that only cos
 and neither clears its error bar (Welch t = +1.46, −0.19). At the scatter these
 cells show, settling it by repeating protocols needs **~200 runs per protocol**.
 The cheaper experiment is to measure the clock ramp directly during an
-idle-to-load transition, which answers the same question in minutes.
+idle-to-load transition, which answers the same question in minutes — so that is
+what `clock_ramp.py` does, and **the arm is dead**.
+
+| | idle | sustained under load | reached and held |
+|---|---|---|---|
+| memory clock | 405 MHz | **11001 MHz** | **0.4 s** |
+| SM clock | 435 MHz | 2640 MHz | 7.4 s |
+
+The memory clock is at its operating point 0.4 s after the load starts — 0.2% of
+the shortest protocol. A 205 s run spends 99.8% of itself with the clock already
+up. This was pre-registered before the run (H1 ≥ 20.5 s, H2 < 20.5 s, prediction
+"H2, 1–4 s"); 0.4 s is H2 by a factor of 50 and 2.5× faster than predicted.
+
+Two by-products. The memory clock **leads the SM clock by 18×**, which is the
+reverse of the assumption behind the original ramp bug — that ramp drove the SM
+clock and expected memory to follow. And the card **boosts to 12001 MHz for 6.5 s**
+before settling to 11001 for the remaining 96% of the window; taking that peak as
+the ceiling was a bug in this measurement, caught by reading the series rather
+than the summary, and fixed from the saved trace without re-running the GPU.
+
+**So both arms of the two-mechanism story are dead** — thermal on effect size,
+warm-up on time constant. What survives is the observation: 300 s of preload
+takes the short protocol's spread from 13.2% to 0.6%, and nothing here explains
+why. The candidates that remain untested are the power governor integrating over
+a window far longer than the clock ramp, a settled fan curve rather than a
+temperature, and allocator or driver state a preload happens to warm.
 
 **What predicts the movement is achieved bandwidth.** Time each row's own
 DRAM-resident bytes against its own DRAM-resident time and the pattern is flat:
@@ -952,7 +977,7 @@ python -m venv .venv
 .venv/Scripts/python.exe -m pip install -r requirements.txt
 
 .venv/Scripts/python.exe -m pytest test_correctness.py -q   # 106 tests, ~89 s (GPU)
-.venv/Scripts/python.exe -m pytest test_between_run.py -q    # 118 tests, ~11 s (no GPU)
+.venv/Scripts/python.exe -m pytest test_between_run.py -q    # 124 tests, ~13 s (no GPU)
 .venv/Scripts/python.exe benchmark.py --quick                # ~75 s smoke run
 .venv/Scripts/python.exe benchmark.py --samples 50           # full suite, ~13 min
 .venv/Scripts/python.exe dispersion_tier.py                  # three-tier verdict per row
@@ -1020,13 +1045,14 @@ committed.
 | `kernels/fused_decode_attn.py` | the fused kernel. |
 | `kernels/fp16_decode_attn.py` | the control: identical shape, unquantized. Isolates the flash-decoding effect. |
 | `test_correctness.py` | 106 tests on the kernel, explicit asserted thresholds. |
-| `test_between_run.py` | 118 CPU-only tests on the between-run, excursion, protocol, dispersion-tier and bandwidth-law machinery — including the 2x2 arithmetic, the design reader and the tier's calibration bar — against synthetic runs with known answers. |
+| `test_between_run.py` | 124 CPU-only tests on the between-run, excursion, protocol, dispersion-tier and bandwidth-law machinery — including the 2x2 arithmetic, the design reader and the tier's calibration bar — against synthetic runs with known answers. |
 | `benchmark.py` | timing + memory. Rotating working set for the cold regime, CUDA-graph replay for the hot one. |
 | `audit_claims.py` | adversarial self-audit: bootstrap CIs over raw timings, attribution against the fp16 control, per-optimization claims with their own controls, and a clock-verification gate. |
 | `between_run.py` | what a bootstrap CI does not cover: compares N independent full runs, reports the run-to-run interval, the inflation over the single-run CI, and whether any verdict moved. |
 | `clock_excursions.py` | the rate at which a row drops a memory P-state, split by run protocol and regime, with the gate's verdict on each. |
 | `compare_protocols.py` | whether two measurement protocols produce the same numbers at all, the bandwidth law that says which rows they will disagree on, and the 2x2 that separates run length from recent saturation. |
 | `bandwidth_law.py` | whether "achieved bandwidth predicts protocol sensitivity" is a law or a method label: the within-method decomposition, leave-one-out, per-row residuals, and whether the memory clock really is constant across protocols. |
+| `clock_ramp.py` | the memory clock's time constant, measured directly: idle the GPU, load it, and watch. Answers in minutes what repeating protocols could not settle in hundreds of runs. |
 | `thermal_check.py` | whether temperature is even large enough to move a memory P-state: the within-cell slope in MHz per degree, against the degrees the protocols actually span. |
 | `analyze_dispersion.py` | decomposes every rejected measurement into trend, tail and floor, so the gate is argued with rather than tuned. |
 | `dispersion_tier.py` | the third verdict: which gate-failed rows pin their medians well enough to be used anyway, judged against the worst row the gate already accepts. Post-hoc, so it never touches the instrument. |
