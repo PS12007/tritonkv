@@ -1765,3 +1765,93 @@ protocol repetition.
 
 `test_between_run.py`: 118 → **124**, including a test that plants a boost
 transient and requires the sustained level to be chosen over it.
+
+## The slow process is the cooling loop, not the clock
+
+The clock-ramp trace was recorded to answer one question and answered a second
+one for free. Over 180 s of continuous saturating load, sampled at 10 Hz:
+
+| | 0-10 s | 10-30 s | 30-60 s | 60-120 s | 120-180 s |
+|---|---|---|---|---|---|
+| power (W) | 72.8 | 79.8 | 79.8 | 79.8 | 79.9 |
+| temperature (C) | 56.3 | 65.4 | 72.5 | 73.9 | 70.9 |
+| memory clock (MHz) | 11322 | 11001 | 11001 | 11001 | 11001 |
+| SM clock (MHz) | 2507 | 2689 | 2636 | 2624 | 2643 |
+
+**Power pins at its limit in ~10 s and never moves again** — drift over the last
+120 s is +0.03 W. That weakens "the power governor integrates over a long window"
+as the explanation for what a preload does, which was one of the three candidates
+left standing.
+
+**Temperature does not settle for two minutes, and it overshoots.** Smoothed over
+2 s it rises to a peak of **76.2 C at t = 71 s**, falls back to 71.0 C by
+t ≈ 120 s, and is flat from there to 180 s. The SM clock mirrors it exactly —
+2608 MHz at peak temperature, recovering to 2641 and holding. That is a cooling
+loop with a lag: heat rises, the fan responds late, temperature comes back down
+and settles.
+
+So there **is** a slow process on this card, with a time constant around
+**120 s** — 300x the memory clock's 0.4 s. It is the thermal/fan loop, it is
+visible in temperature and in the SM clock, and it is not visible in the memory
+clock at all (11001 MHz flat from t = 10 s).
+
+That is the right order of magnitude to matter here. The shortest protocol is
+205 s, so **a `subset` run spends its entire measurement inside the thermal
+transient**; `full` at 775 s spends about 15% of itself there; and a 300 s
+preload absorbs the whole transient, which is exactly the shape of "preloading
+fixes the short protocol" (13.2% spread -> 0.6%).
+
+### The prediction it makes, and the confound that blocks it
+
+If the thermal transient is what hurts, the rows measured early in a run should
+be the ones with poor timing dispersion. They are:
+
+| quarter of the run | rows | dispersion failures |
+|---|---|---|
+| 1st (rows 0-11) | 24 measurements | 2 (8%) |
+| 2nd (rows 12-23) | 24 | **7 (29%)** |
+| 3rd (rows 24-35) | 24 | 1 (4%) |
+| 4th (rows 36-47) | 24 | **0** |
+
+Nine of ten failures are in the first half, none in the last quarter, and
+correlation between position-in-run and IQR is r = -0.226: later is tighter.
+
+**And it proves nothing**, because in this benchmark the context loop is the
+outer one. Position 0-11 *is* ctx=512, 12-23 *is* ctx=2048, and so on. Measurement
+order and context length are perfectly confounded in the default ordering, so
+this table is equally well explained by "short contexts are noisier", which is
+already known to be true for unrelated reasons (they are tens of microseconds
+long).
+
+### The experiment that separates them
+
+Run the benchmark with the context order **reversed**. If dispersion failures
+follow *position*, they move to ctx=16384 and ctx=8192. If they follow *context*,
+they stay with ctx=512 and ctx=2048. One run, ~13 minutes, and the two
+explanations make opposite predictions about which rows fail.
+
+`benchmark.py --contexts` was added for this: it sets the order as well as the
+content, records itself in the results, and `between_run.py` already refuses to
+pool runs whose context tuples differ, so a reordered run cannot be mixed into
+the canonical set by accident.
+
+**Pre-registered, before the run exists:**
+
+- **H-position.** The thermal transient is what hurts. Failures concentrate in
+  the first half of the *reversed* run — i.e. on ctx=16384 and ctx=8192, which
+  fail 1 of 48 measurements in the normal ordering. Predicted: **>= 4** failures
+  among them, and ctx=512/2048 improve.
+- **H-context.** Short contexts are simply noisier. Failures stay on ctx=512 and
+  ctx=2048 regardless of when they are measured. Predicted: ctx=16384 stays at or
+  near **0** failures, and the overall failure pattern looks like the normal
+  ordering.
+
+**The prediction is H-context**, and not by much: the L2-resident rows at short
+context are 3-5 microseconds long, where a fixed amount of jitter is a much
+larger fraction of the median, and that mechanism does not need position to
+explain anything. H-position would be the more interesting result, which is a
+reason to be suspicious of wanting it.
+
+A mixed outcome is possible and is not a failure of the design: failures moving
+partly is evidence for both mechanisms operating, and the split is the number to
+report.

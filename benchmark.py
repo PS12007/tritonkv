@@ -1151,6 +1151,14 @@ def main():
                          "gap between a short run and a long one is *total* "
                          "sustained load rather than position within the run -- "
                          "see the docstring on preload(). Recorded in the JSON.")
+    ap.add_argument("--contexts", type=int, nargs="+", default=None,
+                    metavar="N",
+                    help="context lengths to time, IN THE ORDER GIVEN. The context "
+                         "loop is the outer one, so this sets measurement order as "
+                         "well as content -- passing the defaults reversed is the "
+                         "experiment that separates position-in-run from context "
+                         "length. Recorded in the results, and `between_run.py` "
+                         "refuses to pool runs whose context tuples differ.")
     ap.add_argument("--quick", action="store_true")
     ap.add_argument("--no-tune", action="store_true")
     ap.add_argument("--no-clock-monitor", action="store_true",
@@ -1163,7 +1171,18 @@ def main():
         print(f"FATAL: {why}", file=sys.stderr)
         return 1
 
-    contexts = (512, 2048) if args.quick else CONTEXT_LENGTHS
+    # Order matters and is deliberately preserved. The context loop is the outer
+    # one, so a run's measurement order is its context order -- which makes
+    # position-in-run and context length perfectly confounded in the default
+    # ordering. Reversing it is the only way to tell the two apart, and it is
+    # recorded in `contexts` so `between_run.py` already refuses to pool a
+    # reordered run with a normal one.
+    if args.contexts:
+        contexts = tuple(args.contexts)
+    elif args.quick:
+        contexts = (512, 2048)
+    else:
+        contexts = CONTEXT_LENGTHS
     samples = 8 if args.quick else args.samples
     passes = max(1, args.passes)
 
