@@ -355,7 +355,7 @@ the 1.05× bar at no context in either regime).
 Current run against `results/benchmark.json` (2026-09-02 12:21, the third of
 three back-to-back full runs — "the last one" rather than "the best one", which
 is the only selection rule that cannot be gamed after the fact; it is also the
-run with the fewest quotable rows of the three): **70 claims — 26 TRUE / 20 TRUE
+run with the fewest quotable rows of the three): **72 claims — 26 TRUE / 22 TRUE
 BUT CONDITIONAL / 12 MISLEADING / 12 FALSE.** Eight claims moved from conditional to established when the clock
 ramp was fixed, and none of them because a threshold was relaxed.
 Regenerate with `./.venv/Scripts/python.exe audit_claims.py` (~20 s) and read
