@@ -2149,3 +2149,56 @@ same code path. A decomposition that only ever confirms is not a decomposition.
 `clock_excursions.py` now carries `duration_effect` and prints the verdict either
 way. `test_between_run.py`: 134 → **139**, including a planted real effect that
 must survive and a planted pure between-method effect that must not.
+
+## Where the excursion question stops, and why it stops here
+
+One more candidate, then a decision about method.
+
+**Tested: does the *preceding* row predict an excursion?** The idea was the best
+one available, because it explains the protocol difference directly. `subset`
+times three methods per context, so its two fast kernels follow each other;
+`full` times twelve, so a fast kernel is far more often preceded by a slow
+DRAM-heavy one. If a predecessor that hammers memory holds the P-state up, the
+short protocol should excurse more — which it does, 12.5% against 2.8%.
+
+It is a **null, and a cleaner one than duration**. Excursion rate by predecessor
+duration, over 978 observations with a predecessor:
+
+| predecessor duration (µs) | observations | excursion rate |
+|---|---|---|
+| 4.6 – 10.4 | 195 | 4.1% |
+| 10.4 – 27.3 | 195 | 6.2% |
+| 27.4 – 50.9 | 195 | 5.6% |
+| 50.9 – 735.6 | 195 | 4.6% |
+| 736.1 – 1884.2 | 198 | 4.5% |
+
+There is no gradient at all — the pooled relationship that made the duration
+candidate tempting simply is not there for the predecessor. Within method, 8 of
+12 negative, which is the same non-sweep. Nothing survives.
+
+### The decision: stop testing hypotheses against this dataset
+
+The excursion mechanism has now been probed with: temperature (too small by 3x),
+clock warm-up time (0.4 s, 500x too fast), the four monitored telemetry variables
+(none tracks the spread), row duration (confounded with kernel identity), and
+predecessor duration (no pooled gradient). That is five hypotheses against the
+**same ~1000 observations**.
+
+Continuing is p-hacking with extra steps. Each new candidate tried on a fixed
+dataset raises the chance that one eventually clears an arbitrary bar, and this
+project would then have a mechanism it believes for the worst possible reason.
+The within-method decomposition protects against confounding, not against
+multiplicity, and nothing here protects against multiplicity.
+
+So the honest position, recorded rather than worked around:
+
+**The P-state excursion mechanism is not identifiable from the runs on disk.**
+What is known is a rate — 2.8% (`full`), 12.5% (`subset`), 1.4% (`preloaded`),
+5.6% (`fullpre`), 4.2% (`reversed`) — and that the gate catches the excursions
+that matter, which is what protects the published numbers regardless of cause.
+Anything further needs **data collected for the question**: a design that varies
+one candidate while holding the others fixed, rather than another pass over runs
+collected for something else.
+
+That is not a satisfying place to leave it. It is the correct one, and it is
+cheaper than the alternative, which is a mechanism nobody can reproduce.
