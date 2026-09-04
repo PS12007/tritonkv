@@ -1297,3 +1297,71 @@ New figure `docs/plots/protocol_factorial.png`. `test_between_run.py`: 47 tests.
 **What the repo should quote for `quant_cold@8192`: 1.28–1.48**, unchanged as a
 range — but the centre of it has moved. Three of the four protocols put the cell
 at 1.39–1.42. Only `full`, the shipped one, says 1.475.
+
+
+## The second dispersion tier: a third verdict, not a wider gate
+
+`next_steps.md` had carried this as open item 1 since the dispersion decomposition
+diagnosed it, deliberately deferred: it touches how rows are reported, and
+changing the instrument while four protocols were in flight was the exact
+confound those protocols were built to measure. The protocols are done, so it
+was safe to act.
+
+**The fact.** The gate rejects a row when its per-sample IQR exceeds 5% of its
+median. But IQR is a property of the *sample distribution* and the tables quote
+the *median*, and on this part those two come apart badly. The L2-resident rows
+are tens of microseconds long and jitter freely around a median that barely
+moves. On run 3, eight of the ten rejected measurements pin their medians to
++-0.05-1.31% while being rejected for IQRs of 5.6-11.5%.
+
+**The refused fix.** Widening `MAX_IQR_FRAC` would admit the two rejected
+measurements that are genuinely badly pinned (+-2.33%, +-2.68%) along with the
+eight that are not. Dispersion and precision are different questions; the fix is
+to ask the second one separately.
+
+**The bar, and why it is not a new free parameter.** A promoted row must pin its
+median at least as well as *the worst number the gate already accepts* — on run 3
+that is +-1.700%, from `fused_gather_meta_4b@512`, a row this repo already prints
+with a star. The bar is read off the instrument's own accepted behaviour, per
+run, so the tier cannot by construction admit a number less certain than one the
+gate blesses. That is what makes it a report rather than a loophole. Across the
+six full runs the bar lands at 1.43-1.96%, so it is a property of the instrument
+and not of the run.
+
+**Two restrictions that bite.** A clock-rejected row is never eligible — the gate
+is not a P-state filter, so a clock failure is a question this tier cannot see.
+And a promoted row is admissible *per claim*: each carries `min_effect_frac`,
+five times its own median uncertainty, and a consumer is expected to check the
+effect it is claiming against it. The attribution rows clear it by 4-25x.
+
+**What it buys, measured across all six full runs rather than argued from one.**
+The attribution chain (`fp16_sdpa`, `triton_fp16_control`, `fused_triton_4b`)
+complete at each context, gate-only vs gate+tier-2:
+
+| ctx | gate only | with tier 2 |
+|---|---|---|
+| 512 | 3/6 | **6/6** |
+| 2048 | 2/6 | **6/6** |
+| 8192 | 5/6 | 5/6 |
+| 16384 | 2/6 | 4/6 |
+
+The two contexts that carry the sign flip — 512, where quantization loses in both
+regimes, and 2048, where the flip happens — go from a minority of runs to all
+six. That is the qualifier `next_steps.md` wanted to remove: those contexts were
+being reported as "clears in one run and not the others" for a reason that turns
+out not to bear on the number quoted.
+
+ctx=8192 is **unchanged**, which is the restriction visible in the data: the one
+run where its chain is incomplete (`fullpre3`) fails because `fused_triton_4b`'s
+median is pinned only to +-1.91% against that run's +-1.49% bar. The tier
+declines it on its own merits rather than rounding it up.
+
+**Promotion is a property of the run, exactly as quotability is.** No row is
+promoted in all six full runs; the most any row manages is four. That is the same
+finding as "quotability is a random variable", not a new problem, and it is why
+the table above is stated over six runs instead of one.
+
+**Code.** `dispersion_tier.py`, applied post-hoc — the raw per-sample timings are
+already in every results JSON, so the tier applies retroactively to all six full
+runs and the three subset runs, and `benchmark.py` is untouched. No re-run was
+needed and no measurement changed. `test_between_run.py`: 47 -> **62** tests.

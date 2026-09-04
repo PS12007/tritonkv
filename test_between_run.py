@@ -12,14 +12,18 @@ from __future__ import annotations
 
 import json
 import random
+import statistics
 from pathlib import Path
 
+import numpy as np
 import pytest
 
+import analyze_dispersion
 import audit_claims
 import between_run
 import clock_excursions
 import compare_protocols
+import dispersion_tier
 from audit_claims import Bench
 
 CTX = 2048
@@ -770,3 +774,223 @@ def test_render_reports_the_2x2_when_the_design_is_complete():
     assert "4 protocols, compared" in md
     assert "The 2x2" in md and "Simple effects" in md
     assert "Not computed" not in md
+
+
+# ---------------------------------------------------------------------------
+# dispersion_tier -- the second reporting tier
+#
+# The shapes below are not arbitrary: they reproduce the real run's structure.
+# `_grid` passes the IQR gate while pinning its median only to ~1.7%, which is
+# what `fused_gather_meta_4b@512` does in run 3 and what therefore sets the bar; `_wide` at n=400 fails the gate at ~5.8% IQR while pinning to ~0.6%,
+# which is the case the tier exists for; `_drift` fails the gate *and* pins
+# badly, which is the case that must keep failing.
+# ---------------------------------------------------------------------------
+
+
+def _wide(mean: float, n: int, spread: float = 0.06, seed: int = 0):
+    """Uncorrelated noise. Wide per-sample spread, median pinned by sheer n."""
+    rng = random.Random(seed)
+    return [mean * (1.0 + rng.uniform(-spread, spread)) for _ in range(n)]
+
+
+def _grid(mean: float, n: int = 24, spread: float = 0.045, seed: int = 0):
+    """A shuffled uniform grid: the IQR is exactly `spread` by construction, so
+    this row sits inside the gate for *every* seed. Drawing it randomly at this
+    n put the IQR either side of 5% depending on the seed, which would have made
+    the fixture decide the thing under test."""
+    xs = [mean * (1.0 + spread * (2.0 * k / (n - 1) - 1.0)) for k in range(n)]
+    random.Random(seed).shuffle(xs)
+    return xs
+
+
+def _drift(mean: float, n: int = 200, pct: float = 0.15, seed: int = 0):
+    """A monotone ramp across the window: wide IQR *and* an unpinned median,
+    because the block bootstrap keeps the ramp intact."""
+    rng = random.Random(seed)
+    return [mean * (1.0 + pct * i / (n - 1)) * (1.0 + rng.uniform(-0.01, 0.01))
+            for i in range(n)]
+
+
+def _tight(mean: float, n: int = 200, seed: int = 0):
+    return _wide(mean, n, spread=0.005, seed=seed)
+
+
+def _tier_payload(spec: dict) -> dict:
+    """A results payload built from named sample series.
+
+    `spec` maps method -> (cold_series, graph_series, clock_verified). The
+    `quotable` flag is derived the way `benchmark.py` derives it -- clocks
+    verified and both regimes inside the IQR gate -- so the fixture cannot
+    disagree with the gate it is testing.
+    """
+    results = []
+    for i, (method, (cold, graph, clock_ok)) in enumerate(spec.items()):
+        # the gate's own IQR, not a re-implementation of it: a fixture that
+        # disagreed with `describe` would be testing the disagreement
+        tight = all(analyze_dispersion.iqr_frac(np.asarray(xs, dtype=float))
+                    <= dispersion_tier.MAX_IQR_FRAC for xs in (cold, graph))
+        results.append({
+            "method": method,
+            "ctx": CTX,
+            "clock_verified": clock_ok,
+            "quotable": bool(clock_ok and tight),
+            "cold_raw_ms": cold,
+            "graph_raw_ms": graph,
+            "cold": {"median_ms": statistics.median(cold)},
+            "graph": {"median_ms": statistics.median(graph)},
+        })
+    return {"results": results, "contexts": [CTX], "model": "synthetic",
+            "env": {}, "correctness": [], "args": {}, "bit_widths": [NBITS]}
+
+
+def _standard_spec() -> dict:
+    """One tight row, one loose-but-accepted row that sets the bar, one row the
+    tier should promote, and one it must not."""
+    return {
+        "fp16_sdpa": (_tight(100.0, seed=1), _tight(50.0, seed=2), True),
+        # passes the gate at exactly 4.5% IQR but pins its median only to ~1.7%
+        "triton_fp16_control": (_grid(10.0, seed=3), _tight(5.0, seed=4), True),
+        # fails the gate at ~5.8% IQR, median pinned to ~0.6%
+        "fused_triton_4b": (_wide(8.0, 400, seed=5), _tight(4.0, seed=6), True),
+        # fails the gate and the median is not pinned either
+        "fused_gather_meta_4b": (_drift(10.4, seed=7), _tight(5.2, seed=8), True),
+    }
+
+
+def _tier_report(spec: dict | None = None) -> dict:
+    return dispersion_tier.build(_tier_payload(spec or _standard_spec()))
+
+
+def _row(report: dict, method: str) -> dict:
+    return dispersion_tier.by_row(report)[(method, CTX)]
+
+
+def test_a_row_that_passes_the_gate_is_untouched():
+    """Tier 1 is the gate's own verdict, restated. The tier must not re-derive
+    it, because a star has to keep meaning what it meant before this existed."""
+    report = _tier_report()
+    r = _row(report, "fp16_sdpa")
+    assert r["tier"] == dispersion_tier.TIER_QUOTABLE
+    assert r["reason"] == "passes the gate"
+    assert r["min_effect_frac"] is None  # a starred row carries no qualifier
+
+
+def test_promotion_never_changes_the_quotable_count():
+    """The property that makes this a report and not a widened gate."""
+    payload = _tier_payload(_standard_spec())
+    report = dispersion_tier.build(payload)
+    assert report["counts"]["quotable"] == sum(
+        1 for r in payload["results"] if r["quotable"])
+
+
+def test_a_wide_row_with_a_pinned_median_is_promoted():
+    report = _tier_report()
+    r = _row(report, "fused_triton_4b")
+    assert r["tier"] == dispersion_tier.TIER_PINNED
+    assert r["worst_iqr_frac"] > dispersion_tier.MAX_IQR_FRAC
+    assert r["worst_median_ci_halfwidth_frac"] < 0.01
+    assert "fails the gate" in r["reason"]
+
+
+def test_a_row_whose_median_is_not_pinned_stays_rejected():
+    """The whole point of not widening `MAX_IQR_FRAC`: this row and the promoted
+    one both fail the gate, and only one of them deserves to be readable."""
+    report = _tier_report()
+    r = _row(report, "fused_gather_meta_4b")
+    assert r["tier"] == dispersion_tier.TIER_REJECTED
+    assert "worse than the gate's own worst accepted" in r["reason"]
+
+
+def test_the_bar_is_the_worst_number_the_gate_already_accepts():
+    report = _tier_report()
+    cal = report["calibration"]
+    assert cal["worst"]["method"] == "triton_fp16_control"
+    # ...and it is genuinely inside the gate, which is what makes it a fair bar
+    assert cal["worst"]["iqr_frac"] <= dispersion_tier.MAX_IQR_FRAC
+    assert cal["bar_frac"] == pytest.approx(
+        cal["worst"]["median_ci_halfwidth_frac"])
+
+
+def test_no_promoted_row_is_looser_than_the_bar():
+    report = _tier_report()
+    bar = report["calibration"]["bar_frac"]
+    promoted = [r for r in report["rows"] if r["tier"] == dispersion_tier.TIER_PINNED]
+    assert promoted
+    assert all(r["worst_median_ci_halfwidth_frac"] <= bar for r in promoted)
+
+
+def test_a_clock_rejected_row_is_never_promoted():
+    """The gate is not a P-state filter, so a clock failure is not a dispersion
+    question and this tier has nothing to say about it -- even for a row whose
+    median is pinned perfectly."""
+    spec = _standard_spec()
+    spec["fused_triton_4b"] = (_tight(8.0, seed=9), _tight(4.0, seed=10), False)
+    r = _row(_tier_report(spec), "fused_triton_4b")
+    assert r["tier"] == dispersion_tier.TIER_REJECTED
+    assert "clock-rejected" in r["reason"]
+
+
+def test_a_row_is_judged_on_its_worse_regime():
+    """One pinned regime does not carry a row whose other regime wanders."""
+    spec = _standard_spec()
+    spec["fused_triton_4b"] = (_tight(8.0, seed=11), _drift(4.0, seed=12), True)
+    r = _row(_tier_report(spec), "fused_triton_4b")
+    assert r["tier"] == dispersion_tier.TIER_REJECTED
+
+
+def test_a_run_with_no_quotable_row_promotes_nothing():
+    """With nothing accepted there is nothing to calibrate against, and the tier
+    declines to exist rather than inventing a bar."""
+    spec = {m: (c, g, False) for m, (c, g, _) in _standard_spec().items()}
+    report = _tier_report(spec)
+    assert report["calibration"]["bar_frac"] is None
+    assert report["counts"]["pinned"] == 0
+
+
+def test_usable_for_weighs_the_effect_against_the_row():
+    """A promoted row is admissible per claim, not in general."""
+    r = _row(_tier_report(), "fused_triton_4b")
+    floor = r["min_effect_frac"]
+    assert dispersion_tier.usable_for(r, floor * 1.01)
+    assert not dispersion_tier.usable_for(r, floor * 0.99)
+    # sign is irrelevant: a 20% slowdown is as large an effect as a 20% speedup
+    assert dispersion_tier.usable_for(r, -floor * 1.01)
+
+
+def test_a_quotable_row_needs_no_effect_size_and_a_rejected_one_is_never_usable():
+    report = _tier_report()
+    assert dispersion_tier.usable_for(_row(report, "fp16_sdpa"), 0.0001)
+    assert not dispersion_tier.usable_for(_row(report, "fused_gather_meta_4b"), 10.0)
+
+
+def test_the_floor_is_the_multiple_of_the_rows_own_uncertainty():
+    r = _row(_tier_report(), "fused_triton_4b")
+    assert r["min_effect_frac"] == pytest.approx(
+        dispersion_tier.EFFECT_MULTIPLE * r["worst_median_ci_halfwidth_frac"])
+
+
+def test_render_names_the_calibrator_and_lists_both_outcomes():
+    md = dispersion_tier.render(_tier_report())
+    assert "triton_fp16_control" in md          # the bar, named
+    assert "Tier 2: gate-failed, median pinned" in md
+    assert "fused_triton_4b" in md              # promoted
+    assert "fused_gather_meta_4b" in md         # still rejected, and said so
+
+
+def test_render_says_so_when_there_is_no_bar():
+    spec = {m: (c, g, False) for m, (c, g, _) in _standard_spec().items()}
+    md = dispersion_tier.render(_tier_report(spec))
+    assert "no bar to calibrate" in md
+
+
+def test_tier_end_to_end_writes_both_reports(tmp_path, monkeypatch):
+    src = tmp_path / "benchmark.json"
+    src.write_text(json.dumps(_tier_payload(_standard_spec())), encoding="utf-8")
+    out, md = tmp_path / "tier.json", tmp_path / "tier.md"
+    monkeypatch.setattr("sys.argv", ["dispersion_tier.py", "--input", str(src),
+                                     "--out", str(out), "--md", str(md)])
+    dispersion_tier.main()
+    report = json.loads(out.read_text(encoding="utf-8"))
+    assert report["counts"]["pinned"] == 1
+    assert report["counts"]["rejected"] == 1
+    assert "Dispersion tiers" in md.read_text(encoding="utf-8")

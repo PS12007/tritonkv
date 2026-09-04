@@ -29,9 +29,16 @@ Everything below is verified on this machine, not assumed.
 - `python clock_excursions.py --label full=... --label subset=...` → seconds,
   writes `results/clock_excursions.{md,json}`: the per-run-group rate of memory
   P-state excursions and whether the gate rejected each one.
-- `python -m pytest test_between_run.py -q` → **47** CPU-only tests, ~7 s,
-  covering `between_run.py`, `clock_excursions.py` and `compare_protocols.py`
-  (including the 2x2 arithmetic and the design reader).
+- `python dispersion_tier.py` → seconds, writes
+  `results/dispersion_tier.{md,json}`: the three-tier verdict per row, the
+  calibration bar it was judged against, and each promoted row's
+  `min_effect_frac`. Post-hoc from the raw samples, so it runs on any results
+  JSON ever recorded and never touches `benchmark.py`. Run 3: **39 quotable /
+  7 pinned / 2 rejected**.
+- `python -m pytest test_between_run.py -q` → **62** CPU-only tests, ~10 s,
+  covering `between_run.py`, `clock_excursions.py`, `compare_protocols.py` and
+  `dispersion_tier.py` (including the 2x2 arithmetic, the design reader, and the
+  tier's calibration bar and per-claim admissibility).
 - `python benchmark.py --methods attribution` → 210 s instead of 775 s, times
   only the three rows the conditional is built from. **Not a substitute for a
   full run** — see open item 3; it is measurably noisier and shifted.
@@ -79,26 +86,55 @@ re-run it after any benchmark run without thinking about it:
 
 ## Open work, in order
 
-1. **Decide what to do about the dispersion rejects, now that they are
-   diagnosed.** `analyze_dispersion.py` decomposed all 96 measurements: only
-   8 of 25 failures carry a significant trend (so shorter windows help 8 rows,
-   not 23), 13 have neither trend nor tail, and the failing rows pin their
-   medians to +-0.69% anyway. The two fixes this file used to propose are
-   therefore mostly answering a question the data does not ask. What is left is
-   a **presentation** decision, not a measurement one, and it should be made
-   deliberately:
+1. **DONE -- the second dispersion tier is implemented.** `dispersion_tier.py`
+   adds a third verdict rather than widening `MAX_IQR_FRAC`, which stays at 5%
+   and is not to be touched.
 
-   - report the median's CI alongside the IQR in `benchmark.py`, so a starred
-     row carries the number that actually bears on the conclusion (needs a
-     re-run to take effect, and does not change the gate); and/or
-   - add a *second* tier -- "gate-failed but median pinned to <1%" -- so the
-     attribution tables can use those rows with an explicit qualifier instead
-     of dropping them.
+   * **tier 1, quotable** -- the gate's own verdict, unchanged. A star means
+     what it always meant.
+   * **tier 2, pinned** -- clock-verified, failed the IQR gate, but every regime
+     pins its median at least as well as *the worst number the gate already
+     accepts* (run 3: +-1.700%, from `fused_gather_meta_4b@512`). Usable with an
+     explicit qualifier, never a star.
+   * **tier 3, rejected** -- everything else.
 
-   Do **not** widen `MAX_IQR_FRAC`. The four rows whose failure is a tail would
-   be fixed by a trimmed statistic, which is a defensible change on its own
-   merits; the seven "drift + floor" rows would genuinely benefit from a shorter
-   window, and ctx=512 is where four of them are.
+   The bar is read off the instrument per run, so it is not a new free
+   parameter, and across the six full runs it is stable at 1.43-1.96%. A
+   clock-rejected row is never eligible (the gate is not a P-state filter). Each
+   tier-2 row carries `min_effect_frac` = 5x its own median uncertainty, and
+   `usable_for(rec, effect)` is the per-claim test.
+
+   Run 3: **39 quotable / 7 pinned / 2 rejected** of 48. The two that stay
+   rejected are the two genuinely unpinned ones (+-2.33%, +-2.68%) — which is
+   the reason the gate was not widened instead.
+
+   Attribution chain complete, over all six full runs:
+
+   | ctx | gate only | with tier 2 |
+   |---|---|---|
+   | 512 | 3/6 | **6/6** |
+   | 2048 | 2/6 | **6/6** |
+   | 8192 | 5/6 | 5/6 |
+   | 16384 | 2/6 | 4/6 |
+
+   ctx=512 and ctx=2048 — the two that carry the sign flip and that this file
+   used to report with a "clears in one run and not the others" qualifier — are
+   now complete in every run. ctx=8192 is untouched because its one incomplete
+   run fails on a median genuinely pinned to only +-1.91%, not on dispersion.
+
+   Applied post-hoc from the raw per-sample timings already in every results
+   JSON, so it covers all six full runs and the subset runs retroactively and
+   `benchmark.py` is untouched. `python dispersion_tier.py` -> seconds, writes
+   `results/dispersion_tier.{md,json}`.
+
+   **Still open, and it is the smaller half:** the tier is computed but nothing
+   consumes it yet. `audit_claims.py` still asks `b.quotable(...)` and stars on
+   tier 1 alone, so the six chains this unlocks are not yet reflected in the
+   audit or in the README tables. That is the next thing to do.
+
+   Note that **promotion is a property of the run**, exactly as quotability is:
+   no row is promoted in all six full runs, and the most any manages is four.
+   Report tier-2 coverage over runs, never from a single one.
 
 2. **Where the metadata-load curve actually bends.** `sweep_group_size.py` ran
    the sweep on both paths and the prediction ("broadcast sloped, gather flat")
