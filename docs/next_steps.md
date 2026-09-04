@@ -364,6 +364,25 @@ re-run it after any benchmark run without thinking about it:
      either way. Do not revive this without a design that varies duration within
      a kernel.
 
+     **Second candidate, also null: the PRECEDING row's duration.** The best idea
+     available, because it explains the protocol difference directly (`subset`
+     times 3 methods so its fast kernels follow each other; `full` times 12 so a
+     fast kernel is usually preceded by a slow DRAM-heavy one). Excursion rate by
+     predecessor duration over 978 observations: 4.1 / 6.2 / 5.6 / 4.6 / 4.5% —
+     **no gradient at all**. Within method 8 of 12 negative. Dead.
+
+     **STOP TESTING HYPOTHESES AGAINST THIS DATASET.** Five have now been tried
+     on the same ~1000 observations (temperature, clock warm-up, the four
+     telemetry variables, row duration, predecessor duration). Continuing is
+     p-hacking: the within-method decomposition protects against confounding,
+     not multiplicity, and nothing here protects against multiplicity. **The
+     excursion mechanism is not identifiable from the runs on disk.** What is
+     known is a rate (2.8 / 12.5 / 1.4 / 5.6 / 4.2% by protocol) and that the
+     gate catches the excursions that matter, which protects the published
+     numbers whatever the cause. Anything further needs **data collected for the
+     question** — a design that varies one candidate while holding the others
+     fixed.
+
    - Original framing, kept for the record. Spreads
      at `quant_cold@8192` are `full` 0.6%, `subset` 13.2%, `preloaded` 0.6%,
      `fullpre` 8.4%; excursion rates 2.8% / 12.5% / 2.8% / 6.9%. That is not
