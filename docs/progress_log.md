@@ -1657,3 +1657,44 @@ The test that makes this worth trusting is
 enormously in both temperature and clock with no relationship inside either,
 where a naive pooled fit would report a strong slope and the within-cell fit must
 report none. `test_between_run.py`: 106 → **113**.
+
+
+## Pre-registration: the clock-ramp measurement, before it is run
+
+`thermal_check.py` said settling the warm-up arm by repeating protocols would
+take ~200 runs per protocol. That is the wrong experiment. The hypothesis is a
+claim about a **time constant** — if a 205 s protocol is noisy because the memory
+clock has not finished rising, the clock must take a meaningful fraction of 205 s
+to rise. That is directly observable in minutes.
+
+`clock_ramp.py`: idle the GPU 90 s, then apply the same DRAM-saturating load
+`benchmark.py` ramps with (cache-resident GEMM alongside a DRAM-sized copy) for
+180 s, sampling `nvidia-smi` at 10 Hz throughout. Output: seconds until the
+memory clock reaches and **holds** (3 s) 99% of its loaded ceiling. Only loaded
+samples define the ceiling — at idle this part reports 12001 MHz, higher than it
+ever sustains under load, and targeting that is a bug `benchmark.py` already had
+to fix.
+
+**Written down before the run, and the decision rule with it.**
+
+- **H1 — the warm-up arm survives.** The memory clock takes **≥ 20.5 s** (10% of
+  the shortest protocol) to reach and hold its ceiling. A short protocol then
+  really does spend a meaningful part of itself with the clock still rising.
+- **H2 — the warm-up arm dies.** It arrives in **< 20.5 s**. A clock that is up
+  and holding within a small fraction of the shortest protocol cannot explain
+  that protocol behaving differently from one four times longer.
+
+**The prediction is H2, and more specifically 1–4 s.** The reason is already in
+the tree: `benchmark.py`'s own per-row ramp uses `MEM_SETTLE_SECONDS = 0.55` and
+gives up after `MEM_MAX_WAIT_SECONDS = 2.5`, and it mostly succeeds rather than
+timing out. A ramp that usually settles inside 2.5 s is not a ramp with a
+200-second time constant.
+
+If H2 lands, the `subset` → `preloaded` improvement (13.2% spread → 0.6%) still
+needs an explanation, and it will have to be something other than "the clock had
+not come up yet" — thermal steady state, or the power governor integrating over a
+longer window, are the obvious candidates and neither is tested here.
+
+The threshold, the hold rule, and both hypotheses are committed before the
+measurement exists. This is the same discipline as the fourth protocol, which is
+the only reason that result was worth anything.
