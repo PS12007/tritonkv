@@ -113,7 +113,7 @@ re-run it after any benchmark run without thinking about it:
    * **tier 3, rejected** -- everything else.
 
    The bar is read off the instrument per run, so it is not a new free
-   parameter, and across the six full runs it is stable at 1.43-1.96%. A
+   parameter, and across the nine full runs it is stable at 1.43-1.96%. A
    clock-rejected row is never eligible (the gate is not a P-state filter). Each
    tier-2 row carries `min_effect_frac` = 5x its own median uncertainty, and
    `usable_for(rec, effect)` is the per-claim test.
@@ -122,14 +122,15 @@ re-run it after any benchmark run without thinking about it:
    rejected are the two genuinely unpinned ones (+-2.33%, +-2.68%) — which is
    the reason the gate was not widened instead.
 
-   Attribution chain complete, over all six full runs:
+   Attribution chain complete, over all **nine** full-method runs (three
+   protocols):
 
    | ctx | gate only | with tier 2 |
    |---|---|---|
-   | 512 | 3/6 | **6/6** |
-   | 2048 | 2/6 | **6/6** |
-   | 8192 | 5/6 | 5/6 |
-   | 16384 | 2/6 | 4/6 |
+   | 512 | 5/9 | **9/9** |
+   | 2048 | 5/9 | **9/9** |
+   | 8192 | 7/9 | 7/9 |
+   | 16384 | 2/9 | **7/9** |
 
    ctx=512 and ctx=2048 — the two that carry the sign flip and that this file
    used to report with a "clears in one run and not the others" qualifier — are
@@ -137,7 +138,7 @@ re-run it after any benchmark run without thinking about it:
    run fails on a median genuinely pinned to only +-1.91%, not on dispersion.
 
    Applied post-hoc from the raw per-sample timings already in every results
-   JSON, so it covers all six full runs and the subset runs retroactively and
+   JSON, so it covers all nine full runs and the subset runs retroactively and
    `benchmark.py` is untouched. `python dispersion_tier.py` -> seconds, writes
    `results/dispersion_tier.{md,json}`.
 
@@ -154,7 +155,7 @@ re-run it after any benchmark run without thinking about it:
    (`make_session_plots.py`).
 
    Note that **promotion is a property of the run**, exactly as quotability is:
-   no row is promoted in all six full runs, and the most any manages is four.
+   no row is promoted in all nine full runs, and the most any manages is four.
    Report tier-2 coverage over runs, never from a single one.
 
 2. **Where the metadata-load curve actually bends.** `sweep_group_size.py` ran

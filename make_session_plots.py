@@ -635,9 +635,14 @@ def plot_dispersion(rows: list[dict]):
 
 # The six full runs the tier's coverage is reported over. Six, not one, because
 # promotion is a property of the run exactly as quotability is.
+# Every full-method run on disk, across three protocols. Three protocols rather
+# than one on purpose: the claim is that promotion is a property of the *run*, so
+# the denominator should span as many independently-collected runs as exist.
 FULL_RUNS = ("results/runs/run1.json", "results/runs/run2.json",
              "results/runs/run3.json", "results/tail/fullpre3.json",
-             "results/tail/fullpre4.json", "results/tail/fullpre5.json")
+             "results/tail/fullpre4.json", "results/tail/fullpre5.json",
+             "results/tail/reversed1.json", "results/tail/reversed2.json",
+             "results/tail/reversed3.json")
 
 # The rows the L2-residency conditional is built from. If all three survive at a
 # context, that context can carry the finding; if one is missing, it cannot.

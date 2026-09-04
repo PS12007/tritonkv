@@ -110,14 +110,15 @@ ctx=512 and ctx=2048 used to be quoted with an apologetic "clears the gate in on
 run and not the others". That qualifier was wrong in a specific way: those rows
 were being rejected for their *per-sample* spread, while the number quoted from
 them is the *median*, and on rows this short the two come apart. Measured over
-six full runs, all three rows of the attribution chain survive at each context:
+**nine** full-method runs spanning three protocols, all three rows of the
+attribution chain survive at each context:
 
 | ctx | gate alone | gate + pinned tier |
 |---|---|---|
-| 512 | 3/6 | **6/6** |
-| 2048 | 2/6 | **6/6** |
-| 8192 | 5/6 | 5/6 |
-| 16384 | 2/6 | 4/6 |
+| 512 | 5/9 | **9/9** |
+| 2048 | 5/9 | **9/9** |
+| 8192 | 7/9 | 7/9 |
+| 16384 | 2/9 | **7/9** |
 
 The bar for the second tier is not a chosen number — it is the worst-pinned row
 the gate already accepts (±1.70% on run 3), so it cannot admit anything less
@@ -908,7 +909,7 @@ it failed the per-sample IQR gate but pins every regime's median at least as wel
 as *the worst row the gate itself accepts* — ±1.70% on run 3, from
 `fused_gather_meta_4b@512`, a row this README prints unstarred. The bar is read
 off the instrument per run rather than chosen, so the tier cannot admit a number
-less certain than one already quoted, and across six full runs it lands at
+less certain than one already quoted, and across nine full runs it lands at
 1.43–1.96%. Run 3: **39 quotable / 7 pinned / 2 rejected** of 48.
 
 The two that stay rejected are pinned to ±2.33% and ±2.68% — which is exactly why

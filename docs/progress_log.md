@@ -2202,3 +2202,32 @@ collected for something else.
 
 That is not a satisfying place to leave it. It is the correct one, and it is
 cheaper than the alternative, which is a mechanism nobody can reproduce.
+
+## The tier's coverage, restated over nine runs
+
+The three reversed runs are full-method, so the dispersion tier's headline claim
+can now be measured over **nine** runs spanning **three** protocols rather than
+six over two. It gets stronger, and in the place that matters:
+
+| ctx | gate alone | gate + pinned tier |
+|---|---|---|
+| 512 | 5/9 | **9/9** |
+| 2048 | 5/9 | **9/9** |
+| 8192 | 7/9 | 7/9 |
+| 16384 | 2/9 | **7/9** |
+
+The two contexts carrying the sign flip are complete in **every run on disk**,
+across three protocols that disagree with each other about the headline number.
+ctx=16384 improves from 2/9 to 7/9 — a much larger gain than the 2/6 → 4/6 the
+six-run version showed. ctx=8192 is still untouched by the tier, for the same
+reason as before: where its chain is incomplete, the failure is a median that is
+genuinely unpinned.
+
+Spanning three protocols is the point rather than an accident. The claim being
+made is that promotion is a property of the *run*, so the denominator should be
+as many independently collected runs as exist, not as many repetitions of one
+protocol. That also makes the caveat sharper: **no row is promoted in more than
+four of the nine.**
+
+`make_session_plots.py` draws the figure from the same list, so
+`docs/plots/dispersion_tier.png` is regenerated with the nine-run denominator.

@@ -37,10 +37,11 @@ the fp16 control and the fused kernel all pass the gate there every time:
 **0.800–0.813× L2-resident, 1.469–1.478× DRAM-resident.**
 
 ctx=512 and ctx=2048 were previously quoted with "clears the gate in one run and
-not the others". Measured over six full runs and admitting the pinned tier, all
-three rows of the chain survive at **6/6** runs at both contexts (against 3/6 and
-2/6 on the gate alone). ctx=8192 is unchanged at 5/6 and ctx=16384 goes 2/6 →
-4/6. Promotion is still a property of the run — no row is promoted in all six —
+not the others". Measured over **nine** full-method runs spanning three
+protocols and admitting the pinned tier, all three rows of the chain survive at
+**9/9** at both contexts (against 5/9 on the gate alone). ctx=8192 is unchanged
+at 7/9 and ctx=16384 goes 2/9 → **7/9**. Promotion is still a property of the
+run — no row is promoted in more than four of the nine —
 so this is stated with a denominator, not as a star. Earlier versions of this
 claim rested on rows where the fp16 control had failed the gate.
 
@@ -246,9 +247,9 @@ unrealistically easy input for a quantizer.
     a wider gate, which would also admit the two rows pinned only to ±2.33% and
     ±2.68%; it is a second verdict whose bar is **the worst-pinned row the gate
     already accepts** (±1.70%), so it cannot admit anything less certain than a
-    number already printed unstarred. Over six full runs this takes the
-    attribution chain at ctx=512 from 3/6 runs to 6/6 and at ctx=2048 from 2/6 to
-    6/6 — the two contexts carrying the sign flip, previously quoted with an
+    number already printed unstarred. Over nine full runs this takes the
+    attribution chain at ctx=512 from 5/9 runs to 9/9 and at ctx=2048 from 5/9 to
+    9/9 — the two contexts carrying the sign flip, previously quoted with an
     apologetic qualifier. `dispersion_tier.py` measures it; `audit_claims.py`
     carries it as `method.dispersion_tier` and marks promoted rows `~`.
 
