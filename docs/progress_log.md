@@ -1489,3 +1489,24 @@ clock moving and one without, and both misfit.
 
 Nothing here re-measures anything — it all comes out of the JSON
 `compare_protocols.py` had already written. `test_between_run.py`: 77 → **87**.
+
+
+### The audit carries it
+
+`method.bandwidth_law`, the fourth of these method claims after
+`between_run_spread`, `protocol_choice` and `dispersion_tier`, and the same
+shape: MISLEADING when `results/bandwidth_law.json` is absent, because a pooled
+correlation over three methods pulling 11 / 88 / 214 GB/s does not by itself
+distinguish a bandwidth law from a method label, and nothing then checks.
+
+Present and holding, it reads TRUE BUT CONDITIONAL and lists all six
+within-method looks, the leave-one-out floor, which method misfits, and that the
+memory clock is not constant across protocols. The conditional is named rather
+than implied: one card, one kernel family, four contexts per method.
+
+The claim **reverts to MISLEADING if a single look disagrees**, and there is a
+test that feeds it exactly that. A verdict that could only come out one way would
+not be worth printing.
+
+**72 claims: 26 TRUE / 22 CONDITIONAL / 12 MISLEADING / 12 FALSE.** No existing
+verdict moved. `test_between_run.py`: 87 → **94**.

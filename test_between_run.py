@@ -1356,3 +1356,77 @@ def test_bandwidth_law_refuses_a_missing_input(tmp_path, monkeypatch):
                                      str(tmp_path / "nope.json")])
     with pytest.raises(SystemExit):
         bandwidth_law.main()
+
+
+# ---------------------------------------------------------------------------
+# method.bandwidth_law, as the audit carries it
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def clean_bwlaw():
+    saved = audit_claims.BWLAW
+    yield
+    audit_claims.BWLAW = saved
+
+
+def _bwlaw_report(shifts=(0.001, 0.004, 0.007, 0.010)):
+    """A real bandwidth_law report, built by the real code, so the audit is
+    tested against the shape that actually reaches it."""
+    rows = ([{"method": "A", "ctx": c, "gb_s": g, "shift": s}
+             for c, g, s in zip((512, 2048, 8192, 16384), (10, 40, 70, 100), shifts)]
+            + [{"method": "B", "ctx": c, "gb_s": g, "shift": s}
+               for c, g, s in zip((512, 2048, 8192, 16384), (110, 140, 170, 200),
+                                  (0.011, 0.014, 0.017, 0.020))])
+    return bandwidth_law.build({"bandwidth_sensitivity": {"subset": {"rows": rows}},
+                                "telemetry": []})
+
+
+def test_the_audit_says_so_when_the_decomposition_is_missing(clean_bwlaw):
+    audit_claims.BWLAW = {}
+    (claim,) = audit_claims._bandwidth_law_claim()
+    assert claim.id == "method.bandwidth_law"
+    assert claim.verdict == "MISLEADING"
+    assert "bandwidth_law.json" in claim.evidence
+    # the reason it is misleading is the interpretation, not the arithmetic
+    assert "method effect" in claim.evidence
+
+
+def test_the_claim_is_conditional_when_every_look_agrees(clean_bwlaw):
+    audit_claims.BWLAW = _bwlaw_report()
+    (claim,) = audit_claims._bandwidth_law_claim()
+    assert claim.verdict == "TRUE BUT CONDITIONAL"
+    assert "2 of 2" in claim.evidence
+    assert "one card" in claim.evidence          # says what it is conditional on
+
+
+def test_the_claim_reverts_to_misleading_when_a_look_disagrees(clean_bwlaw):
+    """One kernel in which bandwidth does not predict is enough to withdraw the
+    interpretation -- the whole point of the decomposition is that it can."""
+    audit_claims.BWLAW = _bwlaw_report(shifts=(0.010, 0.007, 0.004, 0.001))
+    (claim,) = audit_claims._bandwidth_law_claim()
+    assert claim.verdict == "MISLEADING"
+
+
+def test_the_claim_names_the_method_that_misfits(clean_bwlaw):
+    audit_claims.BWLAW = _bwlaw_report()
+    (claim,) = audit_claims._bandwidth_law_claim()
+    assert "Where it misfits is" in claim.evidence
+
+
+def test_the_excluded_method_is_named_as_excluded(clean_bwlaw):
+    """A method with no bandwidth range must be reported as not counted, not
+    silently dropped -- otherwise '6 of 6' reads as more agreement than it is."""
+    audit_claims.BWLAW = _bwlaw_report()
+    (claim,) = audit_claims._bandwidth_law_claim()
+    assert "reported as excluded" in claim.falsification_attempted
+
+
+def test_load_bandwidth_law_tolerates_a_missing_file(tmp_path):
+    assert audit_claims.load_bandwidth_law(tmp_path / "nope.json") == {}
+
+
+def test_load_bandwidth_law_round_trips(tmp_path):
+    f = tmp_path / "bw.json"
+    f.write_text(json.dumps(_bwlaw_report()), encoding="utf-8")
+    assert audit_claims.load_bandwidth_law(f)["n_positive"] == 2

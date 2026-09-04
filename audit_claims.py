@@ -722,6 +722,11 @@ PROTOCOLS: dict = {}
 # the worst row the gate already accepts, so it is usable *for a large enough
 # effect* -- which is why nothing here consults the tier without an effect size.
 TIERS: dict[tuple[str, int], dict] = {}
+# `bandwidth_law.py`'s decomposition of the protocol finding. The pooled r = +0.84
+# is over 12 rows and 3 methods pulling very different bandwidth, so it is exactly
+# the shape in which a method effect can pose as a bandwidth one; this is the
+# within-method test that tells them apart.
+BWLAW: dict = {}
 
 
 def load_between_run(path: Path) -> dict[tuple[str, int, int], dict]:
@@ -730,6 +735,13 @@ def load_between_run(path: Path) -> dict[tuple[str, int, int], dict]:
         return {}
     payload = json.loads(path.read_text(encoding="utf-8"))
     return {(r["name"], r["ctx"], r["nbits"]): r for r in payload.get("ratios", [])}
+
+
+def load_bandwidth_law(path: Path) -> dict:
+    """Read bandwidth_law.py's output. Absent is fine, and is itself audited."""
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def load_tiers(path: Path) -> dict[tuple[str, int], dict]:
@@ -1544,6 +1556,7 @@ def audit_dispersion(b: Bench) -> list[Claim]:
                 falsification_attempted="n/a",
             ),
             *_tier_claim(),
+            *_bandwidth_law_claim(),
         ]
 
     rows = []
@@ -1564,7 +1577,7 @@ def audit_dispersion(b: Bench) -> list[Claim]:
         # A run where nothing failed says nothing about the gate, but the tier's
         # own claim is still worth carrying -- not least because "no failures"
         # is the case where a reader is least likely to check.
-        return _tier_claim()
+        return _tier_claim() + _bandwidth_law_claim()
 
     causes: dict[str, int] = {}
     for d in fails:
@@ -1618,6 +1631,7 @@ def audit_dispersion(b: Bench) -> list[Claim]:
             ),
         ),
         *_tier_claim(),
+        *_bandwidth_law_claim(),
     ]
 
 
@@ -1692,6 +1706,97 @@ def _tier_claim() -> list[Claim]:
                 "exists to draw. Coverage is reported over six full runs rather than the "
                 "one that motivated it, because promotion, like quotability, is a "
                 "property of the run: no row is promoted in all six."
+            ),
+        )
+    ]
+
+
+def _bandwidth_law_claim() -> list[Claim]:
+    """Is "bandwidth predicts protocol sensitivity" a law, or a method label?
+
+    The pooled correlation is over 12 rows spanning three methods whose mean
+    achieved bandwidth differs by 20x. A correlation of that shape is satisfied
+    just as well by "these are three different kernels", so what is audited here
+    is not the correlation but the *interpretation* of it.
+    """
+    if not BWLAW:
+        return [
+            Claim(
+                id="method.bandwidth_law",
+                claim=(
+                    "Achieved DRAM bandwidth predicts which rows a change of measurement "
+                    "protocol will move."
+                ),
+                verdict="MISLEADING",
+                evidence=(
+                    "The correlation behind that sentence is pooled over 12 rows and three "
+                    "methods whose mean achieved bandwidth differs by 20x (11 / 88 / "
+                    "214 GB/s), so it is equally consistent with a method effect wearing "
+                    "bandwidth's label -- and nothing here tells the two apart, because "
+                    "`results/bandwidth_law.json` is absent. Run `bandwidth_law.py`."
+                ),
+                falsification_attempted=(
+                    "Checked for the within-method decomposition rather than treating a "
+                    "pooled correlation as though it settled the interpretation."
+                ),
+            )
+        ]
+
+    looks = BWLAW.get("within_method_looks") or []
+    n, npos = BWLAW.get("n_looks", 0), BWLAW.get("n_positive", 0)
+    p_sign = BWLAW.get("sign_test_p")
+    holds = bool(n) and npos == n
+    min_loo = min((blk["loo"]["min_r"] for blk in BWLAW["per_protocol"].values()),
+                  default=float("nan"))
+    monotone = all(blk["decomposition"]["between_monotone"]
+                   for blk in BWLAW["per_protocol"].values())
+    misfit = BWLAW.get("misfit_by_method") or {}
+    worst_m = max(misfit, key=misfit.get) if misfit else None
+    others = [v for k, v in misfit.items() if k != worst_m]
+    mc = BWLAW.get("mem_clock") or {}
+
+    return [
+        Claim(
+            id="method.bandwidth_law",
+            claim=(
+                "Achieved DRAM bandwidth predicts which rows a change of measurement "
+                "protocol will move."
+            ),
+            verdict="TRUE BUT CONDITIONAL" if holds else "MISLEADING",
+            evidence=(
+                f"Held up under the test that could have refuted it. Holding the method "
+                f"fixed and varying only the context -- which moves bandwidth 3-4x inside "
+                f"one kernel -- the correlation is positive in {npos} of {n} "
+                f"(method x protocol) pairs that have any bandwidth range to correlate "
+                f"against"
+                + (f" (sign test p = {p_sign:.3f})" if p_sign else "")
+                + ": "
+                + ", ".join(f"`{L['method']}` under `{L['protocol']}` {L['r']:+.3f}"
+                            for L in looks)
+                + ". Each look is n=4 and settles nothing alone; that they agree is the "
+                  "evidence. Between-method means are "
+                + ("monotone under every protocol" if monotone
+                   else "**not** monotone under every protocol")
+                + f", and leave-one-out never takes the pooled r below {min_loo:+.3f}, so "
+                  f"it does not rest on a single row either. "
+                + (f"Where it misfits is `{worst_m}` -- {misfit[worst_m]:.2f} pp mean "
+                   f"absolute residual against {statistics.fmean(others):.2f} pp for the "
+                   f"other methods. " if worst_m and others else "")
+                + ((f"The memory clock is also *not* constant across protocols: "
+                    f"{mc['n_varying']} of {mc['n_rows']} rows differ"
+                    + (f", worst `{mc['worst']['method']}@{mc['worst']['ctx']}` at "
+                       f"{mc['worst']['spread_mhz']:.0f} MHz" if mc.get("worst") else "")
+                    + ". ") if mc.get("n_rows") else "")
+                + "Conditional because this is one card, one kernel family, and four "
+                  "contexts per method."
+            ),
+            falsification_attempted=(
+                "The pooled correlation was decomposed into a within-method and a "
+                "between-method part, because a pooled r over three methods pulling 11 / "
+                "88 / 214 GB/s is satisfied just as well by 'these are three different "
+                "kernels'. A method whose bandwidth does not vary across contexts "
+                "(`fp16_sdpa`, 11-12 GB/s) is excluded from the within-method test and "
+                "reported as excluded rather than counted as agreement."
             ),
         )
     ]
@@ -1977,6 +2082,10 @@ def main():
                          "per-sample IQR gate but pinned its median be used for a "
                          "large enough effect. Absent is fine, and is itself audited "
                          "(method.dispersion_tier).")
+    ap.add_argument("--bandwidth-law", default=str(RESULTS_DIR / "bandwidth_law.json"),
+                    help="output of bandwidth_law.py; the within-method test of the "
+                         "protocol finding. Absent is fine, and is itself audited "
+                         "(method.bandwidth_law).")
     ap.add_argument("--check-bootstrap", action="store_true",
                     help="compare the vectorized bootstrap against the stdlib "
                          "reference on real rows, then exit")
@@ -1987,10 +2096,14 @@ def main():
         raise SystemExit(f"no benchmark results at {path} -- run `python benchmark.py` first")
     b = Bench(json.loads(path.read_text()))
 
-    global BETWEEN, PROTOCOLS, TIERS
+    global BETWEEN, PROTOCOLS, TIERS, BWLAW
     BETWEEN = load_between_run(Path(args.between_run))
     PROTOCOLS = load_protocols(Path(args.protocols))
     TIERS = load_tiers(Path(args.dispersion_tier))
+    BWLAW = load_bandwidth_law(Path(args.bandwidth_law))
+    if BWLAW:
+        print(f"bandwidth law: {BWLAW['n_positive']}/{BWLAW['n_looks']} within-method "
+              f"looks positive ({args.bandwidth_law})")
     if TIERS:
         n2 = sum(1 for r in TIERS.values() if r["tier"] == dispersion_tier.TIER_PINNED)
         print(f"dispersion tiers: {len(TIERS)} rows, {n2} promoted "

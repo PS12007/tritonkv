@@ -39,7 +39,7 @@ Everything below is verified on this machine, not assumed.
   `min_effect_frac`. Post-hoc from the raw samples, so it runs on any results
   JSON ever recorded and never touches `benchmark.py`. Run 3: **39 quotable /
   7 pinned / 2 rejected**.
-- `python -m pytest test_between_run.py -q` → **87** CPU-only tests, ~11 s,
+- `python -m pytest test_between_run.py -q` → **94** CPU-only tests, ~11 s,
   covering `between_run.py`, `clock_excursions.py`, `compare_protocols.py` and
   `dispersion_tier.py` (including the 2x2 arithmetic, the design reader, and the
   tier's calibration bar and per-claim admissibility).
@@ -78,7 +78,7 @@ property of the kernel.
 
 Nothing is blocking. `results/audit.{md,json}` are current (regenerated
 2026-09-02 against run 3 with the between-run and protocol data loaded,
-**71 claims: 26 TRUE / 21 CONDITIONAL / 12 MISLEADING / 12 FALSE**), and the
+**72 claims: 26 TRUE / 22 CONDITIONAL / 12 MISLEADING / 12 FALSE**), and the
 audit takes ~20 s, so
 re-run it after any benchmark run without thinking about it:
 
@@ -135,8 +135,8 @@ re-run it after any benchmark run without thinking about it:
    lines now separate `*` (not usable) from `~` (gate-failed, median pinned,
    effect at least 5x that pin), where both used to be `*`. **No verdict moved**;
    70 claims became 71 with `method.dispersion_tier`, the companion to
-   `method.dispersion_gate`. **26 TRUE / 21 CONDITIONAL / 12 MISLEADING /
-   12 FALSE.**
+   `method.dispersion_gate`, and 72 with `method.bandwidth_law`.
+   **26 TRUE / 22 CONDITIONAL / 12 MISLEADING / 12 FALSE.**
 
    README and `key_numbers.md` are updated: both timing tables mark those rows
    `~`, the qualifier is replaced by the six-run table, and `key_numbers.md`
