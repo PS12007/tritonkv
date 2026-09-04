@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import statistics
 from collections import defaultdict
 from pathlib import Path
@@ -46,6 +47,130 @@ EXCURSION_FRAC = 0.03
 # number much; the L2-resident regime is reported too, and the gap between them
 # is itself part of the answer.
 REGIMES = ("cold", "graph")
+
+
+
+# ---------------------------------------------------------------------------
+# Does a row's duration predict whether it excurses?
+# ---------------------------------------------------------------------------
+#
+# The fastest kernels in this benchmark excurse most and the slowest never do,
+# which suggests a mechanism: a 5 us kernel leaves the memory system idle for a
+# larger fraction of its measurement loop than a 1.9 ms one, so the subsystem
+# sees gaps and drops a P-state. Pooled over every observation the correlation is
+# strong.
+#
+# It is also exactly the shape that fooled nobody only because this project
+# already learned to check: duration is almost perfectly confounded with *which
+# kernel it is*, since the fused Triton rows are the short ones and the SDPA rows
+# are the long ones. The same within-group decomposition that rescued the
+# bandwidth law is applied here, and here it returns a null.
+
+
+def _log_median(vals):
+    return math.log(statistics.median(vals))
+
+
+def duration_effect(rows: list[dict], n_buckets: int = 6) -> dict:
+    """Excursion rate against row duration, pooled and then within each method.
+
+    `rows` are per-observation dicts carrying `method`, `duration_ms` and `is_excursion`.
+    """
+    usable = [r for r in rows if r.get("duration_ms")]
+    if len(usable) < n_buckets * 4:
+        return {"n": len(usable), "pooled_r": None}
+
+    ordered = sorted(usable, key=lambda r: r["duration_ms"])
+    per = len(ordered) // n_buckets
+    buckets = []
+    for b in range(n_buckets):
+        lo = b * per
+        hi = (b + 1) * per if b < n_buckets - 1 else len(ordered)
+        sl = ordered[lo:hi]
+        buckets.append({
+            "min_ms": sl[0]["duration_ms"], "max_ms": sl[-1]["duration_ms"],
+            "n": len(sl),
+            "rate": sum(1 for r in sl if r["is_excursion"]) / len(sl),
+        })
+    pooled = _pearson([_log_median([r["duration_ms"] for r in ordered[b * per:(b + 1) * per
+                                   if b < n_buckets - 1 else len(ordered)]])
+                       for b in range(n_buckets)],
+                      [x["rate"] for x in buckets])
+
+    within = []
+    for method in sorted({r["method"] for r in usable}):
+        sel = [r for r in usable if r["method"] == method]
+        cells: dict = {}
+        for r in sel:
+            cells.setdefault((r["ctx"], r["regime"]), []).append(r)
+        if len(cells) < 3:
+            continue
+        xs = [_log_median([o["duration_ms"] for o in v]) for v in cells.values()]
+        ys = [sum(1 for o in v if o["is_excursion"]) / len(v) for v in cells.values()]
+        r = _pearson(xs, ys)
+        within.append({"method": method, "cells": len(cells), "r": r,
+                       "min_ms": min(o["duration_ms"] for o in sel),
+                       "max_ms": max(o["duration_ms"] for o in sel)})
+    scored = [w for w in within if w["r"] is not None]
+    n_neg = sum(1 for w in scored if w["r"] < 0)
+    return {
+        "n": len(usable),
+        "buckets": buckets,
+        "pooled_r": pooled,
+        "within": within,
+        "n_methods_scored": len(scored),
+        "n_methods_negative": n_neg,
+        # One-sided sign test against "the sign is a coin flip". Only a clean
+        # sweep counts, for the same reason as in bandwidth_law.py.
+        "sign_test_p": (0.5 ** len(scored) if scored and n_neg == len(scored) else None),
+        "survives_within_method": bool(scored and n_neg == len(scored)),
+    }
+
+
+def _pearson(xs, ys):
+    n = len(xs)
+    if n < 3:
+        return None
+    mx, my = sum(xs) / n, sum(ys) / n
+    sx = math.sqrt(sum((x - mx) ** 2 for x in xs))
+    sy = math.sqrt(sum((y - my) ** 2 for y in ys))
+    if sx == 0 or sy == 0:
+        return None
+    return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / (sx * sy)
+
+
+def render_duration(d: dict) -> list[str]:
+    if not d or d.get("pooled_r") is None:
+        return []
+    L = ["", "## Does a row's duration predict whether it excurses?", "",
+         "The fastest kernels here excurse most and the slowest never do. Pooled "
+         "over every observation that is a strong relationship; the question is "
+         "whether it is about duration or about which kernel it is.", "",
+         "| duration bucket (us) | observations | excursion rate |", "|---|---|---|"]
+    for b in d["buckets"]:
+        L.append(f"| {b['min_ms'] * 1000:.1f} - {b['max_ms'] * 1000:.1f} | "
+                 f"{b['n']} | {b['rate'] * 100:.1f}% |")
+    L += ["", f"**Pooled r = {d['pooled_r']:+.3f}** over {len(d['buckets'])} buckets.", ""]
+    L += ["Holding the method fixed and varying only context and regime:", "",
+          "| method | cells | duration range (us) | r |", "|---|---|---|---|"]
+    for w in d["within"]:
+        r = "n/a" if w["r"] is None else f"{w['r']:+.3f}"
+        L.append(f"| `{w['method']}` | {w['cells']} | "
+                 f"{w['min_ms'] * 1000:.1f}-{w['max_ms'] * 1000:.0f} | {r} |")
+    L.append("")
+    if d["survives_within_method"]:
+        L.append(f"**{d['n_methods_negative']} of {d['n_methods_scored']}** methods "
+                 f"agree in sign (p = {d['sign_test_p']:.3f}), so the relationship is "
+                 f"about duration and not about kernel identity.")
+    else:
+        L.append(f"**{d['n_methods_negative']} of {d['n_methods_scored']}** methods "
+                 f"come out negative, which is not a sweep. The pooled correlation "
+                 f"does **not** survive holding the method fixed: duration is "
+                 f"confounded with which kernel a row is -- the fused Triton rows "
+                 f"are the short ones and the SDPA rows the long ones -- and this "
+                 f"data cannot separate them. Recorded as a **null**, by the same "
+                 f"test that the bandwidth law passed.")
+    return L + [""]
 
 
 def load_groups(specs: list[str]) -> dict[str, list[tuple[str, Bench]]]:
@@ -127,6 +252,32 @@ def find_excursions(groups, frac: float = EXCURSION_FRAC):
                     "drop_frac": drop, "row_quotable": quotable,
                 })
     return out, per_cell
+
+
+def all_observations(groups, per_cell, frac: float = EXCURSION_FRAC) -> list[dict]:
+    """Every observation, flagged, with the row's duration attached.
+
+    `find_excursions` returns only the flagged ones, which is what its own table
+    needs. The duration question needs the denominator too -- the rows that did
+    *not* excurse are most of the evidence.
+    """
+    out = []
+    for (method, ctx, regime), cell in per_cell.items():
+        baseline = cell["baseline_mhz"]
+        for gname, entries in groups.items():
+            for run, b in entries:
+                mhz = b.mem_clock(method, ctx, regime)
+                if not mhz:
+                    continue
+                row = b.get(method, ctx) or {}
+                stats = row.get(regime) or {}
+                out.append({
+                    "group": gname, "run": run, "method": method, "ctx": ctx,
+                    "regime": regime, "mem_mhz": mhz,
+                    "duration_ms": stats.get("median_ms"),
+                    "is_excursion": (1.0 - mhz / baseline) >= frac,
+                })
+    return out
 
 
 def render(exc, per_cell, groups, frac) -> str:
@@ -216,7 +367,10 @@ def main():
 
     groups = load_groups(args.label)
     exc, per_cell = find_excursions(groups, args.frac)
+    obs = all_observations(groups, per_cell, args.frac)
+    dur = duration_effect(obs)
     md = render(exc, per_cell, groups, args.frac)
+    md += "\n" + "\n".join(render_duration(dur))
     Path(args.out_md).write_text(md, encoding="utf-8")
     Path(args.out_json).write_text(json.dumps({
         "frac": args.frac,
@@ -224,6 +378,7 @@ def main():
         "n_cells": len(per_cell),
         "cells": {f"{m}|{c}|{r}": v for (m, c, r), v in per_cell.items()},
         "excursions": exc,
+        "duration_effect": dur,
     }, indent=1), encoding="utf-8")
 
     for gname, entries in groups.items():

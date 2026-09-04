@@ -2104,3 +2104,48 @@ ranges. Recomputing with the repo's own statistic reproduced them exactly, and
 the finding above survived.
 
 `test_between_run.py`: 131 → **134**.
+
+## Duration looked like the mechanism, and did not survive its own test
+
+With the question re-posed as "why do some protocols produce more P-state
+excursions", the observation-level data offers a tempting answer. Excursion rate
+against row duration, pooled over 864 observations from the three 12-method
+protocols:
+
+| duration bucket (µs) | observations | excursion rate |
+|---|---|---|
+| 3.3 – 5.2 | 144 | 3.5% |
+| 6.6 – 11.8 | 144 | 8.3% |
+| 13.5 – 24.9 | 144 | 11.1% |
+| 29.0 – 47.1 | 144 | 6.9% |
+| 48.9 – 179.8 | 144 | 1.4% |
+| 743.3 – 1884.2 | 144 | **0.0%** |
+
+**Pooled r = −0.686**, and the slowest bucket has zero excursions in 144
+observations. The mechanism practically narrates itself: a 5 µs kernel leaves the
+memory system idle for a much larger fraction of its measurement loop than a
+1.9 ms one, so the subsystem sees gaps and drops a P-state.
+
+It is also exactly the shape that nearly took the bandwidth law down — duration
+is almost perfectly confounded with *which kernel a row is*, because the fused
+Triton rows are the short ones and the SDPA rows the long ones. Applying the same
+within-group decomposition, holding the method fixed and varying only context and
+regime:
+
+**7 of 11 methods come out negative.** That is not a sweep, and the effect is
+**recorded as a null.** The pooled correlation does not survive holding the
+method fixed, and this data cannot separate duration from kernel identity.
+
+One sub-pattern, noted and not claimed: all five SDPA-family methods are negative
+(−0.41 to −0.54) while the fused Triton methods are mixed (−0.55 to +0.59). That
+would fit a threshold — above roughly 50 µs longer means fewer excursions, below
+it nothing — but four methods on eight cells each is not evidence for a threshold,
+it is a shape someone could talk themselves into.
+
+The point worth keeping is that the test is not rigged. It rescued the bandwidth
+law from exactly this objection and it kills this one, on the same data, with the
+same code path. A decomposition that only ever confirms is not a decomposition.
+
+`clock_excursions.py` now carries `duration_effect` and prints the verdict either
+way. `test_between_run.py`: 134 → **139**, including a planted real effect that
+must survive and a planted pure between-method effect that must not.

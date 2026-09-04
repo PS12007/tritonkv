@@ -1965,3 +1965,72 @@ def test_the_usable_section_appears_only_when_a_run_was_lost():
     md = compare_protocols.render(recs, telem, clean, fac=[], fac_note=note,
                                   design=cells, levels=levels)
     assert "over usable runs only" not in md
+
+
+# ---------------------------------------------------------------------------
+# Duration vs excursion: the same within-group test, returning a null
+# ---------------------------------------------------------------------------
+
+
+def _dur_rows(spec):
+    """(method, ctx, regime, duration_ms, is_excursion) tuples."""
+    return [{"method": m, "ctx": c, "regime": g, "duration_ms": d,
+             "is_excursion": e} for m, c, g, d, e in spec]
+
+
+def _dur_dataset(rate_for, methods=("A", "B"), reps=6):
+    """Each (method, ctx) cell gets `reps` observations; `rate_for(method, dur)`
+    decides how many of them excurse."""
+    spec = []
+    for m in methods:
+        base = 0.005 if m == "A" else 0.5
+        for i, ctx in enumerate((512, 2048, 8192, 16384)):
+            dur = base * (2 ** i)
+            k = int(round(rate_for(m, i) * reps))
+            for j in range(reps):
+                spec.append((m, ctx, "cold", dur, j < k))
+    return _dur_rows(spec)
+
+
+def test_a_real_duration_effect_survives_the_within_method_test():
+    """Longer rows excurse less, inside every method as well as between them."""
+    rows = _dur_dataset(lambda m, i: [0.8, 0.6, 0.4, 0.2][i])
+    d = clock_excursions.duration_effect(rows, n_buckets=4)
+    assert d["n_methods_negative"] == d["n_methods_scored"]
+    assert d["survives_within_method"]
+    assert d["sign_test_p"] == pytest.approx(0.5 ** d["n_methods_scored"])
+
+
+def test_a_between_method_effect_alone_is_reported_as_a_null():
+    """The case the real data is in: the short-kernel method excurses a lot and
+    the long-kernel one not at all, with no relationship inside either. Pooled
+    this looks like a duration law; within method it is nothing."""
+    rows = _dur_dataset(lambda m, i: 0.5 if m == "A" else 0.0)
+    d = clock_excursions.duration_effect(rows, n_buckets=4)
+    assert d["pooled_r"] is not None and d["pooled_r"] < -0.5
+    assert not d["survives_within_method"]
+    assert d["sign_test_p"] is None
+
+
+def test_rows_without_a_duration_are_excluded():
+    rows = _dur_dataset(lambda m, i: 0.5)
+    for r in rows[:10]:
+        r["duration_ms"] = None
+    d = clock_excursions.duration_effect(rows, n_buckets=4)
+    assert d["n"] == len(rows) - 10
+
+
+def test_the_duration_report_says_which_way_it_came_out():
+    real = clock_excursions.render_duration(
+        clock_excursions.duration_effect(
+            _dur_dataset(lambda m, i: [0.8, 0.6, 0.4, 0.2][i]), n_buckets=4))
+    assert "about duration and not about kernel identity" in "\n".join(real)
+    null = clock_excursions.render_duration(
+        clock_excursions.duration_effect(
+            _dur_dataset(lambda m, i: 0.5 if m == "A" else 0.0), n_buckets=4))
+    assert "Recorded as a **null**" in "\n".join(null)
+
+
+def test_the_duration_report_is_empty_without_enough_data():
+    assert clock_excursions.render_duration({}) == []
+    assert clock_excursions.duration_effect(_dur_rows([]))["pooled_r"] is None
