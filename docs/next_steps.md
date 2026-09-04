@@ -29,7 +29,8 @@ Everything below is verified on this machine, not assumed.
 - `python clock_excursions.py --label full=... --label subset=...` → seconds,
   writes `results/clock_excursions.{md,json}`: the per-run-group rate of memory
   P-state excursions and whether the gate rejected each one.
-- `python bandwidth_law.py` → seconds, writes `results/bandwidth_law.{md,json}`:
+- `python bandwidth_law.py` → seconds, writes `results/bandwidth_law.{md,json}`
+  (figure: `docs/plots/bandwidth_law.png`, from `make_session_plots.py`):
   the within-method decomposition of the bandwidth law, leave-one-out, per-row
   residuals, and the per-row memory-clock constancy check. Reads
   `results/compare_protocols.json`; re-measures nothing.
@@ -39,7 +40,7 @@ Everything below is verified on this machine, not assumed.
   `min_effect_frac`. Post-hoc from the raw samples, so it runs on any results
   JSON ever recorded and never touches `benchmark.py`. Run 3: **39 quotable /
   7 pinned / 2 rejected**.
-- `python -m pytest test_between_run.py -q` → **105** CPU-only tests, ~11 s,
+- `python -m pytest test_between_run.py -q` → **106** CPU-only tests, ~11 s,
   covering `between_run.py`, `clock_excursions.py`, `compare_protocols.py` and
   `dispersion_tier.py` (including the 2x2 arithmetic, the design reader, and the
   tier's calibration bar and per-claim admissibility).

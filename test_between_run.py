@@ -1594,3 +1594,12 @@ def test_the_report_says_when_the_misfit_does_not_survive_the_refit():
     md = bandwidth_law.render(rep)
     assert "Is the straight line the problem?" in md
     assert "not robust to the choice of fit" in md or "in all 3 protocols" in md
+
+
+def test_the_bandwidth_figure_declines_without_its_input():
+    """`make_session_plots.py` draws whatever exists; a payload with no
+    bandwidth block must be skipped and said to be skipped, not crash the deck."""
+    import make_session_plots as msp
+
+    assert msp.plot_bandwidth_law({}) is False
+    assert msp.plot_bandwidth_law({"bandwidth_sensitivity": {}}) is False

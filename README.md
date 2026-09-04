@@ -745,6 +745,12 @@ single kernel. `bandwidth_law.py` runs it:
 | `preloaded` | +0.998 | +0.761 |
 | `fullpre` | +0.939 | +0.426 |
 
+![Checking whether my own correlation means anything](docs/plots/bandwidth_law.png)
+
+If the pooled correlation were a method effect, the per-method lines in the left
+panel would be flat and differ only in height. They are not flat. The control's
+points scattering around its own line is the misfit described below.
+
 **6 of 6 positive** (sign test p = 0.016). Each is only n=4 and settles nothing
 alone; that they agree is the evidence. `fp16_sdpa` is excluded and reported as
 excluded — it sits at 11–12 GB/s at every context, so it has no range to
@@ -920,7 +926,7 @@ python -m venv .venv
 .venv/Scripts/python.exe -m pip install -r requirements.txt
 
 .venv/Scripts/python.exe -m pytest test_correctness.py -q   # 106 tests, ~89 s (GPU)
-.venv/Scripts/python.exe -m pytest test_between_run.py -q    # 105 tests, ~11 s (no GPU)
+.venv/Scripts/python.exe -m pytest test_between_run.py -q    # 106 tests, ~11 s (no GPU)
 .venv/Scripts/python.exe benchmark.py --quick                # ~75 s smoke run
 .venv/Scripts/python.exe benchmark.py --samples 50           # full suite, ~13 min
 .venv/Scripts/python.exe dispersion_tier.py                  # three-tier verdict per row
@@ -988,7 +994,7 @@ committed.
 | `kernels/fused_decode_attn.py` | the fused kernel. |
 | `kernels/fp16_decode_attn.py` | the control: identical shape, unquantized. Isolates the flash-decoding effect. |
 | `test_correctness.py` | 106 tests on the kernel, explicit asserted thresholds. |
-| `test_between_run.py` | 105 CPU-only tests on the between-run, excursion, protocol, dispersion-tier and bandwidth-law machinery — including the 2x2 arithmetic, the design reader and the tier's calibration bar — against synthetic runs with known answers. |
+| `test_between_run.py` | 106 CPU-only tests on the between-run, excursion, protocol, dispersion-tier and bandwidth-law machinery — including the 2x2 arithmetic, the design reader and the tier's calibration bar — against synthetic runs with known answers. |
 | `benchmark.py` | timing + memory. Rotating working set for the cold regime, CUDA-graph replay for the hot one. |
 | `audit_claims.py` | adversarial self-audit: bootstrap CIs over raw timings, attribution against the fp16 control, per-optimization claims with their own controls, and a clock-verification gate. |
 | `between_run.py` | what a bootstrap CI does not cover: compares N independent full runs, reports the run-to-run interval, the inflation over the single-run CI, and whether any verdict moved. |

@@ -769,6 +769,93 @@ def plot_dispersion_tier(rows: list[dict]):
 
 
 # ---------------------------------------------------------------------------
+# The bandwidth law (results/bandwidth_law.json + compare_protocols.json)
+# ---------------------------------------------------------------------------
+
+METHOD_COLOUR = {"fp16_sdpa": "MUTED", "fused_triton_4b": "S1",
+                 "triton_fp16_control": "S2"}
+
+
+def plot_bandwidth_law(cmp_payload: dict):
+    """Does bandwidth predict inside a kernel, or only between kernels?
+
+    The left panel is the whole argument. One line per method: if the pooled
+    correlation were a method effect wearing bandwidth's label, the per-method
+    lines would be flat and only their heights would differ. They are not flat.
+    The control's points also visibly scatter around its own line, which is the
+    misfit that stayed open.
+
+    The right panel is the rival-predictor comparison -- bandwidth was the
+    hypothesis and this is what says nothing obvious beats it.
+    """
+    import bandwidth_law as bl
+
+    bw = cmp_payload.get("bandwidth_sensitivity") or {}
+    if not bw:
+        return False
+    proto = "preloaded" if "preloaded" in bw else sorted(bw)[0]
+    rows = bw[proto]["rows"]
+    palette = {"fp16_sdpa": MUTED, "fused_triton_4b": S1,
+               "triton_fp16_control": S2}
+
+    fig, axes = plt.subplots(1, 2, figsize=(13.4, 4.8),
+                             gridspec_kw={"width_ratios": [1.25, 1], "wspace": 0.34})
+
+    ax = axes[0]
+    dec = bl.decompose(rows)
+    within = {w["method"]: w for w in dec["within"]}
+    for method in sorted({r["method"] for r in rows}):
+        sel = sorted((r for r in rows if r["method"] == method),
+                     key=lambda r: r["gb_s"])
+        x = np.array([r["gb_s"] for r in sel])
+        y = np.abs([r["shift"] for r in sel]) * 100
+        colour = palette.get(method, INK2)
+        ax.scatter(x, y, s=44, color=colour, edgecolor="none", zorder=3)
+        w = within.get(method, {})
+        if w.get("testable") and x.size >= 2:
+            slope, intercept = np.polyfit(x, y, 1)
+            xs = np.linspace(x.min(), x.max(), 10)
+            ax.plot(xs, slope * xs + intercept, color=colour, lw=1.6, alpha=0.85,
+                    zorder=2)
+            label = f"{method}  (within-method r = {w['r']:+.2f})"
+        else:
+            label = f"{method}  (no bandwidth range -- excluded)"
+        ax.scatter([], [], s=44, color=colour, label=label)
+    ax.legend(loc="upper left", fontsize=8.4)
+    style(ax, "Bandwidth predicts inside a kernel, not just between them",
+          subtitle=f"protocol `{proto}`; a method effect would give flat lines at "
+                   f"different heights",
+          xlabel="achieved DRAM bandwidth (GB/s)",
+          ylabel="|shift| vs the shipped protocol (%)")
+
+    ax = axes[1]
+    rivals = bl.rival_predictors(rows)
+    names = [d["predictor"] for d in rivals][::-1]
+    vals = [d["residual_sd_pp"] for d in rivals][::-1]
+    colours = [S1 if n == "achieved GB/s" else MUTED for n in names]
+    y = np.arange(len(names))
+    ax.barh(y, vals, 0.62, color=colours)
+    for yi, v in zip(y, vals):
+        ax.text(v + max(vals) * 0.015, yi, f"{v:.2f}", va="center", fontsize=8.8,
+                color=INK)
+    ax.set_yticks(y)
+    ax.set_yticklabels(names, fontsize=8.6)
+    ax.set_xlim(0, max(vals) * 1.18)
+    style(ax, "...and nothing obvious predicts it better",
+          subtitle="residual spread around a straight-line fit, lower is better",
+          xlabel="residual sd (percentage points)")
+
+    figure_header(
+        fig,
+        "Checking whether my own correlation means anything",
+        "Twelve points over three methods pulling 11 / 88 / 214 GB/s is the shape in which\n"
+        "a method effect poses as a bandwidth one. Holding the method fixed is the test.",
+    )
+    save(fig, "bandwidth_law")
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Memory-clock gate (results/benchmark.json)
 # ---------------------------------------------------------------------------
 # The 2x2 (results/compare_protocols.json, written by compare_protocols.py)
@@ -1018,6 +1105,9 @@ def main():
         print("  (skipped dispersion_gate: no results/dispersion.json --"
               " run analyze_dispersion.py)")
     cmp_ = _sweep(ROOT / "results" / "compare_protocols.json")
+    if cmp_ and not plot_bandwidth_law(cmp_):
+        print("  (skipped bandwidth_law: results/compare_protocols.json has no"
+              " bandwidth_sensitivity block)")
     if not (cmp_ and plot_factorial(cmp_)):
         print("  (skipped protocol_factorial: results/compare_protocols.json"
               " has no complete 2x2 -- run benchmark.py --preload 300 with"
