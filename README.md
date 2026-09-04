@@ -1083,6 +1083,7 @@ committed.
 | `compare_protocols.py` | whether two measurement protocols produce the same numbers at all, the bandwidth law that says which rows they will disagree on, and the 2x2 that separates run length from recent saturation. |
 | `bandwidth_law.py` | whether "achieved bandwidth predicts protocol sensitivity" is a law or a method label: the within-method decomposition, leave-one-out, per-row residuals, and whether the memory clock really is constant across protocols. |
 | `clock_ramp.py` | the memory clock's time constant, measured directly: idle the GPU, load it, and watch. Answers in minutes what repeating protocols could not settle in hundreds of runs. |
+| `configs.py` | the model's attention shape, taken from published architecture parameters and verified against the HuggingFace config when `transformers` is installed — the benchmark records whether that verification actually happened. |
 | `thermal_check.py` | whether temperature is even large enough to move a memory P-state: the within-cell slope in MHz per degree, against the degrees the protocols actually span. |
 | `analyze_dispersion.py` | decomposes every rejected measurement into trend, tail and floor, so the gate is argued with rather than tuned. |
 | `dispersion_tier.py` | the third verdict: which gate-failed rows pin their medians well enough to be used anyway, judged against the worst row the gate already accepts. Post-hoc, so it never touches the instrument. |
