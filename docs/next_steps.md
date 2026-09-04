@@ -49,7 +49,7 @@ Everything below is verified on this machine, not assumed.
   `min_effect_frac`. Post-hoc from the raw samples, so it runs on any results
   JSON ever recorded and never touches `benchmark.py`. Run 3: **39 quotable /
   7 pinned / 2 rejected**.
-- `python -m pytest test_between_run.py -q` → **124** CPU-only tests, ~13 s,
+- `python -m pytest test_between_run.py -q` → **126** CPU-only tests, ~13 s,
   covering `between_run.py`, `clock_excursions.py`, `compare_protocols.py` and
   `dispersion_tier.py` (including the 2x2 arithmetic, the design reader, and the
   tier's calibration bar and per-claim admissibility).
@@ -303,8 +303,18 @@ re-run it after any benchmark run without thinking about it:
      against 1.416–1.469 from three full runs** — on a tier-2 row, so usable, and
      consistent with the bandwidth law: `control@16384` at 305 GB/s is the most
      protocol-sensitive row here and reversal moves it from last to first.
-     **One run, so an observation not a shift** — establishing it needs three
-     reversed runs. `quant_cold@8192` is unaffected (+0.3%).
+     **WITHDRAWN after three reversed runs (2026-09-04).**
+     `compare_protocols.py` over `full` (3) vs `reversed` (3): **1 of 16 ratios
+     disjoint**, and it is `speedup_vs_sdpa@16384`, not a quantization ratio.
+     `quant_cold@16384` is full 1.416–1.469 vs reversed 1.433–1.508 — +5.0% on
+     **overlapping** ranges, so not a shift. The three reversed values were
+     1.5125 / 1.4113 / 1.5151.
+
+     What reversing does is make the protocol **worse**: at the headline cell
+     `full` spans 0.6% and `reversed` spans **11%** (1.332–1.480), with a 7.8%
+     P-state excursion rate against 4.9%. Reversed is a diagnostic, never a
+     default. Bandwidth law survives repointing weakly, r = +0.42 against +0.70
+     to +0.85 for the other pairs.
 
      **Both arms of the two-mechanism hypothesis are now dead** — thermal on
      effect size, warm-up on time constant. What survives is the observation

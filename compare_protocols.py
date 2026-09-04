@@ -233,6 +233,18 @@ def design_coords(b) -> tuple[str, float]:
     return (a.get("methods") or "all", float(a.get("preload") or 0.0))
 
 
+def context_order(b) -> tuple:
+    """The order the run measured its contexts in.
+
+    The context loop is the outer one, so this is the run's measurement order and
+    not merely its content. It is deliberately *not* part of `design_coords`: the
+    2x2 is method set x preload and adding a third factor would make it a 2x2x2
+    with no runs in most cells. But two runs that differ only here are not the
+    same protocol, and saying they are is worse than saying nothing.
+    """
+    return tuple(b.p.get("contexts") or ())
+
+
 def design_cells(groups):
     """Locate the labelled groups on the (method set x preload) grid.
 
@@ -252,10 +264,26 @@ def design_cells(groups):
     if mixed:
         return None, None, ("groups whose runs do not share one protocol: "
                             + ", ".join(mixed))
+    orders = {}
+    for g, entries in groups.items():
+        os_ = {context_order(b) for _, b in entries}
+        orders[g] = os_.pop() if len(os_) == 1 else None
+
     cells = {}
     for g, c in coords.items():
         if c in cells:
-            return None, None, (f"`{g}` and `{cells[c]}` are the same protocol "
+            other = cells[c]
+            if orders.get(g) != orders.get(other):
+                # Same method set and preload, different measurement order. The
+                # 2x2 cannot hold this factor, but the groups are not the same
+                # protocol and must not be described as though they were.
+                return None, None, (
+                    f"`{g}` and `{other}` share the protocol coordinates {c} but "
+                    f"measured their contexts in different orders "
+                    f"({list(orders.get(g) or ())} vs {list(orders.get(other) or ())}); "
+                    f"context order is a protocol difference the 2x2 does not model, "
+                    f"so the factorial is skipped rather than computed across it")
+            return None, None, (f"`{g}` and `{other}` are the same protocol "
                                 f"{c}; a 2x2 needs four distinct cells")
         cells[c] = g
     # Ordered by how much each level times, not alphabetically: the whole

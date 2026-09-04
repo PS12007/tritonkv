@@ -1940,3 +1940,53 @@ noisier, and the 16k cell has not been shown to move."**
 Independent support for the noise half: `clock_excursions.py` over the two
 reversed runs gives a memory P-state excursion rate of **7.8%** (15 of 192)
 against **4.9%** (14 of 288) for the three normal runs.
+
+### Settled with three reversed runs: no shift, a worse protocol
+
+Two more reversed runs, then `compare_protocols.py` over `full` (3 runs) against
+`reversed` (3 runs) — the repo's own range-and-disjointness machinery rather than
+an eyeball comparison.
+
+**1 of 16 ratios has a range that misses `full`'s entirely**, and it is
+`speedup_vs_sdpa@16384`. **None of the eight quantization ratios is disjoint.**
+
+| ratio | ctx | `full` | `reversed` | shift | disjoint |
+|---|---|---|---|---|---|
+| `quant_cold` | 8192 | 1.469–1.478 | 1.332–1.480 | −3.3% | no |
+| `quant_cold` | 16384 | 1.416–1.469 | 1.433–1.508 | +5.0% | no |
+
+So the 16k observation is **withdrawn**: +5.0% on overlapping ranges is not a
+shift, and the direction that looked so clean after one run is what a noisy
+protocol produces. The three reversed values there were 1.5125, 1.4113, 1.5151 —
+two high, one squarely inside the normal range.
+
+**What reversing actually does is make the protocol worse.** At the headline cell
+`full` spans 1.469–1.478 (0.6%) and `reversed` spans 1.332–1.480 (**11%**), and
+the memory P-state excursion rate is 7.8% against 4.9%. Reversed is a diagnostic
+protocol, useful for the one question it was built to answer, and it should never
+become the default.
+
+The bandwidth law survives being repointed at this pair, but weakly: **r = +0.42**
+over 48 rows, against +0.70 to +0.85 for the other three protocol pairs. Worth
+recording rather than quoting — a weaker correlation on a noisier protocol is
+what one would expect, and it is one more pair rather than a new result.
+
+### A tool that was making a false statement
+
+`compare_protocols.py` reads each run's protocol out of its own `args` —
+`(methods, preload)` — which is exactly right for the 2x2 and became wrong the
+moment context order was a variable. Two runs differing only in measurement order
+have identical coordinates, so the collision branch reported them as *"the same
+protocol"*.
+
+The 2x2 still cannot hold a third factor: adding one makes it a 2x2x2 with no
+runs in most cells. But it can decline for the right reason. `design_cells` now
+compares the groups' context orders and, when they differ, says so and skips the
+factorial rather than claiming the groups are interchangeable. The 2x2 over the
+original four protocols is byte-for-byte unchanged (`quant_cold@8192` still
+1.4755 / 1.4217 / 1.3968 / 1.3944), and the audit still reads 72 claims,
+26 TRUE / 22 CONDITIONAL / 12 MISLEADING / 12 FALSE.
+
+`test_between_run.py`: 124 → **126**, one test for each branch — groups that
+differ only in order must not be called the same protocol, and groups that really
+are identical still must be.

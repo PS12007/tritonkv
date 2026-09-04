@@ -1833,3 +1833,25 @@ def test_a_clock_that_never_holds_is_reported_as_such():
     v = clock_ramp.verdict({"mem_mhz": clock_ramp.time_to_ceiling(rows)}, 205.0)
     assert not v["settled"]
     assert "does not simply" in v["note"]
+
+
+def test_groups_differing_only_in_context_order_are_not_called_the_same_protocol():
+    """`design_coords` reads method set and preload, which are identical for two
+    runs that differ only in measurement order -- so the collision branch used to
+    report them as the same protocol, which is false. The 2x2 still cannot hold
+    the factor; it just has to say why."""
+    a = _payload()
+    b = _payload()
+    b["contexts"] = list(reversed(a["contexts"] + [4096]))
+    groups = {"forward": [("f", Bench(a))], "reversed": [("r", Bench(b))]}
+    cells, levels, note = compare_protocols.design_cells(groups)
+    assert cells is None and levels is None
+    assert "different orders" in note
+    assert "the 2x2 does not model" in note
+    assert "are the same protocol" not in note
+
+
+def test_genuinely_identical_protocols_still_say_so():
+    groups = {"a": [("a", Bench(_payload()))], "b": [("b", Bench(_payload()))]}
+    _, _, note = compare_protocols.design_cells(groups)
+    assert "are the same protocol" in note
