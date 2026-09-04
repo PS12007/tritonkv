@@ -35,7 +35,7 @@ Everything below is verified on this machine, not assumed.
   `min_effect_frac`. Post-hoc from the raw samples, so it runs on any results
   JSON ever recorded and never touches `benchmark.py`. Run 3: **39 quotable /
   7 pinned / 2 rejected**.
-- `python -m pytest test_between_run.py -q` → **62** CPU-only tests, ~10 s,
+- `python -m pytest test_between_run.py -q` → **74** CPU-only tests, ~10 s,
   covering `between_run.py`, `clock_excursions.py`, `compare_protocols.py` and
   `dispersion_tier.py` (including the 2x2 arithmetic, the design reader, and the
   tier's calibration bar and per-claim admissibility).
@@ -74,7 +74,7 @@ property of the kernel.
 
 Nothing is blocking. `results/audit.{md,json}` are current (regenerated
 2026-09-02 against run 3 with the between-run and protocol data loaded,
-**70 claims: 26 TRUE / 20 CONDITIONAL / 12 MISLEADING / 12 FALSE**), and the
+**71 claims: 26 TRUE / 21 CONDITIONAL / 12 MISLEADING / 12 FALSE**), and the
 audit takes ~20 s, so
 re-run it after any benchmark run without thinking about it:
 
@@ -127,10 +127,17 @@ re-run it after any benchmark run without thinking about it:
    `benchmark.py` is untouched. `python dispersion_tier.py` -> seconds, writes
    `results/dispersion_tier.{md,json}`.
 
-   **Still open, and it is the smaller half:** the tier is computed but nothing
-   consumes it yet. `audit_claims.py` still asks `b.quotable(...)` and stars on
-   tier 1 alone, so the six chains this unlocks are not yet reflected in the
-   audit or in the README tables. That is the next thing to do.
+   **The audit consumes it** (`--dispersion-tier`, absent is fine). Evidence
+   lines now separate `*` (not usable) from `~` (gate-failed, median pinned,
+   effect at least 5x that pin), where both used to be `*`. **No verdict moved**;
+   70 claims became 71 with `method.dispersion_tier`, the companion to
+   `method.dispersion_gate`. **26 TRUE / 21 CONDITIONAL / 12 MISLEADING /
+   12 FALSE.**
+
+   Still open, and it is now the smallest half: the **README tables** still carry
+   the "clears in one run and not the others" qualifier at ctx=512 and ctx=2048,
+   which the six-run table above supersedes. `key_numbers.md` has not been
+   revisited either.
 
    Note that **promotion is a property of the run**, exactly as quotability is:
    no row is promoted in all six full runs, and the most any manages is four.

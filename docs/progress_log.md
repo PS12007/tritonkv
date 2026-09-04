@@ -1365,3 +1365,43 @@ the table above is stated over six runs instead of one.
 already in every results JSON, so the tier applies retroactively to all six full
 runs and the three subset runs, and `benchmark.py` is untouched. No re-run was
 needed and no measurement changed. `test_between_run.py`: 47 -> **62** tests.
+
+
+### The audit consumes the tier
+
+The tier was computed but nothing read it, which is half a feature.
+`audit_claims.py` now loads `results/dispersion_tier.json` (`--dispersion-tier`,
+absent is fine) and the evidence lines distinguish two things they used to
+conflate under a single `*`:
+
+- `*` -- not usable: rejected, or pinned too loosely for *this* effect.
+- `~` -- failed the per-sample IQR gate, but pins its median at least as well as
+  the worst row the gate itself accepts, against an effect at least 5x that pin.
+
+That distinction is the whole point. Before this, `optimization.meta_broadcast.4b`
+starred ctx=512 and ctx=2048 identically to a row pinned to +-2.68%, when they
+are pinned to +-0.11% and +-0.37% against effects of 15% and 16%.
+
+**No verdict moved.** 70 claims became 71 -- the new one is
+`method.dispersion_tier`, the companion to `method.dispersion_gate`, reading
+MISLEADING when the tier file is absent in the same shape as
+`method.between_run_spread` and `method.protocol_choice`. Counts:
+**26 TRUE / 21 CONDITIONAL / 12 MISLEADING / 12 FALSE**. The four changed claims
+(`meta_broadcast` and `zero_point_fold`, both bit widths) changed evidence only.
+
+Two properties worth keeping:
+
+- **It collapses.** With no tier file, `tier_mark` returns exactly the old
+  two-way split and the audit reads as it did before any of this was written.
+  That is a test, not a hope.
+- **The effect floor is armed but does not currently bind.** No promoted row is
+  being asked to support an effect smaller than 5x its own median uncertainty --
+  every one clears comfortably. The guard exists for the claim that has not been
+  written yet, and the fact that it is slack today is a statement about the
+  claims, not about the guard.
+
+One detail that was a bug for about a minute: the marker for a multi-row ratio is
+the *worst* of its rows, and `max()` on the strings gets that backwards. Hence
+`worst_mark`, and a test for it.
+
+`test_between_run.py`: 62 -> **74** tests.

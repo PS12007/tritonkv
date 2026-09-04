@@ -30,6 +30,8 @@ import statistics
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
+import dispersion_tier
+
 RESULTS_DIR = Path(__file__).parent / "results"
 
 # A speedup must beat this to be called a speedup at all. 1.05 = 5%.
@@ -226,6 +228,13 @@ class Bench:
 
     def quotable(self, method: str, ctx: int) -> bool:
         return bool((self.get(method, ctx) or {}).get("quotable"))
+
+    def usable(self, method: str, ctx: int, effect_frac: float) -> bool:
+        """Quotable outright, or promoted and supporting a large enough effect."""
+        if self.quotable(method, ctx):
+            return True
+        rec = TIERS.get((method, ctx))
+        return bool(rec and dispersion_tier.usable_for(rec, effect_frac))
 
     def mem_clock(self, method: str, ctx: int, regime: str = "cold") -> float | None:
         """Mean memory clock during one row's measurement window, if recorded."""
@@ -702,8 +711,17 @@ def downgrade(verdict: str, caveat: str) -> str:
 # output is present, every per-context claim it covers carries the run-to-run
 # interval next to its own, and a claim whose *verdict* changed between runs is
 # not allowed to be stated flatly.
+TIER2_MARK = "~"  # gate-failed, median pinned, effect large enough to carry it
+                  # (ASCII on purpose: this file is read in a cp1252 console)
+
 BETWEEN: dict[tuple[str, int, int], dict] = {}
 PROTOCOLS: dict = {}
+# `dispersion_tier.py`'s verdict per row. The gate rejects on per-sample IQR;
+# these tables quote medians, and on the short L2-resident rows those come apart
+# badly. A tier-2 row failed the IQR gate but pins its median at least as well as
+# the worst row the gate already accepts, so it is usable *for a large enough
+# effect* -- which is why nothing here consults the tier without an effect size.
+TIERS: dict[tuple[str, int], dict] = {}
 
 
 def load_between_run(path: Path) -> dict[tuple[str, int, int], dict]:
@@ -712,6 +730,63 @@ def load_between_run(path: Path) -> dict[tuple[str, int, int], dict]:
         return {}
     payload = json.loads(path.read_text(encoding="utf-8"))
     return {(r["name"], r["ctx"], r["nbits"]): r for r in payload.get("ratios", [])}
+
+
+def load_tiers(path: Path) -> dict[tuple[str, int], dict]:
+    """Index dispersion_tier.py's output by (method, ctx). Absent is fine."""
+    if not path.exists():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return {(r["method"], r["ctx"]): r for r in payload.get("rows", [])}
+
+
+def tier_mark(b: Bench, method: str, ctx: int, effect_frac: float) -> str:
+    """The marker this row earns in a piece of evidence, given the effect it is
+    being asked to support.
+
+    "" -- passed the gate outright.
+    DAGGER -- failed the IQR gate, but its median is pinned well enough that the
+    effect in question dwarfs its uncertainty.
+    "*" -- not usable: rejected, or pinned too loosely for *this* effect.
+
+    Without the tier file this collapses to the old two-way split, so the audit
+    reads exactly as it did before `dispersion_tier.py` existed.
+    """
+    if b.quotable(method, ctx):
+        return ""
+    rec = TIERS.get((method, ctx))
+    if rec and dispersion_tier.usable_for(rec, effect_frac):
+        return TIER2_MARK
+    return "*"
+
+
+def worst_mark(*marks: str) -> str:
+    """The marker a multi-row ratio earns: the worst of its rows.
+
+    Order matters and is not the string order -- an unusable row ("*") has to
+    dominate a merely-promoted one, so this cannot be a `max()`.
+    """
+    if "*" in marks:
+        return "*"
+    if TIER2_MARK in marks:
+        return TIER2_MARK
+    return ""
+
+
+def tier_legend(marks: set) -> str:
+    """Explain only the markers that actually appear."""
+    out = []
+    if "*" in marks:
+        out.append("Rows marked * did not pass the clock/dispersion gate and are "
+                   "not relied on.")
+    if TIER2_MARK in marks:
+        out.append(
+            f"Rows marked {TIER2_MARK} failed the per-sample IQR gate but pin their "
+            f"medians at least as well as the worst row the gate accepts, against an "
+            f"effect at least {dispersion_tier.EFFECT_MULTIPLE:.0f}x that pin "
+            f"(`dispersion_tier.py`); they are used with that qualifier and are not "
+            f"starred.")
+    return (" " + " ".join(out)) if out else ""
 
 
 def between_run_note(name: str, ctx: int, nbits: int) -> str:
@@ -831,7 +906,14 @@ def audit_optimizations(b: Bench, nbits: int = 4) -> list[Claim]:
             ratios_hot[ctx] = bootstrap_ratio_ci(gh, fh)
 
     if ratios_cold:
-        quotable = [c for c in ratios_cold if b.quotable(gather, c) and b.quotable(fused, c)]
+        # A context is usable if both rows passed the gate, or were promoted by
+        # `dispersion_tier.py` against the effect actually being claimed here.
+        def _eff(c):
+            return abs(ratios_cold[c][0] - 1.0)
+        marks_broadcast = {tier_mark(b, m, c, _eff(c))
+                           for c in ratios_cold for m in (gather, fused)} - {""}
+        quotable = [c for c in ratios_cold
+                    if b.usable(gather, c, _eff(c)) and b.usable(fused, c, _eff(c))]
         lows = [ratios_cold[c][1] for c in quotable]
         wins = bool(lows) and all(
             x > PRACTICAL_THRESHOLD
@@ -859,14 +941,17 @@ def audit_optimizations(b: Bench, nbits: int = 4) -> list[Claim]:
                     + ", ".join(
                         f"{c}:{ratios_cold[c][0]:.2f}x "
                         f"[{ratios_cold[c][1]:.2f},{ratios_cold[c][2]:.2f}]"
-                        + ("" if c in quotable else "*")
+                        + worst_mark(tier_mark(b, gather, c, _eff(c)),
+                                     tier_mark(b, fused, c, _eff(c)))
                         for c in sorted(ratios_cold)
                     )
                     + "; L2-resident: "
                     + ", ".join(
                         f"{c}:{ratios_hot[c][0]:.2f}x" for c in sorted(ratios_hot)
                     )
-                    + ". Rows marked * did not pass the clock/dispersion gate. The two "
+                    + "."
+                    + tier_legend(marks_broadcast)
+                    + " The two "
                     "paths are bitwise-identical (test_metadata_broadcast_is_bitwise_"
                     "identical, 40 cases over S x nbits x group_size), so the gap is "
                     "issue cost and nothing else."
@@ -905,8 +990,12 @@ def audit_optimizations(b: Bench, nbits: int = 4) -> list[Claim]:
         # the bar, but neither the baseline nor the folded row passed the
         # boost-clock/dispersion gate there, so it is exactly the kind of number
         # this project exists to not quote.
+        def _feff(c):
+            return abs(fold_cold[c][0] - 1.0)
+        marks_fold = {tier_mark(b, m, c, _feff(c))
+                      for c in fold_cold for m in (fused, fold)} - {""}
         fold_quotable = [c for c in fold_cold
-                         if b.quotable(fused, c) and b.quotable(fold, c)]
+                         if b.usable(fused, c, _feff(c)) and b.usable(fold, c, _feff(c))]
         helps = [c for c in fold_quotable if fold_cold[c][1] > PRACTICAL_THRESHOLD]
         ungated = [c for c in fold_cold
                    if c not in fold_quotable and fold_cold[c][1] > PRACTICAL_THRESHOLD]
@@ -923,15 +1012,16 @@ def audit_optimizations(b: Bench, nbits: int = 4) -> list[Claim]:
                     "baseline / folded, DRAM-resident: "
                     + ", ".join(
                         f"{c}:{fold_cold[c][0]:.2f}x"
-                        + ("" if c in fold_quotable else "*")
+                        + worst_mark(tier_mark(b, fused, c, _feff(c)),
+                                     tier_mark(b, fold, c, _feff(c)))
                         for c in sorted(fold_cold)
                     )
                     + "; L2-resident: "
                     + ", ".join(f"{c}:{fold_hot[c][0]:.2f}x"
                                 + ("" if c in fold_quotable else "*")
                                 for c in sorted(fold_hot))
-                    + ". A ratio below 1.0 means the fold is slower. Rows marked * did "
-                      "not pass the clock/dispersion gate and are not relied on. "
+                    + ". A ratio below 1.0 means the fold is slower."
+                    + tier_legend(marks_fold) + " "
                     + (
                         f"It clears the {PRACTICAL_THRESHOLD:.2f}x bar on a gated row "
                         "only at ctx=" + ",".join(str(c) for c in helps) + "."
@@ -1452,7 +1542,8 @@ def audit_dispersion(b: Bench) -> list[Claim]:
                 verdict="MISLEADING",
                 evidence=f"not evaluated: {type(exc).__name__}: {exc}",
                 falsification_attempted="n/a",
-            )
+            ),
+            *_tier_claim(),
         ]
 
     rows = []
@@ -1470,7 +1561,10 @@ def audit_dispersion(b: Bench) -> list[Claim]:
             rows.append(d)
     fails = [d for d in rows if d["cause"] != "passes"]
     if not fails:
-        return []
+        # A run where nothing failed says nothing about the gate, but the tier's
+        # own claim is still worth carrying -- not least because "no failures"
+        # is the case where a reader is least likely to check.
+        return _tier_claim()
 
     causes: dict[str, int] = {}
     for d in fails:
@@ -1507,7 +1601,9 @@ def audit_dispersion(b: Bench) -> list[Claim]:
                 "second bears on any conclusion drawn here. The gate is kept as-is and "
                 "unchanged -- loosening a gate because it is inconvenient is how the "
                 "numbers this project exists to avoid get published -- but a starred row "
-                "means 'the card was restless', not 'the number is unknown'."
+                "means 'the card was restless', not 'the number is unknown'. That "
+                "distinction is now acted on rather than only written down: see "
+                "`method.dispersion_tier`."
             ),
             falsification_attempted=(
                 f"Decomposed every failing series into trend, serial correlation and tail "
@@ -1519,6 +1615,83 @@ def audit_dispersion(b: Bench) -> list[Claim]:
                 f"window length changes it. Causes found: "
                 + "; ".join(f"{c} x{n}" for c, n in sorted(causes.items()))
                 + "."
+            ),
+        ),
+        *_tier_claim(),
+    ]
+
+
+def _tier_claim() -> list[Claim]:
+    """Is the second tier present, and is it doing the job it was added for?
+
+    The companion to `method.dispersion_gate`, which establishes that the gate
+    rejects rows for a property nobody quotes. This one asks whether anything was
+    done about it, and reads MISLEADING when the answer is no -- the same shape as
+    `method.between_run_spread` and `method.protocol_choice`.
+    """
+    if not TIERS:
+        return [
+            Claim(
+                id="method.dispersion_tier",
+                claim=(
+                    "A row this benchmark does not star is a row whose number cannot "
+                    "be used."
+                ),
+                verdict="MISLEADING",
+                evidence=(
+                    "`method.dispersion_gate` shows that most gate-rejected rows pin their "
+                    "medians an order of magnitude finer than the effects they would be "
+                    "used to establish, so 'not starred' and 'not usable' are different "
+                    "things -- but nothing here separates them, because "
+                    "`results/dispersion_tier.json` is absent. Run `dispersion_tier.py`."
+                ),
+                falsification_attempted=(
+                    "Checked for the tier file rather than assuming the binary gate is the "
+                    "whole verdict."
+                ),
+            )
+        ]
+
+    recs = list(TIERS.values())
+    n2 = [r for r in recs if r["tier"] == dispersion_tier.TIER_PINNED]
+    n3 = [r for r in recs if r["tier"] == dispersion_tier.TIER_REJECTED]
+    worst_kept = (max((r["worst_median_ci_halfwidth_frac"] for r in n2), default=None))
+    best_dropped = min((r["worst_median_ci_halfwidth_frac"] for r in n3
+                        if r["worst_median_ci_halfwidth_frac"] is not None), default=None)
+    return [
+        Claim(
+            id="method.dispersion_tier",
+            claim=(
+                "A row this benchmark does not star is a row whose number cannot be used."
+            ),
+            verdict="TRUE BUT CONDITIONAL",
+            evidence=(
+                f"Not quite: there are three verdicts, not two. Of "
+                f"{len(recs)} rows, "
+                f"{sum(1 for r in recs if r['tier'] == dispersion_tier.TIER_QUOTABLE)} "
+                f"pass the gate, {len(n2)} failed the per-sample IQR gate but pin every "
+                f"regime's median at least as well as the worst row the gate itself "
+                f"accepts, and {len(n3)} are genuinely not usable"
+                + (f" (best of them pinned only to +-{best_dropped * 100:.2f}%)"
+                   if best_dropped is not None else "")
+                + ". The bar is not a chosen number -- it is read off the gate's own "
+                  "accepted behaviour per run, so this tier cannot admit a measurement "
+                  "less certain than one already printed with a star"
+                + (f"; the loosest row it admits is pinned to "
+                   f"+-{worst_kept * 100:.2f}%" if worst_kept is not None else "")
+                + ". Promotion is per claim, not blanket: a promoted row carries a floor of "
+                  f"{dispersion_tier.EFFECT_MULTIPLE:.0f}x its own median uncertainty and "
+                  "is marked `~` rather than starred in the evidence above. A "
+                  "clock-rejected row is never promoted, because the gate is not a P-state "
+                  "filter and this tier cannot see what that failure was."
+            ),
+            falsification_attempted=(
+                "The alternative -- widening MAX_IQR_FRAC -- was checked against the same "
+                "data and rejected: it would admit the rows that are genuinely unpinned "
+                "along with the rows that are not, which is the distinction the tier "
+                "exists to draw. Coverage is reported over six full runs rather than the "
+                "one that motivated it, because promotion, like quotability, is a "
+                "property of the run: no row is promoted in all six."
             ),
         )
     ]
@@ -1799,6 +1972,11 @@ def main():
                     help="output of compare_protocols.py; used to report how far "
                          "changing the measurement protocol moves a ratio. Absent "
                          "is fine, and is itself audited (method.protocol_choice).")
+    ap.add_argument("--dispersion-tier", default=str(RESULTS_DIR / "dispersion_tier.json"),
+                    help="output of dispersion_tier.py; lets a row that failed the "
+                         "per-sample IQR gate but pinned its median be used for a "
+                         "large enough effect. Absent is fine, and is itself audited "
+                         "(method.dispersion_tier).")
     ap.add_argument("--check-bootstrap", action="store_true",
                     help="compare the vectorized bootstrap against the stdlib "
                          "reference on real rows, then exit")
@@ -1809,9 +1987,14 @@ def main():
         raise SystemExit(f"no benchmark results at {path} -- run `python benchmark.py` first")
     b = Bench(json.loads(path.read_text()))
 
-    global BETWEEN, PROTOCOLS
+    global BETWEEN, PROTOCOLS, TIERS
     BETWEEN = load_between_run(Path(args.between_run))
     PROTOCOLS = load_protocols(Path(args.protocols))
+    TIERS = load_tiers(Path(args.dispersion_tier))
+    if TIERS:
+        n2 = sum(1 for r in TIERS.values() if r["tier"] == dispersion_tier.TIER_PINNED)
+        print(f"dispersion tiers: {len(TIERS)} rows, {n2} promoted "
+              f"({args.dispersion_tier})")
     if PROTOCOLS:
         print(f"protocol comparison: {len(PROTOCOLS.get('groups') or {})} "
               f"protocols ({args.protocols})")

@@ -994,3 +994,130 @@ def test_tier_end_to_end_writes_both_reports(tmp_path, monkeypatch):
     assert report["counts"]["pinned"] == 1
     assert report["counts"]["rejected"] == 1
     assert "Dispersion tiers" in md.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# The tier, as the audit consumes it
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def clean_tiers():
+    """`audit_claims.TIERS` is module state; leave it as it was found."""
+    saved = audit_claims.TIERS
+    yield
+    audit_claims.TIERS = saved
+
+
+def _tiered(method: str, tier: int, floor: float | None = None) -> dict:
+    return {"method": method, "ctx": CTX, "tier": tier,
+            "tier_name": dispersion_tier.TIER_NAMES[tier],
+            "min_effect_frac": floor,
+            "worst_median_ci_halfwidth_frac": (floor / dispersion_tier.EFFECT_MULTIPLE
+                                               if floor else 0.001)}
+
+
+def _bench_with(quotable: bool) -> Bench:
+    return Bench(_payload(quotable=quotable))
+
+
+def test_a_quotable_row_is_unmarked(clean_tiers):
+    audit_claims.TIERS = {}
+    b = _bench_with(True)
+    assert audit_claims.tier_mark(b, "fused_triton_4b", CTX, 0.3) == ""
+
+
+def test_a_promoted_row_earns_the_tier_mark_for_a_large_effect(clean_tiers):
+    b = _bench_with(False)
+    audit_claims.TIERS = {
+        ("fused_triton_4b", CTX): _tiered("fused_triton_4b",
+                                          dispersion_tier.TIER_PINNED, 0.05)}
+    assert audit_claims.tier_mark(b, "fused_triton_4b", CTX, 0.30) == audit_claims.TIER2_MARK
+
+
+def test_a_promoted_row_is_starred_when_the_effect_is_too_small(clean_tiers):
+    """The per-claim half of the tier: the same row is admissible for a 30%
+    effect and not for a 2% one. A binary gate cannot express that."""
+    b = _bench_with(False)
+    audit_claims.TIERS = {
+        ("fused_triton_4b", CTX): _tiered("fused_triton_4b",
+                                          dispersion_tier.TIER_PINNED, 0.05)}
+    assert audit_claims.tier_mark(b, "fused_triton_4b", CTX, 0.02) == "*"
+
+
+def test_a_rejected_row_is_starred_however_large_the_effect(clean_tiers):
+    b = _bench_with(False)
+    audit_claims.TIERS = {
+        ("fused_triton_4b", CTX): _tiered("fused_triton_4b",
+                                          dispersion_tier.TIER_REJECTED)}
+    assert audit_claims.tier_mark(b, "fused_triton_4b", CTX, 10.0) == "*"
+
+
+def test_without_the_tier_file_the_audit_reads_exactly_as_before(clean_tiers):
+    """The collapse property: absent the tier, every row is starred or not, and
+    nothing in the audit can tell that `dispersion_tier.py` was ever written."""
+    audit_claims.TIERS = {}
+    assert audit_claims.tier_mark(_bench_with(False), "fused_triton_4b", CTX, 10.0) == "*"
+    assert audit_claims.tier_mark(_bench_with(True), "fused_triton_4b", CTX, 0.0) == ""
+
+
+def test_the_worse_marker_wins_over_the_better_one():
+    """An unusable row has to dominate a merely-promoted one. String `max` gets
+    this backwards, which is why `worst_mark` exists."""
+    m = audit_claims.TIER2_MARK
+    assert audit_claims.worst_mark("*", m) == "*"
+    assert audit_claims.worst_mark(m, "*") == "*"
+    assert audit_claims.worst_mark("", m) == m
+    assert audit_claims.worst_mark("", "") == ""
+
+
+def test_the_legend_explains_only_the_markers_that_appear():
+    assert audit_claims.tier_legend(set()) == ""
+    star_only = audit_claims.tier_legend({"*"})
+    assert "did not pass" in star_only and audit_claims.TIER2_MARK not in star_only
+    both = audit_claims.tier_legend({"*", audit_claims.TIER2_MARK})
+    assert "did not pass" in both and audit_claims.TIER2_MARK in both
+
+
+def test_usable_needs_the_effect_to_clear_the_rows_floor(clean_tiers):
+    b = _bench_with(False)
+    audit_claims.TIERS = {
+        ("fused_triton_4b", CTX): _tiered("fused_triton_4b",
+                                          dispersion_tier.TIER_PINNED, 0.05)}
+    assert b.usable("fused_triton_4b", CTX, 0.06)
+    assert not b.usable("fused_triton_4b", CTX, 0.04)
+    # a row with no tier record at all is judged by the gate alone
+    assert not b.usable("fp16_sdpa", CTX, 10.0)
+
+
+def test_the_audit_says_so_when_no_tier_data_exists(clean_tiers):
+    audit_claims.TIERS = {}
+    (claim,) = audit_claims._tier_claim()
+    assert claim.id == "method.dispersion_tier"
+    assert claim.verdict == "MISLEADING"
+    assert "dispersion_tier.json" in claim.evidence
+
+
+def test_the_tier_claim_counts_all_three_verdicts(clean_tiers):
+    audit_claims.TIERS = {
+        ("a", CTX): _tiered("a", dispersion_tier.TIER_QUOTABLE),
+        ("b", CTX): _tiered("b", dispersion_tier.TIER_PINNED, 0.05),
+        ("c", CTX): _tiered("c", dispersion_tier.TIER_REJECTED),
+    }
+    (claim,) = audit_claims._tier_claim()
+    assert claim.verdict == "TRUE BUT CONDITIONAL"
+    assert "three verdicts, not two" in claim.evidence
+    assert "cannot admit a measurement less certain" in claim.evidence
+
+
+def test_load_tiers_tolerates_a_missing_file(tmp_path):
+    assert audit_claims.load_tiers(tmp_path / "nope.json") == {}
+
+
+def test_load_tiers_indexes_by_method_and_ctx(tmp_path):
+    f = tmp_path / "tier.json"
+    f.write_text(json.dumps(dispersion_tier.build(_tier_payload(_standard_spec()))),
+                 encoding="utf-8")
+    tiers = audit_claims.load_tiers(f)
+    assert ("fused_triton_4b", CTX) in tiers
+    assert tiers[("fused_triton_4b", CTX)]["tier"] == dispersion_tier.TIER_PINNED
