@@ -29,6 +29,10 @@ Everything below is verified on this machine, not assumed.
 - `python clock_excursions.py --label full=... --label subset=...` → seconds,
   writes `results/clock_excursions.{md,json}`: the per-run-group rate of memory
   P-state excursions and whether the gate rejected each one.
+- `python thermal_check.py --label name=path[,path...]` (one flag per protocol)
+  → seconds, writes `results/thermal_check.{md,json}`: the within-cell slope of
+  memory clock against temperature, and how many degrees a P-state step would
+  need. Re-measures nothing.
 - `python bandwidth_law.py` → seconds, writes `results/bandwidth_law.{md,json}`
   (figure: `docs/plots/bandwidth_law.png`, from `make_session_plots.py`):
   the within-method decomposition of the bandwidth law, leave-one-out, per-row
@@ -40,7 +44,7 @@ Everything below is verified on this machine, not assumed.
   `min_effect_frac`. Post-hoc from the raw samples, so it runs on any results
   JSON ever recorded and never touches `benchmark.py`. Run 3: **39 quotable /
   7 pinned / 2 rejected**.
-- `python -m pytest test_between_run.py -q` → **106** CPU-only tests, ~11 s,
+- `python -m pytest test_between_run.py -q` → **113** CPU-only tests, ~11 s,
   covering `between_run.py`, `clock_excursions.py`, `compare_protocols.py` and
   `dispersion_tier.py` (including the 2x2 arithmetic, the design reader, and the
   tier's calibration bar and per-claim admissibility).
@@ -236,7 +240,29 @@ re-run it after any benchmark run without thinking about it:
 
    Still open, and now sharper:
 
-   - **Why the shortest and the longest protocols are the noisy ones.** Spreads
+   - **Why the shortest and the longest protocols are the noisy ones — the
+     thermal half of the answer is now RULED OUT at these temperatures
+     (2026-09-03, `thermal_check.py`).** Every observation across all four
+     protocols, expressed as a deviation from its own (method, ctx, regime,
+     protocol) cell mean: temperature moves the memory clock by **−30.4 MHz per
+     degree C** (r = −0.143, n = 720, 2.0% of the variance). The sign is the one
+     the thermal story predicts; the size is the problem. A memory P-state step
+     on this part is 350–1100 MHz, so moving one needs **11.5–36 degrees C** —
+     and the four protocols span only **3.3 degrees**, worth 99 MHz. That is
+     under a third of the smallest step.
+
+     So a temperature sweep is only worth running if it **induces at least
+     ~12 degrees C** at fixed protocol, which the protocols themselves do not.
+     Caveats in `results/thermal_check.md`: the fit is linear over ±3.9 C so the
+     degrees-per-step figure is an extrapolation and a threshold outside that
+     window would not show up; observations inside a cell are not independent so
+     the reported t overstates significance; and temperature is a window mean, so
+     a brief spike could throttle without moving it.
+
+     The *other* arm — too little preceding work and the clock never comes up —
+     is untouched by this and remains the live hypothesis.
+
+   - Original framing, kept for the record. Spreads
      at `quant_cold@8192` are `full` 0.6%, `subset` 13.2%, `preloaded` 0.6%,
      `fullpre` 8.4%; excursion rates 2.8% / 12.5% / 2.8% / 6.9%. That is not
      monotone in load or in temperature (69.3 / 69.5 / 70.8 / 72.1 C — the

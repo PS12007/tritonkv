@@ -716,6 +716,23 @@ free parameters is a description, not a test. It is on the open list, and it is
 the reason "sustained load holds the memory clock up" is no longer stated here
 without qualification.
 
+**The thermal half of that reading is now ruled out at these temperatures.**
+`thermal_check.py` expresses every observation as a deviation from its own
+(method, ctx, regime, protocol) cell mean and finds temperature worth
+**−30.4 MHz per degree C** (r = −0.143, n = 720, 2.0% of the variance). The sign
+is the one the story predicts; the size is not. A memory P-state step on this
+part is 350–1100 MHz, so moving one needs **11.5–36 °C** — and the four protocols
+span **3.3 °C**, worth 99 MHz, under a third of the smallest step. A temperature
+sweep is therefore only worth running if it induces ~12 °C at fixed protocol,
+which these protocols do not. The other arm — too little preceding work and the
+clock never comes up — is untouched by this and remains live.
+
+The fit is linear over a ±3.9 °C window, so the degrees-per-step figure is an
+extrapolation and a threshold outside that window would not appear; observations
+inside a cell come from repeated runs and are not independent; and temperature is
+a window mean, so a brief spike could throttle without moving it.
+`results/thermal_check.md` says all three.
+
 **What predicts the movement is achieved bandwidth.** Time each row's own
 DRAM-resident bytes against its own DRAM-resident time and the pattern is flat:
 
@@ -926,7 +943,7 @@ python -m venv .venv
 .venv/Scripts/python.exe -m pip install -r requirements.txt
 
 .venv/Scripts/python.exe -m pytest test_correctness.py -q   # 106 tests, ~89 s (GPU)
-.venv/Scripts/python.exe -m pytest test_between_run.py -q    # 106 tests, ~11 s (no GPU)
+.venv/Scripts/python.exe -m pytest test_between_run.py -q    # 113 tests, ~11 s (no GPU)
 .venv/Scripts/python.exe benchmark.py --quick                # ~75 s smoke run
 .venv/Scripts/python.exe benchmark.py --samples 50           # full suite, ~13 min
 .venv/Scripts/python.exe dispersion_tier.py                  # three-tier verdict per row
@@ -994,13 +1011,14 @@ committed.
 | `kernels/fused_decode_attn.py` | the fused kernel. |
 | `kernels/fp16_decode_attn.py` | the control: identical shape, unquantized. Isolates the flash-decoding effect. |
 | `test_correctness.py` | 106 tests on the kernel, explicit asserted thresholds. |
-| `test_between_run.py` | 106 CPU-only tests on the between-run, excursion, protocol, dispersion-tier and bandwidth-law machinery — including the 2x2 arithmetic, the design reader and the tier's calibration bar — against synthetic runs with known answers. |
+| `test_between_run.py` | 113 CPU-only tests on the between-run, excursion, protocol, dispersion-tier and bandwidth-law machinery — including the 2x2 arithmetic, the design reader and the tier's calibration bar — against synthetic runs with known answers. |
 | `benchmark.py` | timing + memory. Rotating working set for the cold regime, CUDA-graph replay for the hot one. |
 | `audit_claims.py` | adversarial self-audit: bootstrap CIs over raw timings, attribution against the fp16 control, per-optimization claims with their own controls, and a clock-verification gate. |
 | `between_run.py` | what a bootstrap CI does not cover: compares N independent full runs, reports the run-to-run interval, the inflation over the single-run CI, and whether any verdict moved. |
 | `clock_excursions.py` | the rate at which a row drops a memory P-state, split by run protocol and regime, with the gate's verdict on each. |
 | `compare_protocols.py` | whether two measurement protocols produce the same numbers at all, the bandwidth law that says which rows they will disagree on, and the 2x2 that separates run length from recent saturation. |
 | `bandwidth_law.py` | whether "achieved bandwidth predicts protocol sensitivity" is a law or a method label: the within-method decomposition, leave-one-out, per-row residuals, and whether the memory clock really is constant across protocols. |
+| `thermal_check.py` | whether temperature is even large enough to move a memory P-state: the within-cell slope in MHz per degree, against the degrees the protocols actually span. |
 | `analyze_dispersion.py` | decomposes every rejected measurement into trend, tail and floor, so the gate is argued with rather than tuned. |
 | `dispersion_tier.py` | the third verdict: which gate-failed rows pin their medians well enough to be used anyway, judged against the worst row the gate already accepts. Post-hoc, so it never touches the instrument. |
 | `sweep_group_size.py`, `probe_gs128.py` | the metadata-load sweep and the static PTX probe behind the gs=128 cliff. |

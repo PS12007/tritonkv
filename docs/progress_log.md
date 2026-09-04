@@ -1601,3 +1601,59 @@ no table currently reflects.
 
 This is a decision about scope rather than a measurement, so it is written down
 here rather than taken.
+
+
+## Temperature cannot be the mechanism, and the runs already said so
+
+`next_steps.md` carried a two-mechanism *hypothesis* for the protocol spreads —
+too little preceding work and the memory clock never comes up, too much and
+thermal pressure drags it back down — and asked for "a temperature sweep at fixed
+protocol" as the actual experiment. Two hours of wall clock. Before spending it,
+the runs already recorded were asked, because every measurement window carries a
+mean temperature and a mean memory clock.
+
+The comparison has to be **within a cell**. Between cells, temperature and memory
+clock both move enormously for unrelated reasons — `fp16_sdpa@512` and
+`triton_fp16_control@16384` are different workloads — so a pooled fit on raw
+values would mostly measure "these are different things". Every observation is
+therefore expressed as a deviation from its own (method, ctx, regime, protocol)
+cell mean.
+
+**The slope is −30.4 MHz per degree C** (r = −0.143, n = 720, **2.0%** of the
+variance in memory clock). The sign is the one the thermal story predicts. The
+size is what settles it.
+
+A memory P-state step on this part is 350–1100 MHz, and it is P-state changes
+that cost DRAM-resident time. At 30.4 MHz per degree, moving one step needs
+**11.5–36 degrees C**. The four protocols span **3.3 degrees** (subset 70.2 →
+fullpre 73.4), which predicts **99 MHz** — under a third of the smallest step.
+
+So temperature is not the mechanism at these temperatures, and the sweep is only
+worth running if it deliberately induces **~12 degrees C or more** at fixed
+protocol. The protocols do not produce that by themselves, which is exactly why
+the four-protocol data could never have answered the question and why a sweep was
+the right instinct. It just needs a much wider range than anyone was going to get
+by varying the protocol.
+
+Per protocol the slope is −37.3 (`full`), −32.2 (`fullpre`), −9.3 (`subset`) and
+**+15.5** (`preloaded`) MHz/C — the last of the wrong sign, on 24 cells. That
+disagreement is itself a reason not to lean on the pooled figure too hard.
+
+Three caveats, stated in the generated report and none of which rescues the
+mechanism: the fit is linear over a ±3.9 C window so the degrees-per-step figure
+is an **extrapolation** and a threshold outside it would not show up here;
+observations inside a cell come from repeated runs of the same measurement and
+are **not independent**, so the reported t = −3.9 overstates the significance;
+and temperature is a **window mean**, so a brief spike could throttle without
+moving it.
+
+The other arm of the hypothesis — too little preceding work and the clock never
+comes up — is untouched by any of this and remains the live one. It is also the
+arm the `subset` → `preloaded` comparison already supports (13.2% spread → 0.6%
+after a 300 s preload).
+
+The test that makes this worth trusting is
+`test_between_cell_variation_cannot_leak_into_the_fit`: two cells differing
+enormously in both temperature and clock with no relationship inside either,
+where a naive pooled fit would report a strong slope and the within-cell fit must
+report none. `test_between_run.py`: 106 → **113**.

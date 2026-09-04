@@ -25,6 +25,7 @@ import between_run
 import clock_excursions
 import compare_protocols
 import dispersion_tier
+import thermal_check
 from audit_claims import Bench
 
 CTX = 2048
@@ -1603,3 +1604,93 @@ def test_the_bandwidth_figure_declines_without_its_input():
 
     assert msp.plot_bandwidth_law({}) is False
     assert msp.plot_bandwidth_law({"bandwidth_sensitivity": {}}) is False
+
+
+# ---------------------------------------------------------------------------
+# thermal_check -- is temperature big enough to move a P-state?
+# ---------------------------------------------------------------------------
+
+
+def _thermal_payload(spec) -> dict:
+    """`spec` is (method, ctx, regime, mem_mhz, temp_c) tuples."""
+    byrow: dict = {}
+    for m, c, reg, mem, t in spec:
+        byrow.setdefault((m, c), {})[reg] = {
+            "clocks": {"mem_mhz_mean": mem, "temp_c_mean": t,
+                       "power_w_mean": 75.0, "sm_mhz_mean": 2750.0}}
+    return {"results": [{"method": m, "ctx": c, "clocks": regs}
+                        for (m, c), regs in byrow.items()]}
+
+
+def test_the_thermal_slope_is_recovered():
+    runs = []
+    for t, mem in ((70.0, 11000.0), (72.0, 10900.0), (74.0, 10800.0)):
+        runs.append(_thermal_payload([("A", 8192, "cold", mem, t)]))
+    rep = thermal_check.build({"p": runs})
+    assert rep["pooled"]["slope_mhz_per_c"] == pytest.approx(-50.0, abs=1e-6)
+
+
+def test_between_cell_variation_cannot_leak_into_the_fit():
+    """The test this file turns on. Two cells that differ enormously in both
+    temperature and clock, with *no* relationship inside either: a pooled fit on
+    raw values would report a strong slope, and the within-cell fit must not."""
+    runs = []
+    for i, (ta, tb) in enumerate(((-1.0, -1.0), (0.0, 0.0), (1.0, 1.0))):
+        runs.append(_thermal_payload([
+            # cool cell, low clock; hot cell, high clock -- opposite to thermal
+            ("cool", 512, "cold", 10000.0 + ta * 0.0, 60.0 + ta),
+            ("hot", 16384, "cold", 11500.0 + tb * 0.0, 85.0 + tb),
+        ]))
+    rep = thermal_check.build({"p": runs})
+    assert abs(rep["pooled"]["slope_mhz_per_c"]) < 1e-6
+
+
+def test_a_cell_with_too_few_observations_is_skipped():
+    runs = [_thermal_payload([("A", 8192, "cold", 11000.0, 70.0),
+                              ("B", 512, "cold", 10000.0, 60.0)]),
+            _thermal_payload([("A", 8192, "cold", 10900.0, 72.0)])]
+    rep = thermal_check.build({"p": runs})
+    # A has 2 observations, B has 1 -- neither reaches MIN_PER_CELL
+    assert rep["per_protocol"]["p"]["n_cells"] == 0
+    assert rep["pooled"]["slope_mhz_per_c"] is None
+
+
+def test_a_window_without_telemetry_is_ignored():
+    payload = {"results": [
+        {"method": "A", "ctx": 8192,
+         "clocks": {"cold": {"clocks": {"mem_mhz_mean": 11000.0, "temp_c_mean": 70.0}},
+                    "graph": {"clocks": {"mem_mhz_mean": None, "temp_c_mean": 70.0}}}},
+        {"method": "B", "ctx": 512, "clocks": {"cold": {"clocks": {}}}},
+    ]}
+    assert len(thermal_check.observations(payload)) == 1
+
+
+def test_the_sufficiency_verdict_follows_the_arithmetic():
+    """A steep enough slope over the same temperature span must flip the verdict
+    -- otherwise the conclusion is baked in rather than computed."""
+    # two protocols, because the span the verdict divides by is the spread of
+    # mean temperature *between* protocols -- with one there is nothing to span
+    def groups(per_c):
+        return {
+            "cool": [_thermal_payload([("A", 8192, "cold", 11000.0 - per_c * i,
+                                        70.0 + i)]) for i in range(3)],
+            "hot": [_thermal_payload([("A", 8192, "cold", 10000.0 - per_c * i,
+                                       90.0 + i)]) for i in range(3)],
+        }
+    assert not thermal_check.build(groups(5.0))["thermal_mechanism_sufficient"]
+    assert thermal_check.build(groups(500.0))["thermal_mechanism_sufficient"]
+
+
+def test_the_report_states_the_extrapolation_caveat():
+    runs = [_thermal_payload([("A", 8192, "cold", 11000.0 - 50 * i, 70.0 + i),
+                              ("B", 512, "cold", 10000.0 - 50 * i, 80.0 + i)])
+            for i in range(3)]
+    md = thermal_check.render(thermal_check.build({"p": runs}))
+    assert "extrapolation" in md
+    assert "not independent" in md
+    assert "a temperature sweep would have to achieve" in md
+
+
+def test_thermal_check_refuses_a_missing_run(tmp_path):
+    with pytest.raises(SystemExit):
+        thermal_check.load_groups([f"p={tmp_path / 'nope.json'}"])
