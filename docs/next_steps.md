@@ -49,7 +49,7 @@ Everything below is verified on this machine, not assumed.
   `min_effect_frac`. Post-hoc from the raw samples, so it runs on any results
   JSON ever recorded and never touches `benchmark.py`. Run 3: **39 quotable /
   7 pinned / 2 rejected**.
-- `python -m pytest test_between_run.py -q` → **126** CPU-only tests, ~13 s,
+- `python -m pytest test_between_run.py -q` → **131** CPU-only tests, ~13 s,
   covering `between_run.py`, `clock_excursions.py`, `compare_protocols.py` and
   `dispersion_tier.py` (including the 2x2 arithmetic, the design reader, and the
   tier's calibration bar and per-claim admissibility).
@@ -319,11 +319,25 @@ re-run it after any benchmark run without thinking about it:
      **Both arms of the two-mechanism hypothesis are now dead** — thermal on
      effect size, warm-up on time constant. What survives is the observation
      itself: `subset` → `preloaded` improves spread 13.2% → 0.6% for 300 s of
-     preload, and nothing here explains why. Untested candidates: the power
-     governor integrating over a window far longer than the clock ramp; a settled
-     fan curve rather than a temperature; allocator or driver state a preload
-     warms. **Do not run more protocol repetitions** — design a measurement that
-     separates those three.
+     preload, and nothing here explains why.
+
+     **And nothing in the telemetry explains it either (2026-09-04).**
+     `thermal_check.py` reports the mean within-cell run-to-run SD of every
+     monitored variable beside each protocol's ratio spread: `subset` (13.2%) and
+     `full` (0.6%) differ 20x in spread while sitting within 6% of each other on
+     temperature SD and 10% on memory-clock SD, and `preloaded` is as steady as
+     `full` in its ratios with the second-worst SM-clock reproducibility. Nothing
+     tracks it.
+
+     Candidate status: the **power governor** is weakened (power pins at 79.8 W
+     in 10 s, then flat); the **fan curve is untestable on this part** —
+     `nvidia-smi --query-gpu=fan.speed` is `[N/A]` because a laptop GPU does not
+     control the chassis fan, so that is unavailable rather than refuted;
+     **allocator or driver state** is untouched.
+
+     **Do not run more protocol repetitions.** What would settle this is a
+     variable the current sampler does not record, and the obvious one cannot be
+     read on this hardware.
 
    - Original framing, kept for the record. Spreads
      at `quant_cold@8192` are `full` 0.6%, `subset` 13.2%, `preloaded` 0.6%,
