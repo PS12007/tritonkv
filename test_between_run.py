@@ -1694,3 +1694,72 @@ def test_the_report_states_the_extrapolation_caveat():
 def test_thermal_check_refuses_a_missing_run(tmp_path):
     with pytest.raises(SystemExit):
         thermal_check.load_groups([f"p={tmp_path / 'nope.json'}"])
+
+
+def test_the_decay_test_finds_a_planted_decay():
+    """A warm group whose advantage is large early and gone late, with little
+    scatter, must come out established."""
+    cells = [("A", 512), ("B", 512), ("C", 2048), ("D", 2048), ("E", 8192), ("F", 8192), ("G", 16384), ("H", 16384)]
+    warm, cold = [], []
+    for _ in range(3):
+        warm.append(_thermal_payload(
+            [(m, c, "cold", 11000.0 + (300.0 if i < 4 else 0.0), 70.0)
+             for i, (m, c) in enumerate(cells)]))
+        cold.append(_thermal_payload(
+            [(m, c, "cold", 11000.0, 70.0) for m, c in cells]))
+    d = thermal_check.preload_decay(warm, cold)
+    assert d["early_mhz"] == pytest.approx(300.0)
+    assert d["late_mhz"] == pytest.approx(0.0)
+    assert d["significant"]
+
+
+def test_a_decay_buried_in_scatter_is_not_called_established():
+    """The case the real data is in: the point estimates lean the right way and
+    the error bars swallow them."""
+    cells = [("A", 512), ("B", 512), ("C", 2048), ("D", 2048), ("E", 8192), ("F", 8192), ("G", 16384), ("H", 16384)]
+    noise = [+400, -350, +380, -300, -330, +420, -360, +340]
+    warm, cold = [], []
+    for _ in range(3):
+        warm.append(_thermal_payload(
+            [(m, c, "cold", 11000.0 + noise[i], 70.0)
+             for i, (m, c) in enumerate(cells)]))
+        cold.append(_thermal_payload(
+            [(m, c, "cold", 11000.0, 70.0) for m, c in cells]))
+    d = thermal_check.preload_decay(warm, cold)
+    assert not d["significant"]
+    assert d["runs_per_protocol_needed"] is None or d["runs_per_protocol_needed"] > 3
+
+
+def test_the_decay_test_declines_with_too_few_shared_cells():
+    warm = [_thermal_payload([("A", 512, "cold", 11000.0, 70.0)])]
+    cold = [_thermal_payload([("A", 512, "cold", 10900.0, 70.0)])]
+    d = thermal_check.preload_decay(warm, cold)
+    assert d["early_mhz"] is None
+
+
+def test_measurement_order_is_read_from_the_results_list():
+    """Position-in-run is only recoverable because benchmark.py writes results in
+    measurement order; if that stopped being true this would be silently wrong."""
+    payload = _thermal_payload([("first", 512, "cold", 11000.0, 70.0),
+                                ("second", 2048, "cold", 11000.0, 70.0),
+                                ("third", 8192, "cold", 11000.0, 70.0)])
+    cells = thermal_check.ordered_cells([payload])
+    assert cells[("first", 512, "cold")]["position"] == 0
+    assert cells[("third", 8192, "cold")]["position"] == 2
+
+
+def test_the_report_states_what_the_underpowered_test_would_need():
+    cells = [("A", 512), ("B", 512), ("C", 2048), ("D", 2048), ("E", 8192), ("F", 8192), ("G", 16384), ("H", 16384)]
+    noise = [+400, -350, +380, -300, -330, +420, -360, +340]
+    warm, cold = [], []
+    for k in range(3):
+        warm.append(_thermal_payload(
+            [(m, c, "cold", 11000.0 + noise[i] - 5 * k, 70.0 + k)
+             for i, (m, c) in enumerate(cells)]))
+        cold.append(_thermal_payload(
+            [(m, c, "cold", 11000.0 - 10 * k, 70.0 + k) for m, c in cells]))
+    rep = thermal_check.build({"warm": warm, "cold": cold}, [("warm", "cold")])
+    md = thermal_check.render(rep)
+    assert "The other arm" in md
+    assert "runs/protocol needed" in md
+    assert "measure the clock ramp directly" in md

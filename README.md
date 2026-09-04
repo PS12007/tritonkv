@@ -733,6 +733,15 @@ inside a cell come from repeated runs and are not independent; and temperature i
 a window mean, so a brief spike could throttle without moving it.
 `results/thermal_check.md` says all three.
 
+**The other arm is live but not settleable this way.** If a run has to earn its
+memory clock, a preloaded run should start higher and the advantage should decay.
+It leans that way — `preloaded` over `subset` is **+124 MHz early against +43
+late**, while `fullpre` under `full` is −38 and −31, a preload that only costs —
+and neither clears its error bar (Welch t = +1.46, −0.19). At the scatter these
+cells show, settling it by repeating protocols needs **~200 runs per protocol**.
+The cheaper experiment is to measure the clock ramp directly during an
+idle-to-load transition, which answers the same question in minutes.
+
 **What predicts the movement is achieved bandwidth.** Time each row's own
 DRAM-resident bytes against its own DRAM-resident time and the pattern is flat:
 
@@ -943,7 +952,7 @@ python -m venv .venv
 .venv/Scripts/python.exe -m pip install -r requirements.txt
 
 .venv/Scripts/python.exe -m pytest test_correctness.py -q   # 106 tests, ~89 s (GPU)
-.venv/Scripts/python.exe -m pytest test_between_run.py -q    # 113 tests, ~11 s (no GPU)
+.venv/Scripts/python.exe -m pytest test_between_run.py -q    # 118 tests, ~11 s (no GPU)
 .venv/Scripts/python.exe benchmark.py --quick                # ~75 s smoke run
 .venv/Scripts/python.exe benchmark.py --samples 50           # full suite, ~13 min
 .venv/Scripts/python.exe dispersion_tier.py                  # three-tier verdict per row
@@ -1011,7 +1020,7 @@ committed.
 | `kernels/fused_decode_attn.py` | the fused kernel. |
 | `kernels/fp16_decode_attn.py` | the control: identical shape, unquantized. Isolates the flash-decoding effect. |
 | `test_correctness.py` | 106 tests on the kernel, explicit asserted thresholds. |
-| `test_between_run.py` | 113 CPU-only tests on the between-run, excursion, protocol, dispersion-tier and bandwidth-law machinery — including the 2x2 arithmetic, the design reader and the tier's calibration bar — against synthetic runs with known answers. |
+| `test_between_run.py` | 118 CPU-only tests on the between-run, excursion, protocol, dispersion-tier and bandwidth-law machinery — including the 2x2 arithmetic, the design reader and the tier's calibration bar — against synthetic runs with known answers. |
 | `benchmark.py` | timing + memory. Rotating working set for the cold regime, CUDA-graph replay for the hot one. |
 | `audit_claims.py` | adversarial self-audit: bootstrap CIs over raw timings, attribution against the fp16 control, per-optimization claims with their own controls, and a clock-verification gate. |
 | `between_run.py` | what a bootstrap CI does not cover: compares N independent full runs, reports the run-to-run interval, the inflation over the single-run CI, and whether any verdict moved. |

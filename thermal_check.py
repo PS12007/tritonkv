@@ -1,5 +1,13 @@
 #!/usr/bin/env python
-"""Can temperature explain why the shortest and longest protocols are the noisy ones?
+"""What do the recorded runs say about the two-mechanism hypothesis?
+
+Two arms, tested separately, both from runs already on disk:
+
+* **Thermal** -- too much preceding work and thermal pressure drags the memory
+  clock down. Ruled out at these temperatures; see below.
+* **Warm-up** -- too little preceding work and the memory clock never comes up.
+  Not ruled out, and not established either: the test is underpowered at three
+  runs per protocol and this file says by how much.
 
     ./.venv/Scripts/python.exe thermal_check.py \\
         --label full=results/runs/run1.json,results/runs/run2.json,results/runs/run3.json \\
@@ -29,6 +37,22 @@ by one P-state step. The answer is several times the temperature range the
 protocols actually span, which is what rules the mechanism out at these
 temperatures -- and says how much wider a sweep would have to reach to test it.
 
+## The warm-up arm
+
+If a run has to *earn* its memory clock, a preloaded run should start higher than
+a cold-start one and the advantage should **decay** as the cold-start run
+accumulates its own work. Measurement order is recoverable -- the results list is
+chronological -- so each shared cell gets the preloaded-minus-cold difference and
+its mean position in the run, and the early half is compared against the late
+half.
+
+The point estimates lean the right way for the short protocol (`preloaded` over
+`subset`) and the wrong way for the long one (`fullpre` under `full`), which is
+the shape the two-mechanism story predicts. Neither survives its own error bar.
+The file reports the Welch t and the number of runs per protocol that would be
+needed, because the useful output of an underpowered test is the power
+calculation.
+
 Nothing here re-measures anything.
 """
 from __future__ import annotations
@@ -55,6 +79,11 @@ P_STATE_STEP_MAX_MHZ = 1100.0
 # A cell needs at least this many observations before a within-cell deviation
 # means anything.
 MIN_PER_CELL = 3
+
+# How many runs each protocol group actually has. Used only to turn the observed
+# scatter into "how many runs would this test need", so it is stated rather than
+# inferred from whatever was passed.
+RUNS_PER_PROTOCOL = 3
 
 
 def observations(payload: dict) -> list[dict]:
@@ -120,6 +149,81 @@ def fit(dt: list[float], dm: list[float]) -> dict:
     }
 
 
+def ordered_cells(payloads: list[dict]) -> dict:
+    """Mean memory clock and mean position-in-run for each cell.
+
+    `benchmark.py` writes its results in measurement order (context outer,
+    method inner), so the list index is chronological and is the only record of
+    when in a run a cell was measured.
+    """
+    acc: dict[tuple, dict] = {}
+    for payload in payloads:
+        for i, r in enumerate(payload.get("results") or []):
+            for regime in REGIMES:
+                w = ((r.get("clocks") or {}).get(regime) or {}).get("clocks") or {}
+                if w.get("mem_mhz_mean") is None:
+                    continue
+                key = (r["method"], r["ctx"], regime)
+                acc.setdefault(key, {"mem": [], "idx": []})
+                acc[key]["mem"].append(w["mem_mhz_mean"])
+                acc[key]["idx"].append(i)
+    return {k: {"mem_mhz": statistics.fmean(v["mem"]),
+                "position": statistics.fmean(v["idx"])}
+            for k, v in acc.items()}
+
+
+def _welch(a: np.ndarray, b: np.ndarray) -> tuple[float, float]:
+    va, vb = a.var(ddof=1) / a.size, b.var(ddof=1) / b.size
+    denom = np.sqrt(va + vb)
+    if denom == 0:
+        # Both groups constant. If their means differ the separation is perfect,
+        # which is the opposite of "no evidence" -- returning 0 here would have
+        # reported a noiseless effect as insignificant.
+        gap = float(a.mean() - b.mean())
+        t = 0.0 if gap == 0 else float("inf") * (1.0 if gap > 0 else -1.0)
+        return t, float(a.size + b.size - 2)
+    t = float((a.mean() - b.mean()) / denom)
+    df = float((va + vb) ** 2 / (va ** 2 / (a.size - 1) + vb ** 2 / (b.size - 1)))
+    return t, df
+
+
+def preload_decay(warm: list[dict], cold: list[dict]) -> dict:
+    """Does a preload's memory-clock advantage decay as a run earns its own?
+
+    Positive `early` means the preloaded run sat at a higher memory clock in the
+    first half of the run. The warm-up story predicts early > late; a preload
+    that simply heats the card predicts a negative difference with no decay.
+    """
+    W, C = ordered_cells(warm), ordered_cells(cold)
+    shared = sorted(set(W) & set(C), key=lambda k: C[k]["position"])
+    if len(shared) < 6:
+        return {"n_cells": len(shared), "early_mhz": None}
+    diff = np.array([W[k]["mem_mhz"] - C[k]["mem_mhz"] for k in shared])
+    half = diff.size // 2
+    early, late = diff[:half], diff[half:]
+    t, df = _welch(early, late)
+    pooled_sd = float(np.sqrt((early.var(ddof=1) + late.var(ddof=1)) / 2))
+    observed = float(early.mean() - late.mean())
+    # How much would the per-cell scatter have to shrink for this difference to
+    # clear t = 2? Scatter falls as 1/sqrt(runs), so the runs needed follow.
+    need_sd = abs(observed) / 2.0 * np.sqrt(2.0 / max(half, 1)) if observed else None
+    runs_needed = (RUNS_PER_PROTOCOL * (pooled_sd / need_sd) ** 2
+                   if need_sd and need_sd > 0 and pooled_sd > 0 else None)
+    return {
+        "n_cells": len(shared),
+        "early_mhz": float(early.mean()),
+        "late_mhz": float(late.mean()),
+        "early_sd": float(early.std(ddof=1)),
+        "late_sd": float(late.std(ddof=1)),
+        "decay_mhz": observed,
+        "welch_t": t,
+        "welch_df": df,
+        "significant": abs(t) >= 2.0,
+        "pooled_sd_mhz": pooled_sd,
+        "runs_per_protocol_needed": (float(runs_needed) if runs_needed else None),
+    }
+
+
 def degrees_for_a_p_state(slope_mhz_per_c: float | None) -> dict:
     if not slope_mhz_per_c:
         return {}
@@ -128,7 +232,7 @@ def degrees_for_a_p_state(slope_mhz_per_c: float | None) -> dict:
             "max_step_c": P_STATE_STEP_MAX_MHZ / s}
 
 
-def build(groups: dict[str, list[dict]]) -> dict:
+def build(groups: dict[str, list[dict]], pairs: list[tuple] | None = None) -> dict:
     per_protocol = {}
     all_dt: list[float] = []
     all_dm: list[float] = []
@@ -149,8 +253,14 @@ def build(groups: dict[str, list[dict]]) -> dict:
             if len(protocol_temps) > 1 else 0.0)
     predicted = (span * abs(pooled["slope_mhz_per_c"])
                  if pooled.get("slope_mhz_per_c") else None)
+    decay = {}
+    for warm, cold in (pairs or []):
+        if warm in groups and cold in groups:
+            decay[f"{warm} vs {cold}"] = preload_decay(groups[warm], groups[cold])
+
     return {
         "per_protocol": per_protocol,
+        "warm_up_arm": decay,
         "pooled": pooled,
         "protocol_mean_temp_c": protocol_temps,
         "protocol_temp_span_c": span,
@@ -207,9 +317,41 @@ def render(rep: dict) -> str:
              if rep["thermal_mechanism_sufficient"] else
              "So temperature cannot be the mechanism at these temperatures.")
           + "**", ""]
+    decay = rep.get("warm_up_arm") or {}
+    if decay:
+        L += ["", "## The other arm: does a preload's advantage decay?", "",
+              "If a run has to earn its memory clock, a preloaded run should start "
+              "higher than a cold-start one and the gap should shrink as the "
+              "cold-start run accumulates its own work. Measurement order is "
+              "recoverable, so each shared cell is compared early-half against "
+              "late-half.", "",
+              "| comparison | cells | early (MHz) | late (MHz) | decay | Welch t | "
+              "established? | runs/protocol needed |",
+              "|---|---|---|---|---|---|---|---|"]
+        for name, d in decay.items():
+            if d.get("early_mhz") is None:
+                L.append(f"| `{name}` | {d['n_cells']} | -- | -- | -- | -- | -- | -- |")
+                continue
+            runs = d["runs_per_protocol_needed"]
+            L.append(
+                f"| `{name}` | {d['n_cells']} | {d['early_mhz']:+.0f} +-{d['early_sd']:.0f} "
+                f"| {d['late_mhz']:+.0f} +-{d['late_sd']:.0f} | {d['decay_mhz']:+.0f} "
+                f"| {d['welch_t']:+.2f} | "
+                f"{'yes' if d['significant'] else '**no**'} | "
+                f"{'--' if not runs else f'~{runs:.0f}'} |")
+        L += ["",
+              "The point estimates lean the way the story predicts -- the short "
+              "protocol gains from a preload and loses the gain as it goes, the long "
+              "one only loses -- and **neither clears its own error bar**. The last "
+              "column is the useful output: at the scatter these cells actually "
+              "show, settling this by this route would take hundreds of runs per "
+              "protocol, which is tens of hours. That is a reason to measure the "
+              "clock ramp directly during an idle-to-load transition rather than to "
+              "keep inferring it from benchmark cells.", ""]
+
     L += [
-        "Three caveats, none of which rescues the mechanism but all of which "
-        "bound the claim:",
+        "Three caveats, none of which rescues the thermal mechanism but all of "
+        "which bound the claim:",
         "",
         "- The fit is linear over a narrow window -- cell deviations span only "
         f"{p['temp_dev_min']:.1f} to {p['temp_dev_max']:.1f} C -- so the degrees "
@@ -249,13 +391,23 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--label", action="append", default=[],
                     help="name=path[,path...] -- one protocol per flag")
+    ap.add_argument("--pair", action="append", default=[],
+                    help="warm=cold -- test whether the warm protocol's memory-clock "
+                         "advantage over the cold one decays across the run. Both "
+                         "names must be --label groups.")
     ap.add_argument("--out", default=str(RESULTS_DIR / "thermal_check.json"))
     ap.add_argument("--md", default=str(RESULTS_DIR / "thermal_check.md"))
     args = ap.parse_args()
     if not args.label:
         raise SystemExit("nothing to compare -- pass at least one --label name=path")
 
-    rep = build(load_groups(args.label))
+    pairs = []
+    for spec in args.pair:
+        if "=" not in spec:
+            raise SystemExit(f"--pair wants warm=cold, got {spec!r}")
+        warm, cold = spec.split("=", 1)
+        pairs.append((warm.strip(), cold.strip()))
+    rep = build(load_groups(args.label), pairs)
     p = rep["pooled"]
     if p.get("slope_mhz_per_c") is None:
         print("not enough data to fit")
@@ -276,6 +428,17 @@ def main():
           f"needs {need['min_step_c']:.1f}-{need['max_step_c']:.1f} C")
     print(f"the protocols span {rep['protocol_temp_span_c']:.1f} C "
           f"-> {rep['predicted_mhz_over_span']:.0f} MHz predicted")
+    for name, d in (rep.get("warm_up_arm") or {}).items():
+        if d.get("early_mhz") is None:
+            print(f"{name}: too few shared cells")
+            continue
+        need = d["runs_per_protocol_needed"]
+        print(f"{name}: early {d['early_mhz']:+.0f} late {d['late_mhz']:+.0f} "
+              f"MHz  decay {d['decay_mhz']:+.0f}  t = {d['welch_t']:+.2f}  "
+              + ("ESTABLISHED" if d["significant"]
+                 else f"not established (would need ~{need:.0f} runs/protocol)"
+                 if need else "not established"))
+    print()
     print("=> thermal mechanism is "
           + ("SUFFICIENT" if rep["thermal_mechanism_sufficient"]
              else "NOT sufficient at these temperatures"))

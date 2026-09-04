@@ -32,7 +32,9 @@ Everything below is verified on this machine, not assumed.
 - `python thermal_check.py --label name=path[,path...]` (one flag per protocol)
   → seconds, writes `results/thermal_check.{md,json}`: the within-cell slope of
   memory clock against temperature, and how many degrees a P-state step would
-  need. Re-measures nothing.
+  need. With `--pair warm=cold` it also tests the warm-up arm — whether a
+  preload's clock advantage decays across a run — and reports how many runs
+  that test would need. Re-measures nothing.
 - `python bandwidth_law.py` → seconds, writes `results/bandwidth_law.{md,json}`
   (figure: `docs/plots/bandwidth_law.png`, from `make_session_plots.py`):
   the within-method decomposition of the bandwidth law, leave-one-out, per-row
@@ -44,7 +46,7 @@ Everything below is verified on this machine, not assumed.
   `min_effect_frac`. Post-hoc from the raw samples, so it runs on any results
   JSON ever recorded and never touches `benchmark.py`. Run 3: **39 quotable /
   7 pinned / 2 rejected**.
-- `python -m pytest test_between_run.py -q` → **113** CPU-only tests, ~11 s,
+- `python -m pytest test_between_run.py -q` → **118** CPU-only tests, ~11 s,
   covering `between_run.py`, `clock_excursions.py`, `compare_protocols.py` and
   `dispersion_tier.py` (including the 2x2 arithmetic, the design reader, and the
   tier's calibration bar and per-claim admissibility).
@@ -260,7 +262,19 @@ re-run it after any benchmark run without thinking about it:
      a brief spike could throttle without moving it.
 
      The *other* arm — too little preceding work and the clock never comes up —
-     is untouched by this and remains the live hypothesis.
+     is **live but cannot be settled this way.** `thermal_check.py --pair` tests
+     its prediction directly: a preloaded run should start at a higher memory
+     clock and the advantage should decay as the cold-start run earns its own.
+     The point estimates lean correctly (`preloaded` over `subset`: **+124 MHz
+     early, +43 late**; `fullpre` under `full`: −38 and −31, i.e. a preload that
+     only costs) and **neither clears its error bar** (Welch t = +1.46 and −0.19).
+     At the scatter these cells show, settling it by this route needs
+     **~200 runs per protocol** — tens of hours.
+
+     So do not run more protocol repetitions for this. Measure the **clock ramp
+     directly** during an idle-to-load transition instead: it answers "does the
+     memory clock take time to come up, and how long" in minutes rather than
+     inferring it from benchmark cells.
 
    - Original framing, kept for the record. Spreads
      at `quant_cold@8192` are `full` 0.6%, `subset` 13.2%, `preloaded` 0.6%,
