@@ -12,7 +12,8 @@ machine, with a different GPU, is the only way to find out whether the
 conclusion is about GPUs in general or just about that one laptop.
 
 **What it costs you:** about 20 minutes of setup, then ~15 minutes where you
-shouldn't touch the laptop. Then you send back a single 4 MB file.
+shouldn't touch the laptop (plus an optional ~8 more for Step 5b). Then you send
+back one or two small files.
 
 **What it does NOT do:** no admin rights, no driver changes, no system-wide
 installs, no overclocking, no registry edits. Everything lives in one folder you
@@ -30,10 +31,11 @@ python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
 .venv\Scripts\python -m pytest test_correctness.py -q
 .venv\Scripts\python benchmark.py --samples 50
+.venv\Scripts\python -u l2_sweep.py
 ```
 
-Send back `results/benchmark.json`. Plug the laptop in and don't use it during
-the last command.
+Send back `results/benchmark.json` and `results/l2_sweep.json`. Plug the laptop
+in and don't use it during the last two commands.
 
 Everything below is the same thing with explanations and troubleshooting.
 
@@ -216,17 +218,44 @@ running in the background. Just start over when convenient.
 
 ---
 
-## Step 6 — send back one file
+## Step 5b — the L2 sweep (optional, ~8 minutes, and the most useful part)
+
+If you can spare eight more minutes with the laptop still plugged in and left
+alone, run:
+
+```bat
+.venv\Scripts\python -u l2_sweep.py
+```
+
+This one is short and surgical. It times two versions of the GPU program at
+thirteen conversation lengths, chosen **relative to your GPU's own cache size**,
+so every card gets tested at the same points on its own scale. It is the
+experiment that directly checks whether the effect follows the cache. The
+benchmark in Step 5 can only check that indirectly.
+
+It ends by printing a small table and five lines starting `P1` … `P5` with
+`HOLDS` / `FAILS`. Whatever they say, send the file. A `FAILS` from your card is
+exactly as useful as a `HOLDS`, and those predictions were written down before
+anyone's card ran them.
+
+If your GPU has less memory than it needs for the longest lengths, it skips those
+points and says so. That's fine.
+
+---
+
+## Step 6 — send back the files
 
 ```
 tritonkv\results\benchmark.json
+tritonkv\results\l2_sweep.json      (if you ran Step 5b)
 ```
 
-It's about **4 MB**. Discord, email, Google Drive, WeTransfer — whatever's
-easiest.
+About **4 MB** and **1 MB**. Discord, email, Google Drive, WeTransfer —
+whatever's easiest.
 
-**That single file contains everything needed** — your GPU model, its cache size,
-driver version, and every measurement. You won't be asked follow-up questions.
+**Those files contain everything needed:** your GPU model, its cache size,
+driver version, a measured memory bandwidth, and every measurement. You won't be
+asked follow-up questions.
 
 If you want to see what you're sending, it's plain text (JSON). There is nothing
 personal in it: no usernames, no folder paths, no hardware serial numbers — just
