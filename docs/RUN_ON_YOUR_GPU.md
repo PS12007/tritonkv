@@ -45,11 +45,11 @@ Everything below is the same thing with explanations and troubleshooting.
 
 | | |
 |---|---|
-| **GPU** | An NVIDIA card, RTX 20-series (2018) or newer. AMD and Intel graphics will not work. |
+| **GPU** | An NVIDIA card, RTX 30-series or newer. RTX 20-series *may* work but is not officially supported by Triton, the GPU compiler this uses; Step 3 will tell you. AMD and Intel graphics will not work. |
 | **Driver** | Reasonably recent — version 580 or newer. Check with `nvidia-smi`. |
 | **Python** | 3.10 or newer. 3.12 is what this was built on. |
 | **Disk** | ~4 GB free. |
-| **Time** | ~20 min setup (mostly downloading), ~15 min running. |
+| **Time** | ~20 min setup (mostly downloading), ~15 min running, plus ~12 optional (Step 5b). |
 | **Power** | **Laptop must be plugged in.** See Step 4. |
 
 You do **not** need admin rights, and you do **not** need to install CUDA
@@ -73,8 +73,34 @@ NVIDIA GeForce RTX 4070 Laptop GPU, 581.29, 8188 MiB
 ```
 
 **Send that line to Priyansh before you do anything else.** It takes ten seconds
-and tells him whether your card is a useful test — it might save you the whole
-install.
+and says whether your card is a useful test — it might save you the whole
+install. (The table just below is how that gets decided, if you're curious.)
+
+### Is my card a useful test?
+
+What matters is the size of the GPU's **L2 cache** (a small, fast on-chip
+memory). The original laptop has 32 MB. The more yours differs, the more your
+run tells us, because the prediction is that the effect moves in step with
+L2 size: roughly **1,000 tokens of context per MB of L2**.
+
+| your GPU (desktop) | L2 | usefulness | where the crossover should land |
+|---|---|---|---|
+| RTX 2060 / 3060 | 3 MB | ★★★ most useful: 10× smaller than the original | ~3k tokens |
+| RTX 2070 / 2080 / 3060 Ti / 3070 | 4 MB | ★★★ | ~4k |
+| RTX 3080 | 5 MB | ★★★ | ~5k |
+| RTX 3080 Ti / 3090 | 6 MB | ★★★ small cache, very fast memory, the card most likely to break a prediction | ~6k |
+| RTX 4060 | 24 MB | ★ close to the original | ~24k |
+| RTX 4060 Ti / 5060 / 5060 Ti | 32 MB | ☆ same as the original, but a desktop is still a cleaner measurement | ~32k |
+| RTX 4070 | 36 MB | ★ | ~36k |
+| RTX 4070 Ti / 5070 | 48 MB | ★★ | ~48k |
+| RTX 4080 / 5080 | 64 MB | ★★ 2× bigger | ~64k |
+| RTX 4090 | 72 MB | ★★★ | ~72k |
+| RTX 5090 | 96 MB | ★★★ 3× bigger | ~96k |
+
+Laptop versions of these cards often have *less* L2 than the desktop card with
+the same name. It doesn't matter which you have: the benchmark reads the real
+value off your card and records it. RTX 20-series cards may not run at all (see
+"What you need"); Step 3 is where you'd find out.
 
 **If `nvidia-smi` is "not recognised":** your NVIDIA driver isn't installed, or
 isn't on your PATH. Try the full path:
@@ -234,7 +260,7 @@ experiment that directly checks whether the effect follows the cache. The
 benchmark in Step 5 can only check that indirectly.
 
 It ends by printing a small table and five lines starting `P1` … `P5` with
-`HOLDS` / `FAILS`. Whatever they say, send the file. A `FAILS` from your card is
+`HOLDS`, `FAILS` or `untestable`. Whatever they say, send the file. A `FAILS` from your card is
 exactly as useful as a `HOLDS`, and those predictions were written down before
 anyone's card ran them.
 
@@ -250,7 +276,7 @@ tritonkv\results\benchmark.json
 tritonkv\results\l2_sweep.json      (if you ran Step 5b)
 ```
 
-About **4 MB** and **1 MB**. Discord, email, Google Drive, WeTransfer —
+About **4 MB** and **2 MB**. Discord, email, Google Drive, WeTransfer —
 whatever's easiest.
 
 **Those files contain everything needed:** your GPU model, its cache size,
