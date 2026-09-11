@@ -1082,6 +1082,97 @@ def measure_registers() -> dict:
     return out
 
 
+def plot_l2_sweep(sweep_payload: dict):
+    """The quantization ratio as the working set crosses L2, and why.
+
+    Left: the pre-registered test itself -- hot and DRAM-resident ratios against
+    fp16 cache / L2, with the zones and the crossing window drawn from the
+    constants in ``l2_sweep.py`` (the same ones the verdicts use). Hollow markers
+    are pairs where a row failed the dispersion gate. Right: per-token time for
+    each kernel in each regime, which is where the mechanism is visible: each
+    kernel's hot curve peels off onto its DRAM curve when *its own* cache leaves
+    L2, and the two caches differ in size by 3.2x.
+    """
+    import l2_sweep as S
+
+    rep = S.analyze(sweep_payload)
+    pts = rep["points"]
+    if not pts:
+        return False
+    xs = np.array([r["x_fp16"] for r in pts])
+
+    fig, axes = plt.subplots(1, 2, figsize=(13.4, 5.2), gridspec_kw={"wspace": 0.28})
+    fig.subplots_adjust(top=0.84, bottom=0.14)
+
+    ax = axes[0]
+    q4_spill = S.SPILL_FRAC * 3.2
+    for lo, hi, lab in ((xs.min() / 1.3, S.FIT_FRAC, "A: both fit"),
+                        (S.SPILL_FRAC, S.FIT_FRAC * 3.2, "B: fp16 spills,\n4-bit fits"),
+                        (q4_spill, xs.max() * 1.3, "C: both spill")):
+        ax.axvspan(lo, hi, color=MUTED, alpha=0.10, lw=0, zorder=0)
+        ax.text((lo * hi) ** 0.5, 0.985, lab, ha="center", va="top", fontsize=8,
+                color=INK2, transform=ax.get_xaxis_transform())
+    w0, w1 = S.CROSSING_WINDOW
+    ax.axvspan(w0, w1, ymin=0, ymax=0.035, color=S2, alpha=0.6, lw=0)
+    ax.axhline(1.0, color=INK2, lw=1.0, ls="--")
+    for key, colour, label in (("hot", S1, "hot (one cache, replayed)"),
+                               ("cold", S3, "DRAM-resident (rotating set)")):
+        ys = np.array([r[key]["ratio"] for r in pts])
+        lo = ys - np.array([r[key]["lo"] for r in pts])
+        hi = np.array([r[key]["hi"] for r in pts]) - ys
+        ax.plot(xs, ys, color=colour, lw=2.0, zorder=2, label=label)
+        ax.errorbar(xs, ys, yerr=[lo, hi], fmt="none", ecolor=colour, capsize=2, zorder=3)
+        for x, y, r in zip(xs, ys, pts):
+            ax.plot([x], [y], marker="o", ms=6, zorder=4, color=colour,
+                    mfc=colour if r[key]["quotable"] else SURFACE)
+    p2 = next(p for p in rep["predictions"] if p["id"] == "P2")
+    if p2.get("x_star") not in (None, float("-inf")):
+        ax.axvline(p2["x_star"], color=S2, lw=1.2, ls=":")
+        ax.text(p2["x_star"] * 0.94, 1.08, f"crossing\n{p2['x_star']:.2f}x L2",
+                fontsize=8, color=S2, va="bottom", ha="right")
+    ax.set_xscale("log")
+    ax.set_xlim(xs.min() / 1.3, xs.max() * 1.3)
+    ax.set_ylim(0.6, max(2.2, max(r["hot"]["hi"] for r in pts) * 1.08))
+    ax.legend(loc="lower right", bbox_to_anchor=(1.0, 0.06), fontsize=8.5,
+              frameon=True, framealpha=0.95)
+    style(ax, "fp16 control / fused 4-bit",
+          subtitle="orange bar on the axis = pre-registered crossing window; "
+                   "hollow = gate-failed pair",
+          xlabel="fp16 KV cache / L2  (log)", ylabel="ratio (>1: quantization pays)")
+
+    ax = axes[1]
+    ctx = np.array([p["ctx"] for p in sweep_payload["points"] if not p.get("skipped")])
+    order = np.argsort(ctx)
+    good = [p for p in sweep_payload["points"] if not p.get("skipped")]
+    good = [good[i] for i in order]
+    x16 = np.array([p["x_fp16"] for p in good])
+    for method, colour, name in ((S.CONTROL, S1, "fp16 control"), (S.FUSED, S2, "fused 4-bit")):
+        for regime, ls in (("hot", "-"), ("cold", "--")):
+            ns = [p["methods"][method][regime]["median_ms"] * 1e6 / p["ctx"] for p in good]
+            ax.plot(x16, ns, color=colour, ls=ls, lw=2.0, marker="o", ms=4,
+                    label=f"{name}, {'hot' if regime == 'hot' else 'DRAM'}")
+    ax.axvline(1.0, color=S1, lw=1.0, ls=":")
+    ax.axvline(3.2, color=S2, lw=1.0, ls=":")
+    ax.text(1.03, 0.04, "fp16 cache = L2", transform=ax.get_xaxis_transform(),
+            fontsize=8, color=S1)
+    ax.text(3.3, 0.04, "4-bit cache = L2", transform=ax.get_xaxis_transform(),
+            fontsize=8, color=S2)
+    ax.set_xscale("log")
+    ax.legend(loc="upper left", fontsize=8, ncol=2, frameon=True, framealpha=0.95)
+    style(ax, "Each kernel falls off its own cliff",
+          subtitle="per-token time; hot peels onto DRAM when that kernel's cache leaves L2",
+          xlabel="fp16 KV cache / L2  (log)", ylabel="ns per cached token")
+
+    figure_header(
+        fig,
+        f"Watching the quantization effect cross L2 -- {rep['gpu']}",
+        "Context swept so the fp16 cache runs 0.125x to 12x this card's L2. "
+        "Predictions and zones were committed\nbefore the run (docs/preregistration_l2.md).",
+    )
+    save(fig, "l2_sweep")
+    return True
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", default=str(ROOT / "results" / "benchmark.json"))
@@ -1124,6 +1215,11 @@ def main():
         plot_gs128_cliff(sweep)
     else:
         print("  (skipped gs_saturation and gs128_cliff: no results/gs_sweep.json)")
+    l2s = _sweep(ROOT / "results" / "l2_sweep.json")
+    if l2s:
+        plot_l2_sweep(l2s)
+    else:
+        print("  (skipped l2_sweep: no results/l2_sweep.json -- run l2_sweep.py)")
     if args.no_gpu:
         print("  (skipped inner_loop_cost and fold_accuracy: --no-gpu)")
         return

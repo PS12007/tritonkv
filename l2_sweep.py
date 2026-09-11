@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Move the working set across L2 instead of moving L2: the direct test.
 
-    ./.venv/Scripts/python.exe -u l2_sweep.py              # ~6-8 min on the GPU
+    ./.venv/Scripts/python.exe -u l2_sweep.py              # ~11 min on the GPU
     ./.venv/Scripts/python.exe l2_sweep.py --from-json results/l2_sweep.json
 
 The project's headline claim is conditional on L2 residency: quantization *costs*

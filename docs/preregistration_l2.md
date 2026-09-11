@@ -188,6 +188,74 @@ p-value.
 
 *(appended after the run; nothing above this line changes)*
 
+**Run:** 2026-09-10, `results/l2_sweep.json`, 13 points, ~11 min, every clock
+window stable, worst correctness cosine 0.9999998, copy bandwidth 343 GB/s.
+**By the committed scoring (`l2_sweep.analyze`, all points): all five hold.**
+
+| | prediction | outcome | written-down guess |
+|---|---|---|---|
+| **P1** | zone A hot CI < 1 | **HOLDS**: 0.824 / 0.813 / 0.739 / 0.735 | — |
+| **P2** | crossing in [0.5, 2] x L2 | **HOLDS**: **x\* = 1.04**, ctx ≈ 34 100 | ≈ 1.0, ctx ≈ 32k |
+| **P3** | zone B hot > 1 and > cold | **HOLDS**: 1.914 vs 1.435; 1.905 vs 1.426 | hot ≈ 1.8–2.2 |
+| **P4** | zone C \|hot/cold − 1\| ≤ 0.10 | **HOLDS**: 0.921 / 0.989 / 0.926 | hot ≈ cold ≈ 1.4–1.5 |
+| **P5** | peak at x ∈ [1, 4] | **HOLDS**: 1.914 at x = 1.5 | — |
+
+**The shape is sharper than the zones assumed.** At x = 1.00, with the fp16 cache
+exactly the nominal L2 size, the control's hot per-token time is still only 7%
+above x = 0.75 (ratio 0.812). At x = 1.25 its hot time is 93% of its DRAM time
+(ratio 1.843). The cliff is between 1.00x and 1.25x. The fused kernel falls off
+its own cliff between x = 3 and x = 4, i.e. with *its* cache between 0.94x and
+1.25x L2, which is exactly 3.2x further out. The margins in `FIT_FRAC` /
+`SPILL_FRAC` were wider than this card needed. They are not narrowed now; they
+are what volunteers' cards will be scored against.
+
+**Five things that have to be said alongside that table:**
+
+1. **The hump rests on measurements the gate rejects.** 8 of 13 pairs have a
+   gate failure, all of them dispersion (every clock window passed). On the hump
+   (x = 1.25–3) the failing measurement is the **fp16 control's hot timing**:
+   IQR 6–11%, with the median pinned to ±0.1–2.7%. It happens only where a
+   working set 1.25–3x L2 is replayed in a loop, which fits an erratic partial
+   hit rate. Rescored with filters the pre-registration did not specify for
+   Part A:
+
+   | scoring | P1 | P2 | P3 | P4 | P5 |
+   |---|---|---|---|---|---|
+   | committed (all points) | HOLDS | HOLDS (1.04) | HOLDS | HOLDS | HOLDS |
+   | gate-quotable pairs only | HOLDS | HOLDS (1.78, only because the gate removes every point from 1.25x to 6x) | untestable | HOLDS (1 pt) | **FAILS** (peak among survivors is at x = 8) |
+   | quotable + tier 2 (bar ±1.07%) | HOLDS | HOLDS (1.04) | untestable | HOLDS (2 pts) | HOLDS |
+
+   **P1 and P2, the primary, survive every filter.** P3 and P5 hold by the
+   committed scoring and depend on control-hot measurements pinned to only
+   ±1.1–2.7%. That is worse than the tier-2 bar, but 30–80x smaller than the
+   +90% effect they carry.
+2. **Mean vs median.** The pre-registered statistic is `bootstrap_ratio_ci`
+   (ratio of means). A median ratio would put ctx = 196608 at hot/cold 0.892,
+   outside P4's ±10%. By the registered statistic it is 0.921, inside. It is
+   reported, not re-scored.
+3. **The sweep's DRAM ratios are biased low by ~7%, and the bias favours P3.**
+   The sweep tunes on the hot regime and mostly picks `num_warps=2`. An A/B with
+   the clocks ramped, three rounds each, puts that config 7–8% slower
+   DRAM-resident than the benchmark's `num_warps=4` (23.2 vs 21.5 µs at 8k,
+   141 vs 132 µs at 64k) and no slower hot. Correcting it would move zone B's cold
+   ratio from ~1.43 toward ~1.53 against a hot ratio of ~1.9, so P3 would still
+   hold by ~25%.
+4. **A statement in this file did not hold.** The protocol caveat above says
+   the sweep should match `benchmark.py` to within ~5% at shared contexts. The
+   hot ratios do: 0.813 vs 0.800 at 8k, 0.739 vs 0.729 at 16k. The DRAM ratio at
+   8k does not: 1.243 against 1.469–1.478, a 16% miss. Item 3 accounts for about
+   7%. The fused cold measurement at 8k is itself gate-rejected (IQR 7.4%, pinned
+   only ±2.9%) and plausibly accounts for more, but "plausibly" is not measured.
+   No prediction uses that cell.
+5. **The smoke-test caveat stands.** Two zone-A points were measured before this
+   file was committed. They are consistent with the full run (0.813 / 0.820 then,
+   0.824 / 0.813 now).
+
+**Consequence for Part B:** nothing in Part B is changed by this outcome. It
+does sharpen one expectation, recorded here as a note rather than a new
+prediction: on this card the crossing sits at 1.04x L2, so a volunteer card's
+`x*` well away from 1 would be informative even inside the [0.5, 2] window.
+
 ## Outcome — Part B
 
 *(appended as cards arrive)*

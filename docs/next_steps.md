@@ -84,6 +84,32 @@ the sign flip itself) clear the gate in one run and not the others, so they are
 reported with that qualifier rather than starred as though the star were a
 property of the kernel.
 
+## Update 2026-09-10: the L2 mechanism has been tested on this card
+
+**Read `docs/preregistration_l2.md` before touching anything cross-GPU.** Its
+predictions were committed (`7aefc6f`) before `l2_sweep.py` ran. Only append to
+its Outcome sections.
+
+- `l2_sweep.py` ran (`results/l2_sweep.{json,md}`, figure `docs/plots/l2_sweep.png`
+  from `make_session_plots.py`): **P1–P5 all hold, crossing at 1.04× L2.** Caveats
+  are in the outcome section: the hump's control-hot rows fail the gate, and
+  the DRAM ratios run ~7% low from hot-regime tuning.
+- `cross_gpu.py` exists and is tested (12 CPU tests) **before any volunteer file**.
+  Score a volunteer with
+  `cross_gpu.py --card NAME=their/benchmark.json --sweep NAME=their/l2_sweep.json`,
+  always together with this card (`--card laptop5060=results/benchmark.json
+  --sweep laptop5060=results/l2_sweep.json`). Report every card, including
+  FAILS. One run per card, the last one received.
+- `benchmark.py` records the driver, bus width, and a DRAM bandwidth probe
+  (after timing), and stores `args.out` repo-relative. **Recording-only; the
+  protocol is unchanged**, so every earlier run is still comparable.
+- Open, and cheap if wanted: the sweep's DRAM ratios could be made unbiased by
+  tuning per regime. This is not needed for any prediction. Leave the sweep
+  exactly as volunteers will run it unless there is a reason to re-run all of
+  them.
+- Open item 5 below ("cross-check on a non-laptop GPU") is now **waiting on
+  volunteers**, not on code.
+
 ## Do this first
 
 Nothing is blocking. `results/audit.{md,json}` are current (regenerated

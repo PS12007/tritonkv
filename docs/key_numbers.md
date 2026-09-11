@@ -47,6 +47,27 @@ claim rested on rows where the fp16 control had failed the gate.
 
 ---
 
+## The L2 crossing, measured directly (2026-09-10)
+
+`l2_sweep.py`, one run, fp16 cache swept 0.125–12× L2 (ctx 4096–393216).
+Pre-registered in `docs/preregistration_l2.md` (commit `7aefc6f`) before the run.
+
+| | value |
+|---|---|
+| **Crossing of the hot ratio through 1** | **1.04× L2** (ctx ≈ 34 100); guess on record was 1.0 |
+| **Zone A (both caches fit), hot** | 0.735–0.824× |
+| **Zone B (fp16 spills, 4-bit fits), hot** | **1.91×**, against 1.43× from DRAM at the same ctx |
+| **Zone C (both spill), hot / DRAM** | 0.92–0.99 |
+| **The two cliffs** | fp16 control between 1.00× and 1.25× L2; fused 4-bit between 3× and 4× (its own cache 0.94–1.25× L2) |
+
+All five predictions hold by the committed scoring. The hump (zone B) rests on
+fp16-control hot timings that fail the dispersion gate (IQR 6–11%, pinned
+±1.1–2.7%), and the sweep's DRAM ratios run ~7% low from hot-regime tuning. Both
+are measured, and both are in the pre-registration's outcome section. The
+crossing and zone A survive every filter.
+
+---
+
 ## Timing, µs per decode step
 
 **L2-resident (CUDA-graph replay, median of ≥25 samples × 50 calls):**

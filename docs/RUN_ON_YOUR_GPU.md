@@ -12,7 +12,7 @@ machine, with a different GPU, is the only way to find out whether the
 conclusion is about GPUs in general or just about that one laptop.
 
 **What it costs you:** about 20 minutes of setup, then ~15 minutes where you
-shouldn't touch the laptop (plus an optional ~8 more for Step 5b). Then you send
+shouldn't touch the laptop (plus an optional ~12 more for Step 5b). Then you send
 back one or two small files.
 
 **What it does NOT do:** no admin rights, no driver changes, no system-wide
@@ -218,9 +218,9 @@ running in the background. Just start over when convenient.
 
 ---
 
-## Step 5b — the L2 sweep (optional, ~8 minutes, and the most useful part)
+## Step 5b — the L2 sweep (optional, ~12 minutes, and the most useful part)
 
-If you can spare eight more minutes with the laptop still plugged in and left
+If you can spare twelve more minutes with the laptop still plugged in and left
 alone, run:
 
 ```bat

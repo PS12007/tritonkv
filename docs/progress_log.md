@@ -2361,3 +2361,58 @@ immune either — see the correction above.
 
 The tuning grid is left exactly as it is. It sits on its boundary because the
 boundary is the right answer.
+
+---
+
+## 2026-09-10 — Before strangers run it, and then watching it cross L2
+
+**Attempted:** make the repo safe and useful to hand to volunteers, then run the
+experiment the headline was always missing.
+
+**What the results file was sending home.** Read `benchmark.json` as a
+volunteer would. The default `--out` is built from `__file__`, which is absolute,
+so a Windows volunteer's file would carry `C:\Users\<name>\...`. Now
+repo-relative. The guide promised the driver version and the file never had it.
+Now it does, plus bus width, the static nvidia-smi power/PCIe fields, and a
+DRAM copy probe (343 GB/s here, 384 theoretical). The probe runs **after** the
+last timed row, because a preload is known to move this benchmark by 5%, so a
+probe up front would have been a protocol change. UUID and PCI bus id are
+deliberately not recorded.
+
+**The missing experiment.** Every benchmark context has an fp16 cache
+(0.5–16.8 MB) inside this card's 33.6 MB L2, so the hot control had never been
+measured outside L2. `l2_sweep.py` sweeps context so the fp16 cache is
+0.125–12× the card's own L2. Predictions were committed first
+(`docs/preregistration_l2.md`, `7aefc6f`), and volunteers' predictions, exclusions
+and README consequences were committed with them.
+
+**Two faults found by the smoke test, before the real run.** The sweep's first
+tuner reused `benchmark.tune`'s flush-then-launch timer and chose `block_n=64` at
+8k, which is **26% slower** cold than `block_n=32` (A/B, three rounds). It now tunes
+by graph replay after a ramp. And `reference_decode_attention` expands K/V to
+all heads in fp32, 4.8 GB at the top grid point here and ~11 GB on a 72 MB-L2
+card. The sweep uses a grouped, chunked version tested against the original.
+
+**Result: P1–P5 all hold.** The hot ratio crosses 1 at **x\* = 1.04× L2**; the
+guess on record was 1.0. The cliff is sharp: 0.812 at exactly 1.00× L2, 1.843
+at 1.25×. Zone B, where fp16 has spilled and 4-bit has not, reads **1.91×**
+against 1.43× from DRAM. Past 4× the hot ratio falls back onto the DRAM one.
+Each kernel's hot curve drops onto its DRAM curve when its own cache passes L2,
+and the two cliffs are 3.2× apart.
+
+**What has to be said with it** (full list in the pre-registration's outcome):
+the hump's fp16-control hot timings fail the dispersion gate (IQR 6–11%);
+gate-only scoring makes P3 untestable and P5 fail, while P1/P2 survive every
+filter. By the registered mean-ratio statistic, P4 at ctx=196608 is 0.921. A
+median ratio would put it at 0.892, outside. The sweep's hot-tuned
+`num_warps=2` is 7–8% slower cold, so its DRAM ratios run low, and the
+pre-registration's own "~5% of `benchmark.py`" statement failed at 8k cold
+(16%).
+
+**Also:** `cross_gpu.py` scores C1–C4/M1 over volunteers' files and exists
+before any of them do. On this card: C1 HOLDS, C2 HOLDS. And a Windows PowerShell
+`Get-Content -Raw`/`WriteAllText` replace mojibaked `RUN_ON_YOUR_GPU.md`; it was
+caught by grep and restored from git before commit.
+
+**Number:** crossing at **1.04× L2**, predicted in writing as ≈1.0 in a window of
+[0.5, 2].

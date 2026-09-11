@@ -139,6 +139,46 @@ the KV cache does not fit in L2, and costs 1.23–1.37× when it does.** At 512
 tokens quantization loses in *both* regimes — there is not enough history to
 amortize anything.
 
+### Watching it cross L2 (pre-registered, 2026-09-10)
+
+The tables above never actually show the mechanism they are conditional on:
+every context in them has an fp16 cache (0.5–16.8 MB) that fits in this card's
+33.6 MB L2, so the "hot" control was never measured outside L2. `l2_sweep.py`
+moves the working set across L2 instead, sweeping context until the fp16 cache
+is 0.125× to 12× **this card's own L2** (ctx 4096 → 393216). Five predictions and
+their decision rules were committed before the run
+([`docs/preregistration_l2.md`](docs/preregistration_l2.md), commit `7aefc6f`).
+
+![Watching the quantization effect cross L2](docs/plots/l2_sweep.png)
+
+| fp16 cache / L2 | 0.125 | 0.5 | 0.75 | **1.0** | **1.25** | 1.5 | 2 | 3 | 4 | 8 | 12 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| quant, hot | 0.82 | 0.74 | 0.74 | **0.81** | **1.84~** | 1.91* | 1.91* | 1.90* | 1.50* | 1.49 | 1.48 |
+| quant, DRAM | 1.24 | 1.39 | 1.44 | 1.48 | 1.51~ | 1.44~ | 1.43 | 1.46~ | 1.56~ | 1.51~ | 1.60 |
+
+`~` and `*` as in the tables above, with the tier bar read off the sweep itself
+(±1.07%, the worst-pinned measurement the gate accepted in this run).
+
+**All five predictions hold.** The hot ratio crosses 1 at **1.04× L2** (the
+written-down guess was 1.0). Between 1.5× and 3× L2 the fp16 cache has spilled
+and the 4-bit cache has not, a regime `benchmark.py` never produces on this
+card. There quantization pays **1.9×**, more than it ever does from DRAM. Past
+~4× both caches spill and the hot ratio falls back onto the DRAM one. The right
+panel shows the mechanism directly: each kernel's hot curve drops onto its DRAM
+curve when *its own* cache passes L2, and the two cliffs sit 3.2× apart, the
+ratio of the two cache sizes.
+
+Two qualifiers belong next to that, and the outcome section of the
+pre-registration has three more. First, the hump rests on the fp16 control's hot
+timings, which fail the dispersion gate there (IQR 6–11%; median pinned to
+±1.1–2.7% against a +90% effect). The crossing and zone A survive every filter;
+the hump survives the committed scoring and tier 2 only in part. Second, the
+sweep's DRAM ratios run ~7% low: it tunes on the hot regime, and that config is
+measurably slower from DRAM. This is one card. The same script is the
+cross-GPU test: its grid is relative to L2, so on another card the crossing
+should sit near 1× L2 again, which is a different context length on every card
+with a different L2.
+
 ### The inner loop was mostly loading the same 4 numbers over and over
 
 The per-group scale and zero are `(BLOCK_N, head_dim/group_size)` in memory — 4
@@ -943,9 +983,10 @@ Be specific about what is *not* solved:
    ratio is flash-decoding, which has nothing to do with quantization. Use the
    decomposition table.
 2. **"Low-bit KV makes decode faster."** False in the L2-resident regime — it is
-   1.4–2× *slower* there. True only when the working set exceeds L2, and then
-   only by 1.14–1.32×, and only at 2k tokens and above. At 512 tokens it loses
-   in both regimes.
+   1.23–1.37× *slower* there. True only when the working set exceeds L2, and then
+   by 1.19–1.48× (1.28–1.48 at ctx=8192 across measurement protocols), and only
+   at 2k tokens and above. At 512 tokens it loses in both regimes. (This item
+   carried the pre-clock-fix figures, 1.4–2× and 1.14–1.32×, until 2026-09-10.)
 3. **2-bit is not usable**, despite passing. The kernel reproduces the
    dequantized values to cosine ≥ 0.9999996, but the *quantizer* loses far too
    much: rel L2 of **0.66–0.81** against the fp16 cache, versus 0.12–0.14 for
@@ -964,7 +1005,11 @@ Be specific about what is *not* solved:
    these numbers reproducible *on this machine*; it says nothing about how the
    attribution shifts on a desktop part with a bigger L2 or a fixed power
    budget. The conditional is stated in terms of L2 residency precisely because
-   that is the axis expected to move.
+   that is the axis expected to move. The L2 sweep now tests the mechanism *on
+   this card* (the crossing sits at 1.04× L2). It still cannot separate L2 size
+   from everything else about the card. That needs other cards, and the
+   predictions for them are already committed (`docs/preregistration_l2.md`,
+   Part B), scored by `cross_gpu.py`.
 8. ~~**The 8k and 16k SDPA baselines are not clock-verified.**~~ Fixed by the
    bandwidth-aware ramp: `fp16_sdpa` at 8k and 16k now passes the gate with a
    timing IQR of 0.1–0.4%. ~~What replaces it is narrower — only ctx=8192 has
@@ -1015,9 +1060,11 @@ python -m venv .venv
 .venv/Scripts/python.exe -m pip install -r requirements.txt
 
 .venv/Scripts/python.exe -m pytest test_correctness.py -q   # 146 tests, ~2 min (GPU)
-.venv/Scripts/python.exe -m pytest test_between_run.py -q    # 139 tests, ~18 s (no GPU)
+.venv/Scripts/python.exe -m pytest test_between_run.py test_l2_sweep.py test_cross_gpu.py -q  # 179 tests, ~30 s (no GPU)
 .venv/Scripts/python.exe benchmark.py --quick                # ~75 s smoke run
 .venv/Scripts/python.exe benchmark.py --samples 50           # full suite, ~13 min
+.venv/Scripts/python.exe -u l2_sweep.py                      # the L2 crossing, ~11 min
+.venv/Scripts/python.exe cross_gpu.py --card me=results/benchmark.json --sweep me=results/l2_sweep.json
 .venv/Scripts/python.exe dispersion_tier.py                  # three-tier verdict per row
 .venv/Scripts/python.exe bandwidth_law.py                    # needs compare_protocols.json
 .venv/Scripts/python.exe audit_claims.py                     # reads results/benchmark.json
@@ -1084,7 +1131,9 @@ committed.
 | `kernels/fp16_decode_attn.py` | the control: identical shape, unquantized. Isolates the flash-decoding effect. |
 | `test_correctness.py` | 146 tests on the kernel, explicit asserted thresholds — including two bitwise-identity suites (metadata broadcast, fp16 dequant) that assert equality rather than a tolerance. |
 | `test_between_run.py` | 139 CPU-only tests on the between-run, excursion, protocol, dispersion-tier and bandwidth-law machinery — including the 2x2 arithmetic, the design reader and the tier's calibration bar — against synthetic runs with known answers. |
-| `benchmark.py` | timing + memory. Rotating working set for the cold regime, CUDA-graph replay for the hot one. |
+| `benchmark.py` | timing + memory. Rotating working set for the cold regime, CUDA-graph replay for the hot one. Records the driver, bus width and a DRAM bandwidth probe (run after timing), and nothing that identifies the machine's owner. |
+| `l2_sweep.py` | the direct test of the L2 mechanism: context swept so the fp16 cache runs 0.125–12× the card's own L2, scored against predictions committed in `docs/preregistration_l2.md`. `test_l2_sweep.py` (28 CPU tests) checks that the scoring can fail. |
+| `cross_gpu.py` | scores the cross-GPU predictions (C1–C4, M1) over volunteers' files, with the pre-registered exclusions. Written before any volunteer data existed. `test_cross_gpu.py`, 12 CPU tests. |
 | `audit_claims.py` | adversarial self-audit: bootstrap CIs over raw timings, attribution against the fp16 control, per-optimization claims with their own controls, and a clock-verification gate. |
 | `between_run.py` | what a bootstrap CI does not cover: compares N independent full runs, reports the run-to-run interval, the inflation over the single-run CI, and whether any verdict moved. |
 | `clock_excursions.py` | the rate at which a row drops a memory P-state, split by run protocol and regime, with the gate's verdict on each — and whether the row's own duration predicts it, decomposed within method as well as pooled. |
