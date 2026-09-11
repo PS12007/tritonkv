@@ -104,6 +104,29 @@ def max_sm_clock() -> float | None:
         return None
 
 
+# Static facts about the card that the cross-machine comparison needs and torch
+# does not expose. Kept as raw strings: on a laptop several of these read
+# "[N/A]", and that is itself worth recording rather than coercing to None.
+SMI_STATIC = ("driver_version", "clocks.max.memory", "power.limit",
+              "power.max_limit", "pcie.link.gen.max", "pcie.link.width.max")
+
+
+def smi_static() -> dict:
+    """One nvidia-smi query for fields that do not change during a run."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", f"--query-gpu={','.join(SMI_STATIC)}",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if out.returncode != 0:
+            return {}
+        parts = [p.strip() for p in out.stdout.strip().splitlines()[0].split(",")]
+        return dict(zip(SMI_STATIC, parts))
+    except Exception:
+        return {}
+
+
 class ClockMonitor:
     """Background nvidia-smi sampler.
 
@@ -1106,6 +1129,9 @@ def env_info() -> dict:
         tw = md.version("triton-windows")
     except Exception:
         tw = None
+    # Deliberately not recorded: the device uuid and PCI bus id. They identify a
+    # physical card, and this file is sent back by volunteers who were told it
+    # carries nothing beyond the GPU model and software versions.
     return {
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "gpu": props.name,
@@ -1113,6 +1139,13 @@ def env_info() -> dict:
         "compute_capability": f"{props.major}.{props.minor}",
         "total_vram_bytes": props.total_memory,
         "l2_cache_bytes": getattr(props, "L2_cache_size", None),
+        # Bus width and memory clock give a *theoretical* DRAM bandwidth. The
+        # multiplier from clock to data rate differs by memory type (GDDR6,
+        # GDDR6X, GDDR7), so the cross-machine analysis uses the measured
+        # `bandwidth_probe` and keeps these only as a cross-check.
+        "memory_bus_width_bits": getattr(props, "memory_bus_width", None),
+        "memory_clock_khz": getattr(props, "memory_clock_rate", None),
+        "smi_static": smi_static(),
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
         "triton": tv,
@@ -1122,6 +1155,90 @@ def env_info() -> dict:
         "max_sm_clock_mhz": max_sm_clock(),
         "clocks_at_start": smi_once(),
     }
+
+
+def dram_bandwidth_probe(l2_bytes: int, monitor: ClockMonitor | None,
+                         warm_s: float = 1.5, iters: int = 30) -> dict:
+    """Achieved device-to-device copy bandwidth over a buffer far larger than L2.
+
+    Exists for the cross-GPU comparison. Every card builds its DRAM-resident
+    regime relative to its own L2, so the *sign* of the quantization effect
+    should transfer by construction; what should differ between cards is its
+    size, and the candidate explanations (L2 size, DRAM bandwidth, SM count)
+    are confounded in any single machine. A spec-sheet bandwidth is not good
+    enough to separate them -- laptop parts of one name ship with different
+    memory clocks and power limits -- so each card measures its own.
+
+    It runs **after every timing loop has finished**, and that placement is the
+    point. A preload changes this benchmark's numbers (the 2x2 in
+    ``compare_protocols.py``: 300 s of saturating load moves the headline cell by
+    5%), so a probe run *before* timing would be a protocol change. After the
+    last row it cannot touch anything that was measured.
+
+    ``warm_s`` of copying first: the memory clock reaches its loaded value in
+    0.4 s on the card this was built on (``clock_ramp.py``), so 1.5 s is ample
+    and the probe costs a few seconds in total.
+    """
+    t_start = time.time()
+    try:
+        nbytes = max(int(256e6), int(8 * (l2_bytes or 0)))
+        src = torch.empty(nbytes, dtype=torch.int8, device="cuda")
+        dst = torch.empty(nbytes, dtype=torch.int8, device="cuda")
+        src.fill_(1)
+        t0 = time.time()
+        while time.time() - t0 < warm_s:
+            dst.copy_(src)
+            torch.cuda.synchronize()
+        starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+        ends = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+        lo = time.time()
+        for i in range(iters):
+            starts[i].record()
+            dst.copy_(src)
+            ends[i].record()
+        torch.cuda.synchronize()
+        hi = time.time()
+        ms = sorted(s.elapsed_time(e) for s, e in zip(starts, ends))
+        med = statistics.median(ms)
+        # A copy reads n bytes and writes n bytes.
+        gbps = [2 * nbytes / (m * 1e-3) / 1e9 for m in ms]
+        del src, dst
+        torch.cuda.empty_cache()
+        clk = monitor.window(lo, hi, mem_sensitive=True) if monitor is not None else None
+        return {
+            "ran": True,
+            "buffer_bytes": nbytes,
+            "iters": iters,
+            "median_ms": med,
+            "copy_gbps_median": 2 * nbytes / (med * 1e-3) / 1e9,
+            "copy_gbps_max": max(gbps),
+            "copy_gbps_min": min(gbps),
+            "mem_mhz_mean": (clk or {}).get("mem_mhz_mean"),
+            "sm_mhz_mean": (clk or {}).get("sm_mhz_mean"),
+            "seconds": time.time() - t_start,
+        }
+    except Exception as exc:  # never lose a finished run to a probe
+        return {"ran": False, "error": f"{type(exc).__name__}: {exc}"[:200],
+                "seconds": time.time() - t_start}
+
+
+def portable_args(args) -> dict:
+    """``vars(args)`` with the output path made relative to the repo.
+
+    The default ``--out`` is built from ``__file__``, which is absolute, so a
+    volunteer's results file would otherwise carry ``C:\\Users\\<name>\\...``.
+    Only the path relative to the repo, or failing that the bare file name, is
+    kept -- which is all ``between_run.py`` and friends ever needed from it.
+    """
+    d = dict(vars(args))
+    out = d.get("out")
+    if out:
+        p = Path(out)
+        try:
+            d["out"] = p.resolve().relative_to(Path(__file__).parent.resolve()).as_posix()
+        except ValueError:
+            d["out"] = p.name
+    return d
 
 
 def main():
@@ -1487,14 +1604,21 @@ def main():
         "n_rows_quotable": sum(1 for r in rows if r.get("quotable")),
         "rejected_rows": unstable,
     }
+    # After the last timed row and after `clocks_at_end`, so it can perturb
+    # nothing that was measured -- see the docstring.
+    bandwidth = dram_bandwidth_probe(l2_bytes, monitor)
+    if bandwidth.get("ran"):
+        print(f"\nbandwidth probe (after timing): {bandwidth['copy_gbps_median']:.0f} GB/s "
+              f"device copy over {bandwidth['buffer_bytes'] / 1e6:.0f} MB")
     if monitor is not None:
         monitor.stop()
     payload = {
         "env": env,
         "clock_monitoring": clock_summary,
+        "bandwidth_probe": bandwidth,
         "model": shape.as_dict(),
         "model_provenance": provenance,
-        "args": vars(args),
+        "args": portable_args(args),
         "passes": passes,
         "preload": preload_info,
         "contexts": list(contexts),

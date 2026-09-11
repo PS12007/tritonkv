@@ -229,8 +229,11 @@ easiest.
 driver version, and every measurement. You won't be asked follow-up questions.
 
 If you want to see what you're sending, it's plain text (JSON). There is nothing
-personal in it: no filenames, no usernames, no system information beyond the GPU
-and Python/driver versions.
+personal in it: no usernames, no folder paths, no hardware serial numbers — just
+the GPU model and its specs, the driver, Python and OS versions, and the
+timings. (The one path it records is the output file's name *relative to the
+project folder*, e.g. `results/benchmark.json`, precisely so that your Windows
+username can't end up in it.)
 
 ---
 
