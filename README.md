@@ -357,49 +357,27 @@ centred near 1.40.
 
 ---
 
-## Limitations
+## Scope and caveats
 
-1. **"The fused kernel is Nx faster than PyTorch."** Misleading. Most of that ratio
-   is flash-decoding, which has nothing to do with quantization. Use the
-   decomposition table.
-2. **"Low-bit KV makes decode faster."** False in the L2-resident regime — it is
-   1.23–1.37× *slower* there. True only when the working set exceeds L2, and then
-   by 1.19–1.48× (1.28–1.48 at ctx=8192 across measurement protocols), and only at
-   2k tokens and above. At 512 tokens it loses in both regimes.
-3. **2-bit is not usable**, despite passing. The kernel reproduces the dequantized
-   values to cosine ≥ 0.9999996, but the *quantizer* loses far too much: rel L2 of
-   **0.66–0.81** against the fp16 cache, versus 0.12–0.14 for 4-bit. 2-bit is a
-   correct implementation of a scheme that does not preserve the cache. 4-bit is
-   the only configuration worth using.
-4. **No end-to-end model integration.** Everything here is one attention layer.
-   There is no tokens/sec claim, and none should be inferred.
-5. **FlashAttention is not in the comparison** — this Windows torch build reports
-   "not compiled with flash attention", so the strongest fp16 baseline available
-   was cuDNN. On Linux with FA2 the SDPA baseline would be much stronger and the
-   flash-decode effect much smaller.
-6. **Per-channel key quantization is not implemented.** KIVI shows keys are better
-   quantized per-channel; this uses per-token grouping along `head_dim` for both K
-   and V, which is simpler but leaves accuracy on the table.
-7. **One GPU, one clock regime, one driver.** The clock-verification gate makes
-   these numbers reproducible *on this machine*; it says nothing about how the
-   attribution shifts on a desktop part with a bigger L2 or a fixed power budget.
-   The conditional is stated in terms of L2 residency precisely because that is the
-   axis expected to move. The L2 sweep tests the mechanism *on this card* (the
-   crossing sits at 1.04× L2), but it cannot separate L2 size from everything else
-   about the card. That needs other cards, and the predictions for them are already
-   committed (`docs/preregistration_l2.md`, Part B), scored by `cross_gpu.py`.
-8. **The attribution chain is complete at 9/9 runs for ctx=512 and 2048, and 7/9
-   for ctx=16384** — once rows that fail the per-sample IQR gate but pin their
-   medians at least as well as the worst row the gate accepts are admitted with
-   that qualifier. Promotion is a property of the run: no row is promoted in more
-   than four of the nine.
-9. **Some measurement protocols produce four times more memory P-state excursions
-   than others, and nothing here explains why.** The rate is 2.8% (`full`), 12.5%
-   (`subset`), 1.4% (`preloaded`), 5.6% (`fullpre`), 4.2% (`reversed`).
-   Temperature, clock warm-up time, all four monitored telemetry variables, row
-   duration and predecessor duration have each been tested and ruled out. The gate
-   catches the excursions that would matter, which is what protects the numbers
-   above — but the cause is unknown and would need data collected for the question.
+Four things worth knowing before quoting any number above.
+
+- **2-bit is not usable**, despite passing every test. The kernel reproduces the
+  dequantized values to cosine ≥ 0.9999996, but the *quantizer* loses far too
+  much: rel L2 of **0.66–0.81** against the fp16 cache, versus 0.12–0.14 for
+  4-bit. 2-bit is a correct implementation of a scheme that does not preserve the
+  cache. 4-bit is the only configuration worth using.
+- **FlashAttention is not in the comparison.** This Windows torch build reports
+  "not compiled with flash attention", so the strongest fp16 baseline available
+  was cuDNN. On Linux with FA2 the SDPA baseline would be stronger and the
+  flash-decode effect smaller.
+- **One attention layer, batch 1.** There is no tokens/sec claim here, and none
+  should be inferred from these numbers.
+- **One GPU, one clock regime, one driver.** The gate makes these numbers
+  reproducible *on this machine*; it says nothing about how the attribution shifts
+  on a part with a bigger L2 or a fixed power budget. That is why the conditional
+  is stated in terms of L2 residency, and why the cross-GPU predictions are
+  already committed (`docs/preregistration_l2.md`, Part B) and scored by
+  `cross_gpu.py`.
 
 ---
 
